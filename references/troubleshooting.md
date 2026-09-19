@@ -267,6 +267,39 @@ note: "**方向反了**（CTLA4 在 T 细胞上）"
 
 ---
 
+## 空间拟时序
+
+### 空间感知的拟时序和朴素的结果差别很大
+
+**这是预期行为。** 朴素做法（直接在原始 PCA 嵌入上跑 DPT）不知道 spot
+在哪，会给出空间上破碎的排序。实测淋巴结数据 Moran's I 从 0.5349
+（朴素）升到 0.7671（平滑后）。
+
+看 `spatial_trajectory_status.json` 的 `morans_I_gain` 和
+`spatial_smoothing_improves_coherence`。
+
+### 平滑后 Moran's I 反而下降
+
+说明 `smoothing_alpha` 太大，真实的局部结构被平均掉了。
+本流水线默认 0.5；换数据集应做敏感性检查（跑 0.3 / 0.5 / 0.7 看
+Moran's I 怎么变）。
+
+### 想换排序起点
+
+设 `spatial_trajectory.root_spot` 为某个 spot 的 barcode。
+`root_selection.method` 会记录是配置的还是自动的。
+
+**注意换根会让整条轴反向** —— 空间数据没有时间轴，方向本身不携带
+生物学结论。
+
+### 具名工具（StPedf / SpaceFlow / ISORT / stLearn）为什么没跑
+
+见 `spatial_trajectory_status.json` 的 `named_tools_not_used`：
+不在 PyPI、需要 spliced/unspliced 计数、需要多时间点样本、或需要
+图像特征提取。验收会检查这个字段至少写了 3 条。
+
+---
+
 ## 绘图
 
 ### 图上标题显示成一个个方框（豆腐块）
