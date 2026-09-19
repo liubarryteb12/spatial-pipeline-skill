@@ -29,7 +29,7 @@ import scanpy as sc  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy,)
+                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, mm,)
 
 HB_PREFIXES = ("HBA", "HBB", "HBD", "HBE", "HBG", "HBM", "HBQ", "HBZ")
 
@@ -116,18 +116,18 @@ def run_01_qc(cfg: dict) -> dict:
     log_info(f"QC 指标已算（{', '.join(qc_vars)}）；线粒体基因 {n_mt} 个")
 
     # ---- 2. 过滤前的空间图 --------------------------------------------------
-    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.3))
+    fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(58)))
     xy = spatial_xy(adata)
     for ax, key, cmap in zip(axes,
                              ("total_counts", "n_genes_by_counts", "pct_counts_mt"),
                              ("viridis", "viridis", "magma")):
         s = ax.scatter(xy[:, 0], xy[:, 1], c=adata.obs[key].astype(float),
                        s=4, cmap=cmap)
-        ax.set_title(key, fontsize=9)
+        ax.set_title(key)
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(s, ax=ax, shrink=0.8)
-    fig.suptitle(f"QC metrics on tissue (n={n0})", fontsize=10)
+    fig.suptitle(f"QC metrics on tissue (n={n0})")
     save_fig(cfg, "qc_metrics_on_tissue", fig)
 
     # ---- 3. 过滤 ------------------------------------------------------------
@@ -175,15 +175,15 @@ def run_01_qc(cfg: dict) -> dict:
                  "检查是不是阈值过严，或组织本身就有分离的区域")
 
     # ---- 5. 过滤后的空间图 --------------------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(10.4, 4.4))
+    fig, axes = plt.subplots(1, 2, figsize=(W_DOUBLE, mm(72)))
     xy = spatial_xy(adata)
     s0 = axes[0].scatter(xy[:, 0], xy[:, 1], c=adata.obs["total_counts"].astype(float),
                          s=5, cmap="viridis")
-    axes[0].set_title(f"After filtering (n={adata.n_obs})", fontsize=9)
+    axes[0].set_title(f"After filtering (n={adata.n_obs})")
     fig.colorbar(s0, ax=axes[0], shrink=0.8)
     s1 = axes[1].scatter(xy[:, 0], xy[:, 1], c=adata.obs["pct_counts_mt"].astype(float),
                          s=5, cmap="magma")
-    axes[1].set_title("pct_counts_mt", fontsize=9)
+    axes[1].set_title("pct_counts_mt")
     fig.colorbar(s1, ax=axes[1], shrink=0.8)
     for ax in axes:
         ax.set_aspect("equal"); ax.invert_yaxis()

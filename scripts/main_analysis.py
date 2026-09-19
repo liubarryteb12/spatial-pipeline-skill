@@ -41,9 +41,25 @@ STEPS = [
      "run_08_spatial_trajectory"),
 ]
 
+# 每步会写的状态文件。**跑之前先删掉** —— 否则步骤崩溃时旧文件还在，
+# 下游"产物存在"检查读的是**上一轮的**结果，给出虚假的通过。
+# 姊妹项目 Part 2 实测踩过：一步因漏 import 崩了，而它的状态文件是上一轮的，
+# 验收照样全绿。
+STEP_STATUS_FILES = {
+    "qc": "qc_status.json",
+    "normalize": "normalize_status.json",
+    "spatial_domains": "domain_status.json",
+    "svg": "svg_status.json",
+    "deconvolution": "deconvolution_status.json",
+    "niche": "niche_status.json",
+    "spatial_communication": "communication_status.json",
+    "spatial_trajectory": "spatial_trajectory_status.json",
+}
+
 
 def run_steps(cfg: dict, only: list = None) -> dict:
     ensure_dirs(cfg)
+    res_dir = Path(cfg["output"]["results_dir"])
     results = {}
     for name, mod_name, fn_name in STEPS:
         if only and name not in only:
@@ -52,6 +68,11 @@ def run_steps(cfg: dict, only: list = None) -> dict:
         log_info("=" * 70)
         log_info(f"步骤 {name}  ({mod_name}.py)")
         log_info("=" * 70)
+        # 先删本步的状态文件：崩溃时不留旧文件冒充本轮结果
+        if name in STEP_STATUS_FILES:
+            stale = res_dir / STEP_STATUS_FILES[name]
+            if stale.exists():
+                stale.unlink()
         t0 = time.time()
         try:
             mod = importlib.import_module(mod_name)
@@ -92,6 +113,14 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
     def chk(cid, kind, ok, detail, severity="required"):
         checks.append({"id": cid, "kind": kind, "passed": bool(ok),
                        "detail": detail, "severity": severity})
+
+    # ---- required: 每个步骤本身必须成功 ------------------------------------
+    # 只检查"产物文件在不在"是不够的：步骤崩溃时旧文件还在，
+    # 产物检查会通过而实际上本轮什么都没产出。
+    for sid, res in step_results.items():
+        ok = res.get("status") == "ok"
+        chk(f"step:{sid}", "required", ok,
+            "成功" if ok else f"**失败**: {str(res.get('error'))[:140]}")
 
     # ---- required: 数据文件 ----
     for f in ("raw.h5ad", "qc_filtered.h5ad", "normalized.h5ad", "domains.h5ad"):

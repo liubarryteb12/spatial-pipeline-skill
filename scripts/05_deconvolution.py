@@ -44,7 +44,7 @@ from scipy.optimize import nnls  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy,)
+                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm,)
 
 
 def load_signature(cfg: dict):
@@ -287,7 +287,7 @@ def run_05_deconvolution(cfg: dict) -> dict:
     sf = float(adata.uns["spatial"][list(adata.uns["spatial"])[0]]
                ["scalefactors"]["tissue_hires_scalef"])
     xy = spatial_xy(adata, sf)
-    fig, axes = plt.subplots(nrow, ncol, figsize=(3.0 * ncol, 3.1 * nrow))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(W_DOUBLE, W_DOUBLE * 3.1 * nrow / (3.0 * ncol)))
     axes = np.atleast_1d(axes).ravel()
     for ax, ct in zip(axes, show):
         s = ax.scatter(xy[:, 0], xy[:, 1], c=prop_df[ct].values, s=4,
@@ -299,13 +299,14 @@ def run_05_deconvolution(cfg: dict) -> dict:
     for ax in axes[len(show):]:
         ax.axis("off")
     fig.suptitle("Deconvolved composition — spatial trends only, "
-                 "absolute values are not cell fractions", fontsize=11)
+                 "absolute values are not cell fractions")
     save_fig(cfg, "deconvolution_spatial", fig)
 
     # 组成堆叠（按某个域聚合，看域之间的组成差异）
     if "domain" in adata.obs.columns:
         by_dom = prop_df.groupby(adata.obs["domain"].astype(str).values).mean()
-        fig, ax = plt.subplots(figsize=(max(6.0, 0.55 * len(by_dom) + 2.5), 4.2))
+        # 宽度夹在 [单栏半, 双栏]，避免域数多时画出装不进一页的图
+        fig, ax = plt.subplots(figsize=(min(W_DOUBLE, max(W_ONE_HALF, 0.55 * len(by_dom) + 2.5)), mm(64)))
         bottom = np.zeros(len(by_dom))
         cmap = plt.get_cmap("tab20")
         for i, ct in enumerate(mean_prop.index):
@@ -315,19 +316,19 @@ def run_05_deconvolution(cfg: dict) -> dict:
         ax.set_xticks(range(len(by_dom)))
         ax.set_xticklabels(by_dom.index, fontsize=8)
         ax.set_xlabel("spatial domain"); ax.set_ylabel("mean relative weight")
-        ax.set_title("Composition per spatial domain", fontsize=10)
+        ax.set_title("Composition per spatial domain")
         ax.legend(fontsize=6, ncol=2, loc="center left", bbox_to_anchor=(1.0, 0.5))
         save_fig(cfg, "deconvolution_by_domain", fig)
         by_dom.to_csv(res_dir / "deconvolution_by_domain.csv")
 
     # ---- 5. 重建误差的空间分布（只有解卷积才有）----------------------------
     if errors is not None:
-        fig, ax = plt.subplots(figsize=(6.0, 5.0))
+        fig, ax = plt.subplots(figsize=(W_SINGLE, mm(76)))
         s = ax.scatter(xy[:, 0], xy[:, 1], c=errors, s=5, cmap="magma")
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
         ax.set_title(f"Reconstruction error (median {np.nanmedian(errors):.3f})\n"
-                     f"high = signature set cannot explain this spot", fontsize=9)
+                     f"high = signature set cannot explain this spot")
         fig.colorbar(s, ax=ax, shrink=0.8, label="relative error")
         save_fig(cfg, "deconvolution_error_map", fig)
 

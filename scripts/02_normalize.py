@@ -25,7 +25,7 @@ import numpy as np  # noqa: E402
 import scanpy as sc  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, spatial_xy,)
+                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, spatial_xy, W_DOUBLE, mm,)
 
 
 def run_02_normalize(cfg: dict) -> dict:
@@ -86,7 +86,7 @@ def run_02_normalize(cfg: dict) -> dict:
 
     sc.pl.highly_variable_genes(adata, show=False)
     fig = plt.gcf()
-    fig.suptitle(f"HVG ({hvg_flavor_used}, n={n_hvg})", fontsize=10)
+    fig.suptitle(f"HVG ({hvg_flavor_used}, n={n_hvg})")
     save_fig(cfg, "hvg_selection", fig)
 
     # ---- 2. PCA -------------------------------------------------------------
@@ -97,7 +97,7 @@ def run_02_normalize(cfg: dict) -> dict:
 
     sc.pl.pca_variance_ratio(work, log=True, show=False)
     fig = plt.gcf()
-    fig.suptitle("PCA variance ratio (elbow)", fontsize=10)
+    fig.suptitle("PCA variance ratio (elbow)")
     save_fig(cfg, "pca_variance_ratio", fig)
 
     var_ratio = work.uns["pca"]["variance_ratio"]
@@ -106,19 +106,19 @@ def run_02_normalize(cfg: dict) -> dict:
     # PCA 空间投影 —— 看主成分是否有空间结构
     # **这是空间数据特有的诊断**：如果 PC1 在组织上是随机斑点，
     # 说明主要变异是技术噪声而不是空间结构。
-    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.2))
+    fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(58)))
     xy = spatial_xy(work)
     for ax, i in zip(axes, range(3)):
         s = ax.scatter(xy[:, 0], xy[:, 1], c=work.obsm["X_pca"][:, i],
                        s=4, cmap="RdBu_r",
                        vmin=-np.abs(work.obsm["X_pca"][:, i]).max(),
                        vmax=np.abs(work.obsm["X_pca"][:, i]).max())
-        ax.set_title(f"PC{i+1} ({var_ratio[i]*100:.1f}%)", fontsize=9)
+        ax.set_title(f"PC{i+1} ({var_ratio[i]*100:.1f}%)")
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(s, ax=ax, shrink=0.8)
     fig.suptitle("PC scores on tissue — spatial structure means PCs capture "
-                 "histology, not just noise", fontsize=10)
+                 "histology, not just noise")
     save_fig(cfg, "pca_on_tissue", fig)
 
     # ---- 3. 落盘 ------------------------------------------------------------

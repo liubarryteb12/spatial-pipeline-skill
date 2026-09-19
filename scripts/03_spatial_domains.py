@@ -41,7 +41,7 @@ from scipy.sparse.csgraph import connected_components  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy,)
+                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, mm, PAL,)
 
 
 def spatial_neighbor_graph(adata, n_neighbors: int = 6):
@@ -216,19 +216,19 @@ def run_03_spatial_domains(cfg: dict) -> dict:
         f"{r.smoothing}->{r.n_domains}域/同域率{r.neighbor_same_frac:.3f}"
         for r in scan_df.itertuples()))
 
-    fig, axes = plt.subplots(1, 2, figsize=(10.6, 3.9))
+    fig, axes = plt.subplots(1, 2, figsize=(W_DOUBLE, mm(64)))
     axes[0].plot(scan_df["smoothing"], scan_df["neighbor_same_frac"], "o-",
-                 color="#2C7FB8", label="observed")
+                 color=PAL["primary"], label="observed")
     axes[0].plot(scan_df["smoothing"], scan_df["random_baseline_same_frac"], "s--",
-                 color="#B2182B", label="random baseline")
+                 color=PAL["highlight"], label="random baseline")
     axes[0].set_xlabel("smoothing strength α")
     axes[0].set_ylabel("neighbor same-domain fraction")
-    axes[0].set_title("Spatial coherence vs smoothing", fontsize=9)
+    axes[0].set_title("Spatial coherence vs smoothing")
     axes[0].legend(fontsize=7)
-    axes[1].plot(scan_df["smoothing"], scan_df["n_domains"], "o-", color="#2C7FB8")
+    axes[1].plot(scan_df["smoothing"], scan_df["n_domains"], "o-", color=PAL["primary"])
     axes[1].set_xlabel("smoothing strength α")
     axes[1].set_ylabel("number of domains")
-    axes[1].set_title("Domain count vs smoothing", fontsize=9)
+    axes[1].set_title("Domain count vs smoothing")
     save_fig(cfg, "smoothing_scan", fig)
 
     # ---- 3. 分辨率扫描 ------------------------------------------------------
@@ -259,12 +259,18 @@ def run_03_spatial_domains(cfg: dict) -> dict:
 
     top3 = (markers.sort_values(["domain", "scores"], ascending=[True, False])
             .groupby("domain", observed=True).head(3)["names"].unique().tolist())
-    top3 = [g for g in top3 if g in adata.raw.var_names][:40]
+    # **上限按图宽算，不是随手取 40。** 双栏 183 mm 下每个基因约 7 mm，
+    # 再多标签就挤成一片。原来取 40 会画出 370 mm 宽的图 —— 装不进任何
+    # 期刊的一页。
+    top3 = [g for g in top3 if g in adata.raw.var_names][:24]
     if top3:
         sc.pl.dotplot(adata, top3, groupby="domain", use_raw=True, show=False,
                       standard_scale="var")
         fig = plt.gcf()
-        fig.suptitle("Top markers per spatial domain", fontsize=10)
+        # scanpy 自己按基因数定尺寸，这里拉回标准双栏宽。
+        # 高度 96 mm 是实测值：80 mm 时域标签顶出画布 +4.2%，88 mm 时 +2.6%
+        fig.set_size_inches(W_DOUBLE, mm(96))
+        fig.suptitle("Top markers per spatial domain")
         save_fig(cfg, "domain_markers_dotplot", fig)
 
     # ---- 4b. 域的组织学标签（用 marker 签名打分）----------------------------
@@ -371,7 +377,7 @@ def run_03_spatial_domains(cfg: dict) -> dict:
     r_plot = spot_radius_plot_units(entry["scalefactors"], "hires")
     xy = spatial_xy(adata, sf)
 
-    fig, axes = plt.subplots(1, 3, figsize=(19.5, 5.6))
+    fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(56)))
     for ax, key, title in zip(
             axes,
             ["domain_expr_only", "domain", None],
@@ -389,10 +395,13 @@ def run_03_spatial_domains(cfg: dict) -> dict:
                            label=u, linewidths=0)
             ax.legend(fontsize=6, markerscale=2.2, loc="upper right",
                       ncol=2, framealpha=0.8)
-        ax.set_title(title, fontsize=10)
+        ax.set_title(title)
         ax.set_xticks([]); ax.set_yticks([])
-    fig.suptitle("Spatial domains overlaid on H&E — the only way to judge "
-                 "whether domains match real histology", fontsize=11)
+    # **suptitle 要折行。** constrained layout 不会给文字换行 —— 一行长标题
+    # 会把整张图撑得比 183 mm 宽，而 savefig.bbox="standard" 下多出来的
+    # 部分直接裁掉。_content_overflow() 就是靠这条抓到的。
+    fig.suptitle("Spatial domains overlaid on H&E\n"
+                 "(the only way to judge whether domains match real histology)")
     save_fig(cfg, "domains_on_he", fig)
 
     # ---- 6. 落盘 ------------------------------------------------------------

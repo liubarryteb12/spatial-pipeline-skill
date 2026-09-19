@@ -39,7 +39,7 @@ import yaml  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy,)
+                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm,)
 
 
 def load_lr_pairs(cfg: dict):
@@ -204,7 +204,7 @@ def run_07_spatial_communication(cfg: dict) -> dict:
 
     # ---- 5. 出图 ------------------------------------------------------------
     top = lr_df.head(20).iloc[::-1]
-    fig, ax = plt.subplots(figsize=(7.0, max(4.0, 0.32 * len(top) + 1.6)))
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, max(mm(56), 0.32 * len(top) + 1.6)))
     colors = ["#B2182B" if z > 2 else ("#2166AC" if z < -2 else "#999999")
               for z in top["z_score"]]
     ax.barh(range(len(top)), top["z_score"], color=colors)
@@ -217,7 +217,7 @@ def run_07_spatial_communication(cfg: dict) -> dict:
     ax.set_xlabel("spatial enrichment z-score (near vs random)")
     ax.set_title(f"Ligand–receptor spatial enrichment\n"
                  f"{len(usable)}/{len(pairs)} pairs usable; "
-                 f"|z|>2 dashed", fontsize=9)
+                 f"|z|>2 dashed")
     save_fig(cfg, "communication_lr_enrichment", fig)
 
     # 空间表达图：top 3 对
@@ -225,17 +225,17 @@ def run_07_spatial_communication(cfg: dict) -> dict:
                ["scalefactors"]["tissue_hires_scalef"])
     xyp = xy * sf
     top3 = lr_df.head(3)
-    fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.6))
+    fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(62)))
     for ax, r in zip(axes, top3.itertuples()):
         li, ri_ = gi[r.ligand], gi[r.receptor]
         prod = X[:, li] * X[:, ri_]
         s = ax.scatter(xyp[:, 0], xyp[:, 1], c=prod, s=4, cmap="viridis")
-        ax.set_title(f"{r.ligand} × {r.receptor}\nz={r.z_score:.2f}", fontsize=9)
+        ax.set_title(f"{r.ligand} × {r.receptor}\nz={r.z_score:.2f}")
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(s, ax=ax, shrink=0.8)
     fig.suptitle("Top spatially enriched ligand–receptor pairs "
-                 "(product of ligand and receptor expression)", fontsize=10)
+                 "(product of ligand and receptor expression)")
     save_fig(cfg, "communication_top_pairs_on_tissue", fig)
 
     # ---- 6. 落盘 ------------------------------------------------------------

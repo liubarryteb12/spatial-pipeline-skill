@@ -35,7 +35,7 @@ import scipy.sparse as sp  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy,)
+                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_SINGLE, mm, PAL,)
 
 
 def build_weights(adata, n_neighbors: int = 6, row_standardize: bool = True):
@@ -222,7 +222,7 @@ def run_04_svg(cfg: dict) -> dict:
     top_genes = res.head(n_top)["gene"].tolist()
     ncol = 6
     nrow = int(np.ceil(len(top_genes) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(2.5 * ncol, 2.6 * nrow))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(W_DOUBLE, W_DOUBLE * 2.6 * nrow / (2.5 * ncol)))
     axes = np.atleast_1d(axes).ravel()
     sf = float(adata.uns["spatial"][list(adata.uns["spatial"])[0]]
                ["scalefactors"]["tissue_hires_scalef"])
@@ -238,16 +238,16 @@ def run_04_svg(cfg: dict) -> dict:
     for ax in axes[len(top_genes):]:
         ax.axis("off")
     fig.suptitle(f"Top {len(top_genes)} spatially variable genes "
-                 f"({stat_name}, BH p<0.05: {n_sig})", fontsize=11)
+                 f"({stat_name}, BH p<0.05: {n_sig})")
     save_fig(cfg, "svg_top_genes", fig)
 
     # 统计量分布
-    fig, ax = plt.subplots(figsize=(5.6, 3.8))
-    ax.hist(res[stat_name], bins=60, color="#2C7FB8", alpha=0.85)
-    ax.axvline(expected, color="#B2182B", ls="--", lw=1.2,
+    fig, ax = plt.subplots(figsize=(W_SINGLE, mm(60)))
+    ax.hist(res[stat_name], bins=60, color=PAL["primary"], alpha=0.85)
+    ax.axvline(expected, color=PAL["highlight"], ls="--", lw=1.2,
                label=f"expected (no autocorr) = {expected:.4f}")
     ax.set_xlabel(stat_name); ax.set_ylabel("number of genes")
-    ax.set_title(f"{stat_name} distribution across {len(res)} genes", fontsize=10)
+    ax.set_title(f"{stat_name} distribution across {len(res)} genes")
     ax.legend(fontsize=8)
     save_fig(cfg, "svg_stat_distribution", fig)
 

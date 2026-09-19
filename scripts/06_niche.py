@@ -34,7 +34,7 @@ import scipy.sparse as sp  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy,)
+                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm,)
 
 
 def build_adj(adata, n_neighbors: int = 6):
@@ -197,7 +197,8 @@ def run_06_niche(cfg: dict) -> dict:
         # 热图
         piv = ne_ct.pivot(index="type_a", columns="type_b", values="z_score")
         piv = piv.combine_first(piv.T)
-        fig, ax = plt.subplots(figsize=(max(6.5, 0.5 * len(piv) + 2.5),
+        # 宽度夹在 [单栏半, 双栏]，避免类型数多时画出装不进一页的图
+        fig, ax = plt.subplots(figsize=(min(W_DOUBLE, max(W_ONE_HALF, 0.5 * len(piv) + 2.5)),
                                         max(5.5, 0.5 * len(piv) + 2.0)))
         im = ax.imshow(piv.values, cmap="RdBu_r", vmin=-8, vmax=8)
         ax.set_xticks(range(len(piv.columns)))
@@ -205,8 +206,7 @@ def run_06_niche(cfg: dict) -> dict:
         ax.set_yticks(range(len(piv.index)))
         ax.set_yticklabels(piv.index, fontsize=7)
         ax.set_title("Neighborhood enrichment z-score (cell types)\n"
-                     "red = preferentially adjacent, blue = avoid each other",
-                     fontsize=9)
+                     "red = preferentially adjacent, blue = avoid each other")
         fig.colorbar(im, ax=ax, label="z-score", shrink=0.8)
         save_fig(cfg, "niche_enrichment_celltypes", fig)
     else:
@@ -225,7 +225,7 @@ def run_06_niche(cfg: dict) -> dict:
 
     if len(core) >= 2:
         fig, axes = plt.subplots(1, min(3, len(core)),
-                                 figsize=(4.6 * min(3, len(core)), 3.6),
+                                 figsize=(W_DOUBLE, mm(64)),
                                  squeeze=False)
         cmap = plt.get_cmap("tab20")
         for ax, core_t in zip(axes[0], core[:3]):
@@ -236,7 +236,7 @@ def run_06_niche(cfg: dict) -> dict:
                         color=cmap(i % 20), label=nb)
             ax.set_xlabel("distance (pixel)")
             ax.set_ylabel("fraction of neighbors")
-            ax.set_title(f"around domain {core_t}", fontsize=9)
+            ax.set_title(f"around domain {core_t}")
             ax.legend(fontsize=6, ncol=2)
         save_fig(cfg, "niche_cooccurrence", fig)
 

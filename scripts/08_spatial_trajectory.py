@@ -35,7 +35,7 @@ import scipy.sparse as sp  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, record_step, save_fig, set_seed,
-                    spatial_xy, write_json)
+                    spatial_xy, write_json, W_DOUBLE, mm,)
 
 # 复用 03 的空间平滑与 04 的 Moran's I —— 不重复实现。
 # 目录名以数字开头，不能直接 import，所以按文件路径加载。
@@ -247,33 +247,33 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
     out.to_csv(res_dir / "spatial_pseudotime.csv", index=False)
 
     # ---- 8. 出图 -----------------------------------------------------------
-    fig, axes = plt.subplots(1, 3, figsize=(15.4, 4.4))
+    fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(60)))
     s0 = axes[0].scatter(xy[:, 0], xy[:, 1], c=expr_pt, s=7, cmap="viridis")
-    axes[0].set_title(f"Expression-only pseudotime\nMoran's I = {I_expr:.3f}", fontsize=9)
+    axes[0].set_title(f"Expression-only pseudotime\nMoran's I = {I_expr:.3f}")
     fig.colorbar(s0, ax=axes[0], label="pseudotime")
     s1 = axes[1].scatter(xy[:, 0], xy[:, 1], c=spatial_pt, s=7, cmap="viridis")
     axes[1].set_title(f"Spatially-smoothed pseudotime\nMoran's I = {I_spatial:.3f}"
-                      f" (alpha={alpha})", fontsize=9)
+                      f" (alpha={alpha})")
     fig.colorbar(s1, ax=axes[1], label="pseudotime")
     s2 = axes[2].scatter(xy[:, 0], xy[:, 1],
                          c=np.abs(expr_pt - spatial_pt), s=7, cmap="magma")
-    axes[2].set_title("|difference| between the two", fontsize=9)
+    axes[2].set_title("|difference| between the two")
     fig.colorbar(s2, ax=axes[2], label="|delta pseudotime|")
     for ax in axes:
         ax.set_xlabel("x (fullres px)"); ax.set_ylabel("y (fullres px)")
         ax.set_aspect("equal")
     save_fig(cfg, "spatial_pseudotime_maps", fig)
 
-    fig, axes = plt.subplots(1, 2, figsize=(10.4, 4.0))
+    fig, axes = plt.subplots(1, 2, figsize=(W_DOUBLE, mm(64)))
     axes[0].hist(expr_pt, bins=40, alpha=0.65, label="expression-only", color="#B2182B")
     axes[0].hist(spatial_pt, bins=40, alpha=0.65, label="spatially-smoothed", color="#2166AC")
     axes[0].set_xlabel("pseudotime"); axes[0].set_ylabel("n spots")
-    axes[0].set_title("Pseudotime distributions", fontsize=9)
+    axes[0].set_title("Pseudotime distributions")
     axes[0].legend(fontsize=8)
     axes[1].scatter(expr_pt, spatial_pt, s=5, alpha=0.4, color="#444444")
     axes[1].set_xlabel("expression-only pseudotime")
     axes[1].set_ylabel("spatially-smoothed pseudotime")
-    axes[1].set_title(f"Spearman rho = {rho_two:+.3f}", fontsize=9)
+    axes[1].set_title(f"Spearman rho = {rho_two:+.3f}")
     save_fig(cfg, "spatial_pseudotime_compare", fig)
 
     # ---- 9. 状态 -----------------------------------------------------------
