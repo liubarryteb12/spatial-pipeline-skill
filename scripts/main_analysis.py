@@ -221,6 +221,29 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         n = sum(1 for _ in open(p, encoding="utf-8")) - 1
         chk(f"content:{f}", "content", n > 0, f"{f}: {n} 数据行", severity="content")
 
+    # ---- honesty: §3.4 点名的 SpatialDE 是否真跑了 ----
+    # **不判失败，但必须可见。** SpatialDE 在 scipy>=1.12 上需要垫片才能
+    # 导入（见 04_svg.py），垫片失效时它会是 package_missing/failed ——
+    # 那种情况必须红字显示，否则"Moran's I 跑了"会被当成"§3.4 做了"。
+    sp = res_dir / "svg_status.json"
+    if sp.exists():
+        try:
+            sd = json.loads(sp.read_text(encoding="utf-8")).get("spatialde") or {}
+            st = sd.get("status")
+            chk("svg:spatialde", "honesty", st == "ok",
+                f"SpatialDE（§3.4）status={st}：{sd.get('reason') or ''}"
+                + (f"，{sd.get('n_genes_run')} 个基因" if st == "ok" else ""))
+            cmp_ = json.loads(sp.read_text(encoding="utf-8")) \
+                .get("spatialde_vs_morans_i") or {}
+            bg = cmp_.get("background_spearman_rho")
+            chk("svg:spatialde_vs_morans", "honesty", bg is not None,
+                (f"与 Moran's I 的一致性：背景组 rho={bg}"
+                 f"（top 组 {cmp_.get('top_morans_spearman_rho')}）"
+                 if bg is not None else
+                 f"未量化：{cmp_.get('reason', '缺 spatialde_vs_morans_i')}"))
+        except Exception as e:  # noqa: BLE001
+            chk("svg:spatialde", "honesty", False, f"读取失败: {e}")
+
     # ---- honesty: 每步必须说明自己没做什么 ----
     # 这是防止"静默跳过"的检查。
     honest_map = {

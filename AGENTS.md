@@ -238,3 +238,37 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 
 **`init_manifest` 必须清掉上一轮**，否则上轮的清单冒充本轮，
 比没有清单更糟（同规则 16）。
+
+## 19. 老包要兼容垫片，但垫片必须可验证、可复算、如实记录
+
+文档 §3.4 点名 SpatialDE。**SpatialDE 1.1.3 是 2019 年的包，
+在当代依赖上有两处独立的不兼容**（都实测确认，不是推测）：
+
+| # | 位置 | 症状 | 处理 |
+|---|---|---|---|
+| 1 | `base.py:12` `from scipy.misc import derivative` | scipy 1.12 移除了 `scipy.misc.derivative` → `ImportError`，**装得上但导不进来** | 垫片补回该名字（3 点中心差分，Vandermonde 解权重）|
+| 2 | `base.py:432` → `util.py:19` `pv = pv.ravel()` | 传入的是 pandas Series，**Series 没有 `ravel`** → `AttributeError` | 绕开 `run`，直接用 `base.dyn_de` + `base.get_mll_results`，多重检验校正改用本仓库的 BH |
+
+**两条硬要求：**
+
+1. **垫片必须用已知解析导数的函数对拍**，不能只看"import 成功了"。
+   `_central_diff_weights(3,1)` 必须是 `[-1/2, 0, 1/2]`、`(3,2)` 必须是
+   `[1,-2,1]`；`sin`/`exp`/`x^3`/`x^4` 的相对误差要 <1e-4。
+   **垫片错了只会让结果悄悄偏，而不会报错。**
+2. **必须记录本轮是否真的打了垫片**（`scipy_misc_derivative_shimmed`）。
+   已经存在时返回 `False`，不无条件声称"我修了"。
+
+**绕开 `run` 的代价要说清楚**：qval 从 Storey q-value 变成 BH。
+这反而更好 —— Moran's I 那条路也是 BH，**两条路的校正口径一致才可比**。
+
+**只用 `SpatialDE.base.X`，不能用 `SpatialDE.X`。**
+`SpatialDE/__init__.py` 只导出 `dyn_de` / `run` / `model_search` /
+`fit_patterns` / `spatial_patterns` 五个名字，`get_l_limits` 与
+`get_mll_results` 都在 `base` 里没被提上来。
+
+**代价与取舍**：SpatialDE 每基因要拟合一个高斯过程，实测 4025 个 spot 上
+150 个基因约 2.6 分钟。所以只跑「Moran's I 前 100 + 按种子随机抽 50 作背景」。
+**子集抽样会引入选择偏差**（前 100 个是 Moran's I 挑的），
+所以一致性必须**分 top 组和背景组各报一次** ——
+合并成一个数会把"两边都认为强"和"两边都认为弱"平均掉。
+**背景组的 rho 才是有信息量的那个数**（实测 0.7954，top 组 0.8713）。

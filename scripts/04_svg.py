@@ -18,10 +18,21 @@
 **本工具自己实现 Moran's I，不依赖 squidpy。** 理由：squidpy 的
 `spatial_autocorr` 在版本间改过参数名和返回值结构；自己实现
 （20 行）比跟着上游 API 漂移更稳，而且能明确控制置换方式。
+
+**另跑 SpatialDE 作为独立交叉验证（文档 §3.4）。** 两者是不同框架：
+Moran's I 是空间自相关、**依赖权重矩阵**；SpatialDE 把基因拟合成高斯过程、
+**不需要权重矩阵**。所以两者一致说明空间结构不是权重选择的产物。
+
+SpatialDE 1.1.3 是 2019 年的包，在当代依赖上有**两处独立的不兼容**
+（都实测确认，见 `_shim_scipy_misc_derivative` 与 `try_spatialde` 的说明）：
+scipy>=1.12 移除了 `scipy.misc.derivative`（垫片解决，只影响标准误列），
+以及 `util.qvalue` 对 pandas Series 调 `.ravel()`（绕开 `run`，
+多重检验校正改用本仓库的 BH —— 反而与 Moran's I 那条路口径一致）。
 """
 
 from __future__ import annotations
 
+import math
 import sys
 import time
 from pathlib import Path
@@ -124,6 +135,226 @@ def permutation_pvalues(X: np.ndarray, W: sp.spmatrix, observed: np.ndarray,
         n_ge += (null >= observed)
     # +1 校正：避免 p=0（有限次置换下不可能有比 1/(n+1) 更小的 p）
     return (n_ge + 1) / (n_perms + 1)
+
+
+# ---------------------------------------------------------------------------
+# SpatialDE（文档 §3.4 点名的工具）
+# ---------------------------------------------------------------------------
+# **与 Moran's I 是两种不同的统计框架。** Moran's I 是空间自相关（基于
+# 权重矩阵），SpatialDE 把每个基因拟合成高斯过程、用似然比检验是否有
+# 空间相关的长度尺度。**权重矩阵换一下 Moran's I 就变，而 SpatialDE
+# 不需要权重矩阵** —— 这正是它值得作为独立交叉验证的原因。
+#
+# 但 SpatialDE 1.1.3（2019 年，7 年未更新）在现代 scipy 上**装得上、
+# 导不进来**：`SpatialDE/base.py` 第 12 行是
+#     from scipy.misc import derivative
+# 而 `scipy.misc.derivative` 在 **scipy 1.12 已被移除**
+# （本仓库 requirements 钉的是 scipy>=1.11,<2.0，实测本地 1.18.1 上
+# `hasattr(scipy.misc, "derivative")` 为 False）。
+#
+# **垫片是否安全？** SpatialDE 只在两处用 derivative，且都只算**标准误**：
+#   base.py:178  s2_logdelta = 1 / (derivative(LL_obj, ..., n=2) ** 2)
+#   base.py:229  s2_FSV      = derivative(FSV, ..., n=1) ** 2 * s2_logdelta
+# 主统计量（l / max_l / FSV / pval / qval / BIC）都不经过它。
+# 所以垫片只影响 SE 列，不影响这里要用的 FSV 与 qval。
+#
+# 垫片用的是标准中心差分（3 点，与 scipy 默认 order=3 一致），
+# 权重由 Vandermonde 方程组解出 —— 见 _central_diff_weights。
+SPATIALDE_MAX_GENES = 150
+
+
+def _central_diff_weights(npts: int, n: int) -> np.ndarray:
+    """等距点上的 n 阶导数有限差分权重（Vandermonde 解法）。
+
+    点取在 j = -ho..ho（ho = npts//2），解
+        Σ_b w_b · j_b^a / a! = δ_{a,n}   for a = 0..npts-1
+    npts=3, n=1 → [-1/2, 0, 1/2]（经典中心差分）
+    npts=3, n=2 → [1, -2, 1]
+    """
+    ho = npts // 2
+    j = np.arange(-ho, ho + 1, dtype=float)
+    if len(j) != npts:
+        raise ValueError(f"npts 必须是奇数，收到 {npts}")
+    # **用 math.factorial，不用 np.math.factorial** —— np.math 在 numpy 2.0
+    # 已被移除，而 requirements 允许 numpy<3。用 np.math 会在 CI 上
+    # AttributeError，本地旧 numpy 上却看不出来。
+    fact = np.array([float(math.factorial(a)) for a in range(npts)])
+    A = (j[None, :] ** np.arange(npts)[:, None]) / fact[:, None]
+    b = np.zeros(npts)
+    b[n] = 1.0
+    return np.linalg.solve(A, b)
+
+
+def _shim_scipy_misc_derivative() -> bool:
+    """把 scipy 1.12 移除的 `scipy.misc.derivative` 补回去。
+
+    返回是否**本次做了**补丁（已经存在则返回 False）。
+    **只补这一个名字，不碰 scipy 其他部分。**
+    """
+    import warnings
+
+    # **告警是 `import scipy.misc` 这一行本身发出的**，不是赋值那行 ——
+    # 所以 import 也必须在上下文里，否则压不住。
+    # 只压 scipy.misc 这一条：我们是有意访问这个正在被移除的命名空间
+    # （它正是要补的东西），告警是预期内噪声；压掉它不掩盖其他告警。
+    # 用 catch_warnings 而不是全局 filterwarnings，避免影响调用方配置。
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning,
+                                message=r".*scipy\.misc is deprecated.*")
+        import scipy.misc as _misc
+        if hasattr(_misc, "derivative"):
+            return False
+
+        def derivative(func, x0, dx=1.0, n=1, args=(), order=3):
+            if order % 2 == 0:
+                raise ValueError("'order' must be an odd integer.")
+            if order < n + 1:
+                raise ValueError(
+                    "'order' (the number of points used to compute the derivative), "
+                    "must be at least the derivative order 'n' + 1.")
+            w = _central_diff_weights(order, n)
+            ho = order // 2
+            # 权重按 j 升序给，点也按 j 升序取
+            total = 0.0
+            for k, wk in enumerate(w):
+                total += wk * func(x0 + (k - ho) * dx, *args)
+            return total / (dx ** n)
+
+        _misc.derivative = derivative
+    return True
+
+
+def try_spatialde(X: np.ndarray, xy: np.ndarray, genes: list,
+                  res: pd.DataFrame, cfg: dict, log=log_info):
+    """跑 SpatialDE 并与 Moran's I 比对。
+
+    **只在基因子集上跑。** SpatialDE 每个基因要拟合一个高斯过程，
+    实测 4025 个 spot 上单基因约 1-3 秒 —— 4000 个基因要几小时，
+    会直接撞穿 CI 的 45 分钟上限。所以取「Moran's I 最高的前 100 个」
+    + 「按种子随机抽 50 个作背景」，共 150 个。
+
+    **子集抽样会引入选择偏差**（前 100 个是 Moran's I 挑出来的），
+    所以一致性数字要**分两组报**：top 组和随机背景组。
+    只报合并的相关会把"两边都认为强"和"两边都认为弱"混成一个数。
+    """
+    info = {"attempted": True, "status": None, "reason": "",
+            "max_genes": SPATIALDE_MAX_GENES}
+    try:
+        shimmed = _shim_scipy_misc_derivative()
+        info["scipy_misc_derivative_shimmed"] = shimmed
+        import SpatialDE
+        info["version"] = getattr(SpatialDE, "__version__", "1.1.3")
+    except Exception as exc:  # noqa: BLE001
+        info["status"] = "package_missing"
+        info["reason"] = f"SpatialDE 不可用（{type(exc).__name__}: {exc}）"
+        log(f"SpatialDE 不可用：{info['reason']}")
+        return None, info
+
+    gi = {g: i for i, g in enumerate(genes)}
+    n_top = min(100, len(res))
+    top = [g for g in res.head(n_top)["gene"].tolist() if g in gi]
+    pool = [g for g in genes if g not in set(top)]
+    rng = np.random.default_rng(cfg["analysis"]["seed"])
+    n_bg = min(SPATIALDE_MAX_GENES - len(top), len(pool))
+    bg = list(rng.choice(pool, size=n_bg, replace=False)) if n_bg > 0 else []
+    sel = top + bg
+    info["n_genes_run"] = len(sel)
+    info["n_top_selected"] = len(top)
+    info["n_background_selected"] = len(bg)
+
+    try:
+        from scipy import stats as _st
+        from statsmodels.stats.multitest import multipletests
+
+        coords = np.asarray(xy, dtype=float)
+        counts = pd.DataFrame(X[:, [gi[g] for g in sel]], columns=sel)
+
+        # **不走 SpatialDE.run。** 它第 432 行是
+        #     mll_results['qval'] = qvalue(mll_results['pval'])
+        # 而 util.qvalue 第 19 行是 `pv = pv.ravel()` —— pandas Series
+        # **没有 ravel**（实测 pandas 3.0.5：hasattr(pd.Series,'ravel') = False）。
+        # 这是 1.1.3 里第二个独立的不兼容，和 scipy.misc 那个无关。
+        #
+        # 绕开的办法是**只用它的模型拟合**（dyn_de / get_mll_results），
+        # 多重检验校正用本仓库自己的 BH。这反而更好：
+        # Moran's I 那边也是 BH，两条路的校正口径一致才可比。
+        # 代价是 qval 从 Storey q-value 变成 BH —— 已记进 limitations。
+        l_min, l_max = SpatialDE.base.get_l_limits(coords)
+        kernel_space = {"SE": np.logspace(np.log10(l_min), np.log10(l_max), 10),
+                        "const": 0}
+        info["kernel_lengthscales"] = [round(float(v), 3)
+                                       for v in kernel_space["SE"]]
+        # **注意用 SpatialDE.base.X，不能用 SpatialDE.X。**
+        # `SpatialDE/__init__.py` 只导出 dyn_de / run / model_search /
+        # fit_patterns / spatial_patterns 五个名字，get_l_limits 与
+        # get_mll_results 都在 base 里、没被提上来。
+        raw = SpatialDE.base.dyn_de(coords, counts, kernel_space)
+        out = pd.DataFrame(SpatialDE.base.get_mll_results(raw))
+        out["pval"] = 1.0 - _st.chi2.cdf(out["LLR"], df=1)
+        out["qval"] = multipletests(out["pval"], method="fdr_bh")[1]
+        out["_group"] = np.where(out["g"].isin(set(top)), "top_morans", "background")
+        info["status"] = "ok"
+        info["qval_method"] = "BH（本仓库实现）"
+        info["bypassed_spatialde_run"] = True
+        info["bypass_reason"] = ("SpatialDE.util.qvalue 对 pandas Series 调 .ravel()，"
+                                 "现代 pandas 已无此方法")
+        info["columns"] = sorted(map(str, out.columns))
+        info["n_significant_qval_0.05"] = int((out["qval"] < 0.05).sum())
+        log(f"SpatialDE 完成：{len(out)} 个基因，"
+            f"qval<0.05 的 {info['n_significant_qval_0.05']} 个")
+        return out, info
+    except Exception as exc:  # noqa: BLE001
+        info["status"] = "failed"
+        info["reason"] = f"{type(exc).__name__}: {exc}"
+        log_warn(f"SpatialDE 跑失败：{info['reason']}")
+        return None, info
+
+
+def compare_with_spatialde(sd: pd.DataFrame, res: pd.DataFrame,
+                           log=log_info) -> dict:
+    """量化 SpatialDE 的 FSV 与 Moran's I 的一致程度。
+
+    **分 top 组和背景组各报一次。** 合并报会把"两边都认为强"和
+    "两边都认为弱"平均成一个数，掩盖真实的一致性结构。
+    """
+    out = {"compared": False}
+    if sd is None or len(sd) == 0:
+        return out
+    try:
+        from scipy.stats import spearmanr
+        # 本步骤产出的列名是 spatial_score（Moran's I 减期望值 / Geary 反之），
+        # 越大越有空间结构。名字写错会静默退到"取第 2 列"，而那可能是
+        # expected 之类的常数列 —— 常数列的 Spearman 是 nan。
+        if "spatial_score" not in res.columns:
+            out["reason"] = (f"res 里没有 spatial_score 列（有 {list(res.columns)}），"
+                             "拒绝用兜底列做对比")
+            return out
+        m = res.set_index("gene")["spatial_score"]
+        out["compared"] = True
+        out["morans_column_used"] = "spatial_score"
+        for grp in ("top_morans", "background", "all"):
+            sub = sd if grp == "all" else sd[sd["_group"] == grp]
+            common = [g for g in sub["g"] if g in m.index]
+            if len(common) < 5:
+                out[f"{grp}_n"] = len(common)
+                continue
+            rho, p = spearmanr(m.loc[common].values,
+                               sub.set_index("g").loc[common, "FSV"].values)
+            out[f"{grp}_n"] = len(common)
+            out[f"{grp}_spearman_rho"] = round(float(rho), 4)
+            out[f"{grp}_spearman_p"] = float(p)
+        out["interpretation"] = (
+            "SpatialDE 用高斯过程似然比，**不需要空间权重矩阵**；"
+            "Moran's I 依赖权重矩阵。两者一致说明空间结构不是权重选择的产物。"
+            "top 组是 Moran's I 挑出来的，一致性天然偏高；"
+            "**背景组的 rho 才是有信息量的那个数**。")
+        log("SpatialDE vs Moran's I："
+            + "，".join(f"{g} rho={out.get(f'{g}_spearman_rho')}"
+                        for g in ("top_morans", "background")))
+    except Exception as exc:  # noqa: BLE001
+        out["reason"] = f"对比失败：{type(exc).__name__}: {exc}"
+        log_warn(out["reason"])
+    return out
 
 
 def run_04_svg(cfg: dict) -> dict:
@@ -251,6 +482,20 @@ def run_04_svg(cfg: dict) -> dict:
     ax.legend(fontsize=8)
     save_fig(cfg, "svg_stat_distribution", fig)
 
+    # ---- 7. SpatialDE 交叉验证（文档 §3.4）---------------------------------
+    # 用 array 坐标（不缩放）：SpatialDE 估的是长度尺度，坐标等比缩放
+    # 只改 l 的数值，不改检验结论；用原始坐标少一层换算。
+    sd_res, sd_info = try_spatialde(X, spatial_xy(adata), genes, res, cfg)
+    sd_cmp = {"compared": False}
+    if sd_res is not None:
+        sd_res.to_csv(res_dir / "spatialde_results.csv", index=False)
+        sd_cmp = compare_with_spatialde(sd_res, res)
+        if sd_info.get("scipy_misc_derivative_shimmed"):
+            sd_cmp["shim_note"] = (
+                "本轮给 scipy 补了 1.12 移除的 scipy.misc.derivative（垫片）。"
+                "SpatialDE 只在算标准误时用它，主统计量 FSV/qval 不经过 —— "
+                "详见 04_svg.py 的说明。")
+
     status = {
         "dataset_id": cfg["dataset_id"],
         "status": "ok",
@@ -277,6 +522,8 @@ def run_04_svg(cfg: dict) -> dict:
             "而非『同一类细胞内该基因被调控』",
         ],
     }
+    status["spatialde"] = sd_info
+    status["spatialde_vs_morans_i"] = sd_cmp
     write_json(res_dir / "svg_status.json", status)
     return status
 
