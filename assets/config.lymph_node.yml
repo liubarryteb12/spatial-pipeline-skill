@@ -1,0 +1,102 @@
+# ============================================================================
+# assets/config.lymph_node.yml — 空间转录组流水线配置
+# ============================================================================
+# 对应 assets/datasets.yml 里的 lymph_node（正常人淋巴结）。
+# 换成自己的数据：复制本文件，改 dataset_id 与 source。
+# ============================================================================
+
+dataset_id: lymph_node
+
+# ---- 数据来源 ---------------------------------------------------------------
+# **Visium 必须给两半。** 只给矩阵会退化成普通单细胞数据。
+source:
+  dataset: lymph_node       # assets/datasets.yml 里的键
+  # 也可以直接写：
+  #   matrix_url: https://.../filtered_feature_bc_matrix.h5
+  #   spatial_url: https://.../spatial.tar.gz
+  #   library_id: my_library
+
+# ---- QC ---------------------------------------------------------------------
+qc:
+  min_counts: 500           # 每个 spot 至少多少 UMI
+  max_counts: null          # null = 不设上限
+  min_genes: 200
+  max_genes: null
+  # **淋巴结用 20。** 组织特异的阈值：
+  #   PBMC 5-10 / 淋巴结 20 / 心肌 30-50 / 肝 30+
+  # 用 PBMC 的阈值套到心肌上会滤掉大部分 spot。
+  max_pct_mt: 20
+  min_spots: 100            # 过滤后至少要剩这么多 spot
+
+# ---- 标准化与降维 -----------------------------------------------------------
+norm:
+  target_sum: 10000
+  n_top_genes: 2000
+  hvg_flavor: seurat_v3     # 需要 scikit-misc；缺了会降级到 seurat 并记录
+  scale: true               # PCA 前是否 z-score
+
+reduce:
+  n_pcs: 30
+  n_neighbors: 15
+
+# ---- 空间域 -----------------------------------------------------------------
+domains:
+  # 空间平滑的强度：把每个 spot 的表达与其空间邻居平均，
+  # 再做聚类。**这是"空间域"与"表达簇"的区别所在。**
+  #   0    = 不平滑，等价于普通表达聚类
+  #   0.5  = 自身与邻居各半
+  #   1.0  = 完全用邻居均值
+  smoothing: 0.5
+  # 空间邻居数（Visium 的六边形网格：6 个直接邻居）
+  n_spatial_neighbors: 6
+  resolution: 0.8
+  # 分辨率扫描（让"选 0.8"有依据）
+  resolution_scan: [0.2, 0.4, 0.6, 0.8, 1.0, 1.5]
+
+# ---- 空间高变基因（SVG）-----------------------------------------------------
+svg:
+  method: moran             # moran | geary
+  n_top: 30
+  n_perms: 100              # 置换检验次数（算 p 值）
+  # **Moran's I 需要一个空间权重矩阵。** 用 Visium 的六边形邻居图。
+  n_neighbors: 6
+
+# ---- 解卷积 -----------------------------------------------------------------
+deconvolution:
+  # **没有参考就不能解卷积。** 三选一：
+  #   builtin   —— 用 assets/reference_signatures.yml 里的 marker 签名
+  #   h5ad      —— 用 scRNA-seq 参考（需要 reference_h5ad 路径与 celltype_key）
+  #   none      —— 不做，并在状态里写明原因
+  reference: builtin
+  signature_set: lymph_node   # reference_signatures.yml 里的键
+  # reference: h5ad
+  # reference_h5ad: data/ref.h5ad
+  # celltype_key: celltype
+  # 每个 spot 里，比例低于此值的细胞类型置 0（去噪）
+  min_proportion: 0.01
+  # 重建误差高于此值的 spot 标为不可靠
+  max_reconstruction_error: 0.5
+
+# ---- 空间邻域 / niche -------------------------------------------------------
+niche:
+  enabled: true
+  n_neighbors: 6            # Visium 六边形网格
+  n_perms: 100
+  max_distance_um: 400      # 共现曲线的最大距离
+
+# ---- 空间通讯 ---------------------------------------------------------------
+communication:
+  enabled: true
+  # 只在**空间上相邻**的 spot 之间算配体-受体。
+  # 这是空间数据相对单细胞的核心优势：能说"它们真的挨着"。
+  max_distance_um: 200      # 超过这个距离的 spot 对不考虑
+  n_permutations: 50        # 零分布的随机采样次数
+
+# ---- 分析选项 ---------------------------------------------------------------
+analysis:
+  seed: 20260919
+  figure_dpi: 150
+  top_markers: 25
+  # 域标签打分用哪个签名集（assets/reference_signatures.yml 的键）。
+  # 不填则跟随 deconvolution.signature_set。
+  celltype_markers: lymph_node

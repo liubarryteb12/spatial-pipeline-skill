@@ -1,0 +1,68 @@
+# ============================================================================
+# assets/datasets.yml — Visium 数据集登记表
+# ============================================================================
+# **每个数据集必须同时给 matrix_url 与 spatial_url。**
+# Visium 的数据是两半：表达矩阵 + 空间信息（坐标/缩放/H&E 图像）。
+# 只给矩阵的话数据退化成普通单细胞数据 —— 丢掉空间坐标等于丢掉这个
+# 技术存在的理由。00_fetch.py 会强制要求两者都在。
+#
+# 10x 的 URL 规律（V1 系列）：
+#   https://cf.10xgenomics.com/samples/spatial-exp/1.1.0/<样本名>/<样本名>_filtered_feature_bc_matrix.h5
+#   https://cf.10xgenomics.com/samples/spatial-exp/1.1.0/<样本名>/<样本名>_spatial.tar.gz
+#
+# 版本号（1.1.0 / 1.2.0 / 2.0.0）随样本不同，**不能靠拼**，要实测。
+# 用 `python scripts/00_fetch.py --probe <URL>` 可以先验证再登记。
+# ============================================================================
+
+datasets:
+
+  # ---- 用于 CI 验证流水线本身 -------------------------------------------------
+  # 人淋巴结。选它的理由：
+  #   1. 体积小（矩阵 29 MB + 空间 7.9 MB）
+  #   2. **空间结构清晰** —— 滤泡、生发中心、副皮质区在 H&E 上肉眼可辨，
+  #      所以"空间域划分是否合理"这件事可以被判断，而不只是"跑通了"
+  #   3. 细胞类型组成已知，解卷积的结果有对照
+  lymph_node:
+    matrix_url: https://cf.10xgenomics.com/samples/spatial-exp/1.1.0/V1_Human_Lymph_Node/V1_Human_Lymph_Node_filtered_feature_bc_matrix.h5
+    spatial_url: https://cf.10xgenomics.com/samples/spatial-exp/1.1.0/V1_Human_Lymph_Node/V1_Human_Lymph_Node_spatial.tar.gz
+    library_id: lymph_node
+    organism: Homo sapiens
+    tissue: lymph node
+    condition: normal
+    size_mb: 37
+    note: 正常淋巴结；空间结构清晰（滤泡/生发中心/副皮质区）
+
+  breast_cancer:
+    matrix_url: https://cf.10xgenomics.com/samples/spatial-exp/1.1.0/V1_Breast_Cancer_Block_A_Section_1/V1_Breast_Cancer_Block_A_Section_1_filtered_feature_bc_matrix.h5
+    spatial_url: https://cf.10xgenomics.com/samples/spatial-exp/1.1.0/V1_Breast_Cancer_Block_A_Section_1/V1_Breast_Cancer_Block_A_Section_1_spatial.tar.gz
+    library_id: breast_cancer
+    organism: Homo sapiens
+    tissue: breast
+    condition: invasive ductal carcinoma
+    size_mb: 35
+    note: 乳腺浸润性导管癌；肿瘤/间质/免疫浸润区混杂
+
+  mouse_brain_sagittal_anterior:
+    matrix_url: https://cf.10xgenomics.com/samples/spatial-exp/1.1.0/V1_Mouse_Brain_Sagittal_Anterior/V1_Mouse_Brain_Sagittal_Anterior_filtered_feature_bc_matrix.h5
+    spatial_url: https://cf.10xgenomics.com/samples/spatial-exp/1.1.0/V1_Mouse_Brain_Sagittal_Anterior/V1_Mouse_Brain_Sagittal_Anterior_spatial.tar.gz
+    library_id: mouse_brain
+    organism: Mus musculus
+    tissue: brain
+    condition: normal
+    size_mb: 26
+    note: 小鼠脑矢状面前部；**小鼠**，线粒体基因前缀是 mt- 不是 MT-
+
+  human_heart:
+    matrix_url: https://cf.10xgenomics.com/samples/spatial-exp/1.1.0/V1_Human_Heart/V1_Human_Heart_filtered_feature_bc_matrix.h5
+    spatial_url: https://cf.10xgenomics.com/samples/spatial-exp/1.1.0/V1_Human_Heart/V1_Human_Heart_spatial.tar.gz
+    library_id: human_heart
+    organism: Homo sapiens
+    tissue: heart
+    condition: normal
+    size_mb: 18
+    note: 人心肌；**线粒体比例天然很高**，用 PBMC 的 max_pct_mt=10 会滤掉大部分 spot
+
+  # ---- 模板：换成自己的数据 ---------------------------------------------------
+  # 自己跑 Space Ranger 得到的输出，上传到某处后按上面格式登记即可。
+  # 关键是 matrix_url 指向 filtered_feature_bc_matrix.h5，
+  # spatial_url 指向 spatial.tar.gz（**不是解压后的目录**）。

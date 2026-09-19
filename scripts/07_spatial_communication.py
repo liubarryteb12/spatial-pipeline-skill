@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""
+07_spatial_communication.py — 空间约束的配体-受体分析
+
+**核心增量：只有空间上接近的细胞才可能通讯。**
+
+普通单细胞流程算配体-受体，隐含假设"样本里所有细胞都可能互相作用" ——
+在 5000 个细胞里，A 类细胞和 B 类细胞永远"共现"，所以永远算出信号。
+空间数据能加一个真实的约束：**只统计距离在阈值内的 spot 对**。
+
+这里报两类结果：
+  1. **空间富集**：把 LR 表达量按"距离内 vs 距离外"分组比较 ——
+     同一对 LR，在近邻对上是否比远距离对上更强？
+  2. **按域/类型的 LR 强度**：哪些域组合在哪些 LR 上活跃。
+
+**必须报"可用 LR 对数"。** 配体-受体基因可能不在数据里（Visium 的
+基因覆盖不全），或者表达太低（零膨胀）。如果 38 对里只有 3 对可用，
+那结论建立在 3 对上，必须说清楚 —— 这是 Part 2 实测踩过的坑
+（HVG 子集上只有 3/38 可用，全基因集上是 27/38）。
+
+**本工具不做"通讯与否"的二元判定。** 真正的细胞通讯推断需要
+CellPhoneDB / CellChat 那样的统计框架（含置换检验与受体复合物建模），
+本工具只给"空间约束下的 LR 共表达强度"这个描述性量。
+"""
+
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import scanpy as sc  # noqa: E402
+import scipy.sparse as sp  # noqa: E402
+import yaml  # noqa: E402
+
+from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
+                    log_warn, parse_args, record_step, save_fig, set_seed,
+                    spot_radius_plot_units, write_json, spatial_xy,)
+
+
+def load_lr_pairs(cfg: dict):
+    p = Path(__file__).resolve().parent.parent / "assets" / "ligand_receptor.yml"
+    with open(p, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh)
+    return doc.get("pairs", []), p
+
+
+def get_expression(adata):
+    """
+    取表达矩阵。
+
+    **必须用全基因集，不是 HVG。** Part 2 实测：在 2000 个 HVG 上
+    38 对 LR 只有 3 对可用；换到全基因集（13714 基因）变成 27 对。
+    配体/受体基因大多是低表达基因，几乎不可能进 HVG。
+    """
+    if adata.raw is not None:
+        X = adata.raw.X
+        X = X.toarray() if sp.issparse(X) else np.asarray(X)
+        return X.astype(np.float64), list(adata.raw.var_names), "adata.raw (全基因集)"
+    raise RuntimeError(
+        "adata.raw 为空 —— 配体-受体分析需要全基因集。\n"
+        "  为什么必须停: 配体/受体大多是低表达基因，几乎不可能进 HVG。\n"
+        "  Part 2 实测：2000 个 HVG 上 38 对 LR 只有 3 对可用，\n"
+        "  全基因集上是 27 对 —— 用 HVG 会让结论建立在 3 对上。")
+
+
+def run_07_spatial_communication(cfg: dict) -> dict:
+    ensure_dirs(cfg)
+    set_seed(cfg)
+    data_dir = Path(cfg["output"]["data_dir"])
+    res_dir = Path(cfg["output"]["results_dir"])
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    c = cfg.get("communication") or {}
+    if not c.get("enabled", True):
+        status = {"dataset_id": cfg["dataset_id"], "status": "disabled",
+                  "reason": "配置 communication.enabled=false"}
+        write_json(res_dir / "communication_status.json", status)
+        return status
+
+    adata = sc.read_h5ad(data_dir / "domains.h5ad")
+    X, genes, xsrc = get_expression(adata)
+    log_info(f"表达矩阵: {X.shape[0]} spot x {X.shape[1]} 基因（来源 {xsrc}）")
+
+    pairs, lr_path = load_lr_pairs(cfg)
+    log_info(f"配体-受体对: {len(pairs)} 对（{lr_path.name}）")
+
+    gi = {g: i for i, g in enumerate(genes)}
+
+    # ---- 1. 可用性筛查 ------------------------------------------------------
+    usable, skipped = [], []
+    for pr in pairs:
+        lig, rec = pr.get("ligand"), pr.get("receptor")
+        if lig not in gi or rec not in gi:
+            skipped.append({"pair": f"{lig}-{rec}",
+                            "reason": "基因不在数据里",
+                            "missing": [g for g in (lig, rec) if g not in gi]})
+            continue
+        li, ri_ = gi[lig], gi[rec]
+        # 至少要在一部分 spot 里有表达，否则全零的列算出来全是 0
+        frac_l = float((X[:, li] > 0).mean())
+        frac_r = float((X[:, ri_] > 0).mean())
+        if frac_l < 0.01 or frac_r < 0.01:
+            skipped.append({"pair": f"{lig}-{rec}", "reason": "表达过低",
+                            "frac_ligand": round(frac_l, 4),
+                            "frac_receptor": round(frac_r, 4)})
+            continue
+        usable.append({**pr, "ligand_idx": li, "receptor_idx": ri_,
+                       "frac_ligand": round(frac_l, 4),
+                       "frac_receptor": round(frac_r, 4)})
+
+    log_info(f"可用 LR 对: {len(usable)}/{len(pairs)}"
+             f"（跳过 {len(skipped)} 对）")
+    if len(usable) / max(len(pairs), 1) < 0.25:
+        log_warn(f"**只有 {len(usable)}/{len(pairs)} 对 LR 可用** —— "
+                 f"结论建立在这少数对上。常见原因：配体/受体基因"
+                 f"不在 Visium 的基因覆盖里，或表达太低（零膨胀）")
+    if not usable:
+        status = {"dataset_id": cfg["dataset_id"], "status": "no_usable_pairs",
+                  "reason": f"{len(pairs)} 对 LR 里没有一对的两个基因都可用",
+                  "skipped": skipped[:50]}
+        write_json(res_dir / "communication_status.json", status)
+        return status
+
+    # ---- 2. 空间距离矩阵（用 kNN，不是全对全）------------------------------
+    from scipy.spatial import cKDTree
+    xy = spatial_xy(adata)
+    tree = cKDTree(xy)
+    d, idx = tree.query(xy, k=min(31, len(xy)))
+    med = float(np.median(d[:, 1]))
+    # Visium spot 中心间距约 100 μm；把 μm 阈值换成像素
+    um_per_px = 100.0 / med
+    max_um = float(c.get("max_distance_um", 200))
+    max_px = max_um / um_per_px
+    log_info(f"空间阈值: {max_um} μm = {max_px:.1f} px"
+             f"（spot 间距 {med:.1f} px ≈ 100 μm）")
+
+    # 近邻掩码：距离 <= 阈值
+    near = d[:, 1:] <= max_px
+    n_near = int(near.sum())
+    log_info(f"阈值内的 spot 对: {n_near}（平均每 spot {near.sum(1).mean():.1f} 个）")
+
+    # ---- 3. 每对 LR 的空间富集 ---------------------------------------------
+    # 统计量：近邻对上的 LR 共表达均值，减去全部对的均值，再标准化。
+    # **这个量是描述性的，不是假设检验。**
+    lr_scores = []
+    for pr in usable:
+        L = X[:, pr["ligand_idx"]]
+        R = X[:, pr["receptor_idx"]]
+        # 归一化表达（每 spot 的总量已由 scanpy 归一化过，这里用 log1p 值）
+        prod = L * R
+        # 近邻对上的平均（用邻居索引取值）
+        nb_vals = prod[idx[:, 1:]]
+        near_mean = float(nb_vals[near].mean()) if n_near else np.nan
+        # 零模型：随机抽同样多的 spot，看它们的 prod 均值分布。
+        # **随机抽 spot（不是抽 spot 对）** —— 因为 near_mean 是
+        # "邻居位置上 prod 的均值"，对应的零假设是"prod 与位置无关"，
+        # 所以零分布应该是"在全部 spot 上随机取同样多个值"。
+        rng = np.random.default_rng(cfg["analysis"]["seed"])
+        n_perm = int(c.get("n_permutations", 50))
+        perm_means = [float(prod[rng.integers(0, len(xy), n_near)].mean())
+                      for _ in range(n_perm)]
+        null_mu = float(np.mean(perm_means))
+        null_sd = float(np.std(perm_means)) or 1e-9
+        z = (near_mean - null_mu) / null_sd
+        lr_scores.append({
+            "ligand": pr["ligand"], "receptor": pr["receptor"],
+            "pathway": pr.get("pathway", ""),
+            "near_mean": round(near_mean, 5),
+            "null_mean": round(null_mu, 5),
+            "z_score": round(float(z), 3),
+            "frac_ligand": pr["frac_ligand"], "frac_receptor": pr["frac_receptor"],
+        })
+
+    lr_df = pd.DataFrame(lr_scores).sort_values("z_score", ascending=False)
+    lr_df.to_csv(res_dir / "communication_lr_scores.csv", index=False)
+    log_info("空间富集 top5: " + ", ".join(
+        f"{r.ligand}-{r.receptor}(z={r.z_score:.2f})" for r in lr_df.head(5).itertuples()))
+
+    # ---- 4. 按域/类型的 LR 强度 ---------------------------------------------
+    dom_blocks = []
+    if "domain" in adata.obs.columns:
+        doms = adata.obs["domain"].astype(str).values
+        for pr in usable:
+            prod = X[:, pr["ligand_idx"]] * X[:, pr["receptor_idx"]]
+            for dm in sorted(set(doms)):
+                m = doms == dm
+                dom_blocks.append({"domain": dm, "ligand": pr["ligand"],
+                                   "receptor": pr["receptor"],
+                                   "pathway": pr.get("pathway", ""),
+                                   "mean_product": round(float(prod[m].mean()), 5),
+                                   "n_spots": int(m.sum())})
+    if dom_blocks:
+        dom_df = pd.DataFrame(dom_blocks)
+        dom_df.to_csv(res_dir / "communication_by_domain.csv", index=False)
+        log_info(f"按域的 LR 强度表: {len(dom_df)} 行")
+
+    # ---- 5. 出图 ------------------------------------------------------------
+    top = lr_df.head(20).iloc[::-1]
+    fig, ax = plt.subplots(figsize=(7.0, max(4.0, 0.32 * len(top) + 1.6)))
+    colors = ["#B2182B" if z > 2 else ("#2166AC" if z < -2 else "#999999")
+              for z in top["z_score"]]
+    ax.barh(range(len(top)), top["z_score"], color=colors)
+    ax.set_yticks(range(len(top)))
+    ax.set_yticklabels([f"{r.ligand}–{r.receptor}" for r in top.itertuples()],
+                       fontsize=7)
+    ax.axvline(0, color="k", lw=0.6)
+    ax.axvline(2, color="#B2182B", ls="--", lw=0.8)
+    ax.axvline(-2, color="#2166AC", ls="--", lw=0.8)
+    ax.set_xlabel("spatial enrichment z-score (near vs random)")
+    ax.set_title(f"Ligand–receptor spatial enrichment\n"
+                 f"{len(usable)}/{len(pairs)} pairs usable; "
+                 f"|z|>2 dashed", fontsize=9)
+    save_fig(cfg, "communication_lr_enrichment", fig)
+
+    # 空间表达图：top 3 对
+    sf = float(adata.uns["spatial"][list(adata.uns["spatial"])[0]]
+               ["scalefactors"]["tissue_hires_scalef"])
+    xyp = xy * sf
+    top3 = lr_df.head(3)
+    fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.6))
+    for ax, r in zip(axes, top3.itertuples()):
+        li, ri_ = gi[r.ligand], gi[r.receptor]
+        prod = X[:, li] * X[:, ri_]
+        s = ax.scatter(xyp[:, 0], xyp[:, 1], c=prod, s=4, cmap="viridis")
+        ax.set_title(f"{r.ligand} × {r.receptor}\nz={r.z_score:.2f}", fontsize=9)
+        ax.set_aspect("equal"); ax.invert_yaxis()
+        ax.set_xticks([]); ax.set_yticks([])
+        fig.colorbar(s, ax=ax, shrink=0.8)
+    fig.suptitle("Top spatially enriched ligand–receptor pairs "
+                 "(product of ligand and receptor expression)", fontsize=10)
+    save_fig(cfg, "communication_top_pairs_on_tissue", fig)
+
+    # ---- 6. 落盘 ------------------------------------------------------------
+    status = {
+        "dataset_id": cfg["dataset_id"],
+        "status": "ok",
+        "expression_source": xsrc,
+        "n_pairs_total": len(pairs),
+        "n_pairs_usable": len(usable),
+        "n_pairs_skipped": len(skipped),
+        "usable_fraction": round(len(usable) / max(len(pairs), 1), 4),
+        "max_distance_um": max_um,
+        "max_distance_px": round(max_px, 2),
+        "median_spot_spacing_px": round(med, 2),
+        "n_spot_pairs_within_threshold": n_near,
+        "top_enriched": df_to_records(lr_df.head(15)),
+        "skipped_examples": skipped[:20],
+        "method": ("空间约束的配体-受体共表达强度："
+                   "统计阈值内 spot 对上的配体×受体表达均值，"
+                   "与随机 spot 对比较得 z-score"),
+        "not_a_call": ("**这不是『通讯与否』的判定。** 真正的细胞通讯推断需要 "
+                       "CellPhoneDB / CellChat 那样的统计框架"
+                       "（含置换检验与受体复合物建模）。本工具只给"
+                       "空间约束下的描述性强度"),
+        "limitations": [
+            f"**只有 {len(usable)}/{len(pairs)} 对 LR 可用** —— "
+            "结论建立在这些对上；不可用的原因是基因不在 Visium 覆盖里"
+            "或表达太低",
+            "配体×受体表达量是**代理量**，不代表蛋白水平的信号传递",
+            "**共表达 ≠ 通讯。** 两个基因在同一个 spot 里高，可能是"
+            "同一个细胞表达了两者（自分泌），也可能是两个细胞紧邻",
+            "Visium 的 spot 含 1-10 个细胞，所以『阈值内』是 spot 层面"
+            "的接近，不是细胞接触",
+            "z-score 用 50 次随机采样估计零分布，精度有限；"
+            "且没有做多重检验校正",
+            "受体复合物（如 IL2 受体的 α/β/γ 三聚体）被简化成单个受体基因",
+        ],
+    }
+    write_json(res_dir / "communication_status.json", status)
+    return status
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    cfg = load_config(args.config)
+    t0 = time.time()
+    try:
+        run_07_spatial_communication(cfg)
+        record_step(cfg, "spatial_communication", "ok", time.time() - t0)
+    except Exception as e:  # noqa: BLE001
+        record_step(cfg, "spatial_communication", "failed", time.time() - t0,
+                    message=str(e))
+        raise

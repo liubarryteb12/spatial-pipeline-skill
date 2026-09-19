@@ -1,0 +1,134 @@
+# ============================================================================
+# assets/reference_signatures.yml — 解卷积用的细胞类型签名
+# ============================================================================
+# **这是 marker 基因签名，不是全转录组参考。** 差别很重要：
+#
+#   RCTD / cell2location / DestVI 用**全转录组**的 scRNA-seq 参考，
+#   对每个细胞类型的完整表达谱建模（包括所有基因的均值与离散度）。
+#
+#   本流水线用的是**精简 marker 签名 + NNLS**（非负最小二乘）：
+#   只用每种类型的一小组标志基因，解一个非负线性混合方程。
+#
+# 后果：
+#   - 只能区分**签名差异明显**的类型。签名重叠的类型（如 T 细胞与 CD4 T）
+#     会被合并或互相混淆
+#   - 比例的**绝对值不可信**，只有**相对的空间趋势**有意义
+#   - 缺失的细胞类型（不在签名里的）会被强行分配给最接近的类型
+#
+# **所以产物里报的是"相对丰度的空间分布"，不是"细胞比例"。**
+#
+# 换成完整参考时：config 里设 deconvolution.reference: h5ad 并给
+# reference_h5ad + celltype_key，代码会走 scRNA-seq 参考那条路。
+#
+# 参考来源（marker 的选择依据）：
+#   - 淋巴结细胞类型标志：各类型的经典 marker（见下方 note）
+#   - Human Protein Atlas 的细胞类型 marker
+#   - PanglaoDB
+# ============================================================================
+
+signatures:
+
+  lymph_node:
+    description: 人淋巴结常见细胞类型（marker 精简版）
+    tissue: lymph node
+    note: |
+      **这是 marker 签名，不是全转录组参考。** 比例的绝对值不可信，
+      只有相对的空间趋势有意义。签名重叠的类型（B_naive 与 B_germinal_center）
+      会互相混淆。
+    celltypes:
+
+      B_naive:
+        markers: [MS4A1, CD79A, CD79B, CD19, TCL1A, IGHD, FCER2, CD22]
+        note: 初始 B 细胞；滤泡外套区
+
+      B_germinal_center:
+        markers: [AICDA, BCL6, MKI67, CD10, MME, RGS13, LMO2, MYBL1]
+        note: 生发中心 B 细胞；**与 B_naive 共享 MS4A1/CD79A**，NNLS 会混淆
+
+      Plasma_cell:
+        markers: [MZB1, JCHAIN, IGHG1, IGHG2, IGKC, DERL3, XBP1, SDC1]
+        note: 浆细胞；髓索与副皮质区
+
+      T_cell:
+        markers: [CD3D, CD3E, CD3G, TRAC, IL7R, CD2, CD247]
+        note: 泛 T 细胞；副皮质区（T 细胞区）
+
+      T_follicular_helper:
+        markers: [CD4, CXCR5, BCL6, PDCD1, ICOS, IL21, SH2D1A]
+        note: Tfh；生发中心内
+
+      T_regulatory:
+        markers: [FOXP3, IL2RA, CTLA4, IKZF2, TNFRSF4]
+        note: Treg
+
+      NK_cell:
+        markers: [NKG7, GNLY, KLRD1, NCAM1, PRF1, KLRF1, NCR1]
+        note: NK 细胞
+
+      Macrophage:
+        markers: [CD68, CD163, MRC1, MSR1, C1QA, C1QB, CSF1R]
+        note: 巨噬细胞；窦与髓索
+
+      Dendritic_cell:
+        markers: [FCER1A, CD1C, CLEC10A, ITGAX, HLA-DQA1, LILRA4]
+        note: 树突细胞
+
+      Follicular_dendritic_cell:
+        markers: [FDCSP, CR2, CXCL13, CLU, FCGR2B]
+        note: 滤泡树突细胞；生发中心
+
+      Endothelial:
+        markers: [PECAM1, VWF, CDH5, CLDN5, AQP1, LYVE1]
+        note: 血管与淋巴窦内皮；LYVE1 偏淋巴窦
+
+      Fibroblastic_reticular_cell:
+        markers: [CCL19, CCL21, PDPN, IL7, TNFSF13B, DES]
+        note: 成纤维网状细胞；T 细胞区的支架（CCL19/CCL21 是它的标志）
+
+      Smooth_muscle:
+        markers: [ACTA2, TAGLN, MYH11, DES, CNN1]
+        note: 血管平滑肌
+
+  # ---- 乳腺（用于 breast_cancer 数据集）--------------------------------------
+  breast_cancer:
+    description: 乳腺浸润性导管癌常见细胞类型（marker 精简版）
+    tissue: breast
+    note: 同 lymph_node —— marker 签名，比例绝对值不可信
+    celltypes:
+
+      Malignant_epithelial:
+        markers: [EPCAM, KRT8, KRT18, KRT19, ESR1, ERBB2, GATA3, MKI67]
+        note: 恶性上皮；**与 Normal_epithelial 共享角蛋白基因**，会混淆
+
+      Normal_epithelial:
+        markers: [EPCAM, KRT14, KRT5, KRT15, ACTA2, TP63]
+        note: 正常/肌上皮
+
+      T_cell:
+        markers: [CD3D, CD3E, CD3G, TRAC, IL7R, CD2]
+
+      B_cell:
+        markers: [MS4A1, CD79A, CD79B, CD19, TCL1A]
+
+      Plasma_cell:
+        markers: [MZB1, JCHAIN, IGHG1, IGKC, DERL3]
+
+      Macrophage:
+        markers: [CD68, CD163, MRC1, C1QA, C1QB, CSF1R]
+
+      Dendritic_cell:
+        markers: [FCER1A, CD1C, CLEC10A, ITGAX, HLA-DQA1]
+
+      NK_cell:
+        markers: [NKG7, GNLY, KLRD1, NCAM1, PRF1]
+
+      Endothelial:
+        markers: [PECAM1, VWF, CDH5, CLDN5]
+
+      Fibroblast:
+        markers: [COL1A1, COL1A2, COL3A1, DCN, LUM, PDGFRA, FAP]
+        note: 肿瘤相关成纤维细胞（FAP）
+
+      Adipocyte:
+        markers: [ADIPOQ, PLIN1, LEP, FABP4, CFD]
+        note: 乳腺脂肪组织

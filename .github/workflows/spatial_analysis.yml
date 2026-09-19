@@ -1,0 +1,159 @@
+name: spatial analysis
+
+# ============================================================================
+# 空间转录组（Visium）流水线 CI
+# ============================================================================
+# 设计原则与 geo-brca-microarray-skill / scrna-pipeline-skill 一致：
+#
+#   1. **静态检查在前，装依赖在后。** 语法错误 1 秒能发现，
+#      不该等 3 分钟装完 scanpy 才知道。
+#
+#   2. **产物必须上传。** 跑通但拿不到结果是没用的 ——
+#      artifact 的 path 清单与脚本写出的文件是两份独立列表，
+#      不一致时 job 绿但用户下载后缺文件。用 check_artifact_paths.mjs 兜住。
+#
+#   3. **空间对齐必须先验证。** 坐标转置/镜像不会报错，散点图看起来
+#      "也像组织形状"。verify_spatial_alignment.py 用网格几何判据
+#      定量检查（转置会让几何分从 +1.81 翻成 -1.81）。
+#
+#   4. **图的检查在跑完之后。** 空白图只有真画出来才知道。
+#
+#   5. 触发路径过滤：改 *.md / references/ 不触发 CI。
+# ============================================================================
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - "tools/**"
+      - "assets/**"
+      - "requirements.txt"
+      - ".github/workflows/spatial_analysis.yml"
+  pull_request:
+    paths:
+      - "scripts/**"
+      - "tools/**"
+      - "assets/**"
+      - "requirements.txt"
+      - ".github/workflows/spatial_analysis.yml"
+  workflow_dispatch:
+    inputs:
+      config:
+        description: "配置文件路径"
+        required: false
+        default: "assets/config.lymph_node.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    # 自设上限。GitHub 托管 runner 的硬上限是 6 小时；
+    # 实测全流程约 3-5 分钟，给 45 分钟留足余量（含装依赖）。
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          # **用 3.12，不用最新的。** 实测 harmonypy 等包在 3.13/3.14 上
+          # 没有 wheel，要从源码编译，且编译时常因缺 numpy 头文件失败。
+          python-version: "3.12"
+
+      - name: 静态检查（不装依赖）
+        run: |
+          node tools/check_py_syntax.mjs
+          node tools/check_artifact_paths.mjs
+
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-spatial-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            pip-spatial-${{ runner.os }}-
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -c "import scanpy, anndata, squidpy; print('核心依赖 OK')"
+
+      - name: 显示环境
+        run: |
+          python -c "
+          import importlib
+          for m in ['scanpy','anndata','squidpy','skmisc','skimage','leidenalg','igraph','statsmodels','yaml']:
+              try:
+                  mod = importlib.import_module(m)
+                  print('  OK  ', m, getattr(mod, '__version__', ''))
+              except Exception as e:
+                  print('  --  ', m, type(e).__name__, e)
+          "
+
+      - name: 跑流水线
+        run: |
+          python scripts/main_analysis.py --config ${{ github.event.inputs.config || 'assets/config.lymph_node.yml' }}
+
+      - name: 验证空间坐标与 H&E 对齐
+        # **这一步不能省。** 坐标转置或镜像不会让任何代码报错，
+        # 散点图看起来"也像组织形状"。网格几何判据能明确识别转置。
+        run: |
+          python tools/verify_spatial_alignment.py --config ${{ github.event.inputs.config || 'assets/config.lymph_node.yml' }}
+
+      - name: 检查图不是空白
+        run: node tools/check_figures.mjs results/lymph_node/figures
+
+      - name: 汇总产物
+        if: always()
+        run: |
+          echo "===== results ====="
+          find results -type f 2>/dev/null | sort | head -60 || true
+          echo "===== data ====="
+          find data -type f 2>/dev/null | sort | head -30 || true
+          echo "===== 验收结论 ====="
+          python -c "
+          import json, pathlib
+          p = pathlib.Path('results/lymph_node/acceptance_report.json')
+          if not p.exists():
+              print('（无 acceptance_report.json）'); raise SystemExit
+          d = json.loads(p.read_text(encoding='utf-8'))
+          print('检查项', d['n_checks'],
+                '| required 失败', d['n_required_failed'],
+                '| content 失败', d['n_content_failed'],
+                '| honesty 失败', d['n_honesty_failed'])
+          for c in d['checks']:
+              if not c['passed']:
+                  print('  [未通过/%s] %s: %s' % (c['severity'], c['id'], c['detail']))
+          " 2>/dev/null || cat results/lymph_node/acceptance_report.json 2>/dev/null | head -40 || true
+          echo "===== 空间对齐 ====="
+          cat data/lymph_node/spatial_alignment_check.json 2>/dev/null | head -30 || true
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spatial-results-${{ github.run_number }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            results/lymph_node/
+            data/lymph_node/domains.h5ad
+            data/lymph_node/dataset_info.json
+            data/lymph_node/spatial_alignment_check.json
+
+# ----------------------------------------------------------------------------
+# **为什么只上传 domains.h5ad。**
+#
+# 每个 h5ad 都带着完整的 36601 基因矩阵 + layers['counts']，单个 200-320 MB。
+# raw / qc_filtered / normalized 是中间态，而 domains.h5ad 是最终态，
+# 它**包含**前面所有步骤的信息（raw 全基因集、counts 层、空间域、邻接结构）。
+#
+# 四个全传约 1 GB，其中约 700 MB 是冗余的。中间态的排除在
+# tools/check_artifact_paths.mjs 里以 INTERMEDIATE 白名单**显式声明** ——
+# 有意排除，而不是"忘了加进清单"（后者正是那个工具要抓的错误）。
+# ----------------------------------------------------------------------------

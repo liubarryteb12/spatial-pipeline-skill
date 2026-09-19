@@ -1,0 +1,300 @@
+# ============================================================================
+# assets/ligand_receptor.yml — 配体-受体对
+# ============================================================================
+# **注意"可用对数"这个诊断量。** 配体/受体大多是低表达基因，在 Visium
+# 数据里很容易出现"基因不在覆盖里"或"几乎全零"。Part 2 实测过：
+# 在 2000 个 HVG 上 38 对里只有 3 对可用，换到全基因集变成 27 对。
+#
+# 所以流水线必须报 `n_pairs_usable / n_pairs_total`。如果可用比例很低，
+# 任何结论都建立在那少数几对上。
+#
+# 选取依据：CellPhoneDB 与 CellChat 里收录的经典互作，优先选
+# 在淋巴组织/免疫微环境里有明确文献支持的。
+#
+# **不收录受体复合物。** 如 IL2 受体实际是 IL2RA/IL2RB/IL2RG 三聚体，
+# 这里只写单个基因 —— 这是简化，写在 limitations 里。
+# ============================================================================
+
+pairs:
+
+  # ---- 趋化因子：淋巴组织分区的主要驱动力 -----------------------------------
+  - ligand: CCL19
+    receptor: CCR7
+    pathway: chemokine
+    note: FRC 分泌 CCL19/CCL21 招募 CCR7+ 的 T 细胞与 DC 到 T 细胞区 —— **淋巴结分区的核心机制**
+
+  - ligand: CCL21
+    receptor: CCR7
+    pathway: chemokine
+    note: 同上；CCL21 是本数据里 Moran's I 最高的基因之一（0.722）
+
+  - ligand: CXCL13
+    receptor: CXCR5
+    pathway: chemokine
+    note: FDC 分泌 CXCL13 招募 CXCR5+ 的 B 细胞与 Tfh 到滤泡
+
+  - ligand: CXCL12
+    receptor: CXCR4
+    pathway: chemokine
+
+  - ligand: CCL5
+    receptor: CCR5
+    pathway: chemokine
+
+  - ligand: CCL5
+    receptor: CCR1
+    pathway: chemokine
+
+  - ligand: CCL2
+    receptor: CCR2
+    pathway: chemokine
+
+  - ligand: CXCL9
+    receptor: CXCR3
+    pathway: chemokine
+
+  - ligand: CXCL10
+    receptor: CXCR3
+    pathway: chemokine
+
+  - ligand: CCL20
+    receptor: CCR6
+    pathway: chemokine
+
+  - ligand: CCL22
+    receptor: CCR4
+    pathway: chemokine
+
+  - ligand: CCL17
+    receptor: CCR4
+    pathway: chemokine
+
+  # ---- 免疫检查点 -----------------------------------------------------------
+  - ligand: CD274
+    receptor: PDCD1
+    pathway: checkpoint
+    note: PD-L1 – PD-1
+
+  - ligand: PDCD1LG2
+    receptor: PDCD1
+    pathway: checkpoint
+    note: PD-L2 – PD-1
+
+  - ligand: CTLA4
+    receptor: CD80
+    pathway: checkpoint
+    note: "**方向反了**（CTLA4 在 T 细胞上，CD80 在 APC 上）——
+      本工具不区分方向，只算共表达"
+
+  - ligand: CTLA4
+    receptor: CD86
+    pathway: checkpoint
+
+  - ligand: LGALS9
+    receptor: HAVCR2
+    pathway: checkpoint
+    note: Galectin-9 – TIM-3
+
+  # ---- 共刺激 ---------------------------------------------------------------
+  - ligand: CD80
+    receptor: CD28
+    pathway: costimulation
+
+  - ligand: CD86
+    receptor: CD28
+    pathway: costimulation
+
+  - ligand: ICOSLG
+    receptor: ICOS
+    pathway: costimulation
+
+  - ligand: CD40
+    receptor: CD40LG
+    pathway: costimulation
+    note: B 细胞 – Tfh 的关键互作，生发中心形成必需
+
+  # ---- 细胞因子 -------------------------------------------------------------
+  - ligand: IL2
+    receptor: IL2RA
+    pathway: cytokine
+    note: 受体实为 IL2RA/IL2RB/IL2RG 三聚体，这里只写一个亚基（简化）
+
+  - ligand: IL4
+    receptor: IL4R
+    pathway: cytokine
+
+  - ligand: IL6
+    receptor: IL6R
+    pathway: cytokine
+
+  - ligand: IL7
+    receptor: IL7R
+    pathway: cytokine
+    note: FRC 分泌 IL7 维持 T 细胞存活；IL7R 是 T 细胞标志
+
+  - ligand: IL10
+    receptor: IL10RA
+    pathway: cytokine
+
+  - ligand: IL15
+    receptor: IL2RB
+    pathway: cytokine
+
+  - ligand: IL21
+    receptor: IL21R
+    pathway: cytokine
+    note: Tfh 分泌 IL21，驱动 B 细胞分化
+
+  - ligand: TGFB1
+    receptor: TGFBR1
+    pathway: cytokine
+
+  - ligand: TGFB1
+    receptor: TGFBR2
+    pathway: cytokine
+
+  - ligand: IFNG
+    receptor: IFNGR1
+    pathway: cytokine
+
+  - ligand: TNF
+    receptor: TNFRSF1A
+    pathway: cytokine
+
+  - ligand: TNF
+    receptor: TNFRSF1B
+    pathway: cytokine
+
+  - ligand: LTA
+    receptor: TNFRSF1A
+    pathway: cytokine
+    note: 淋巴毒素 α；淋巴结组织结构形成必需
+
+  - ligand: TNFSF13B
+    receptor: TNFRSF13B
+    pathway: cytokine
+    note: BAFF – TACI；B 细胞存活
+
+  - ligand: TNFSF13B
+    receptor: TNFRSF13C
+    pathway: cytokine
+    note: BAFF – BAFFR；FRC 表达 TNFSF13B
+
+  - ligand: TNFSF13
+    receptor: TNFRSF13B
+    pathway: cytokine
+    note: APRIL – TACI
+
+  # ---- 粘附 -----------------------------------------------------------------
+  - ligand: ICAM1
+    receptor: ITGAL
+    pathway: adhesion
+
+  - ligand: ICAM1
+    receptor: ITGB2
+    pathway: adhesion
+
+  - ligand: VCAM1
+    receptor: ITGA4
+    pathway: adhesion
+
+  - ligand: SELL
+    receptor: SELPLG
+    pathway: adhesion
+    note: L-选择素 – PSGL1；淋巴细胞归巢
+
+  - ligand: CD6
+    receptor: ALCAM
+    pathway: adhesion
+
+  # ---- 血管/淋巴管生成 ------------------------------------------------------
+  - ligand: VEGFA
+    receptor: KDR
+    pathway: angiogenesis
+
+  - ligand: VEGFA
+    receptor: FLT1
+    pathway: angiogenesis
+
+  - ligand: VEGFC
+    receptor: FLT4
+    pathway: lymphangiogenesis
+    note: 淋巴管生成；淋巴结里淋巴窦内皮表达
+
+  - ligand: PECAM1
+    receptor: PECAM1
+    pathway: adhesion
+    note: 同源互作（内皮细胞间连接）
+
+  # ---- Notch / Wnt / 发育 ---------------------------------------------------
+  - ligand: DLL1
+    receptor: NOTCH1
+    pathway: notch
+
+  - ligand: DLL4
+    receptor: NOTCH1
+    pathway: notch
+
+  - ligand: JAG1
+    receptor: NOTCH1
+    pathway: notch
+
+  - ligand: JAG1
+    receptor: NOTCH2
+    pathway: notch
+
+  - ligand: WNT5A
+    receptor: FZD4
+    pathway: wnt
+
+  # ---- 补体/其他 ------------------------------------------------------------
+  - ligand: C3
+    receptor: CR2
+    pathway: complement
+    note: CR2 (CD21) 是 FDC 的标志；补体调理抗原保留
+
+  - ligand: FN1
+    receptor: ITGA5
+    pathway: ecm
+
+  - ligand: FN1
+    receptor: ITGB1
+    pathway: ecm
+
+  - ligand: COL1A1
+    receptor: ITGB1
+    pathway: ecm
+
+  - ligand: SPP1
+    receptor: ITGAV
+    pathway: ecm
+
+  - ligand: MIF
+    receptor: CD74
+    pathway: cytokine
+
+  - ligand: MDK
+    receptor: NCL
+    pathway: growth_factor
+
+  - ligand: PTN
+    receptor: NCL
+    pathway: growth_factor
+
+  - ligand: ANGPTL4
+    receptor: ITGA5
+    pathway: ecm
+
+  - ligand: APOE
+    receptor: LRP1
+    pathway: lipid
+
+  - ligand: HLA-DRA
+    receptor: CD4
+    pathway: antigen_presentation
+    note: MHC II – CD4；抗原呈递的核心
+
+  - ligand: B2M
+    receptor: KLRD1
+    pathway: antigen_presentation
+    note: MHC I 轻链 – NK 细胞受体
