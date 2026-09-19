@@ -100,8 +100,13 @@ jobs:
           python scripts/main_analysis.py --config ${{ github.event.inputs.config || 'assets/config.lymph_node.yml' }}
 
       - name: 验证空间坐标与 H&E 对齐
-        # **这一步不能省。** 坐标转置或镜像不会让任何代码报错，
-        # 散点图看起来"也像组织形状"。网格几何判据能明确识别转置。
+        # **这一步是对齐检查的独立复核。** 主检查已经在 00_fetch.py 里跑过
+        # （因为验收检查要读它的产物 —— 否则那一项会因为文件不存在而
+        # **静默跳过**；实测 CI 里 25 项、本地 26 项，差的就是这一项）。
+        # 这里用命令行再跑一次：
+        #   - 独立进程，不受流水线内存状态影响
+        #   - 退出码直接反映结论（坐标不是最佳假设就红）
+        #   - 坐标转置不会让任何代码报错，散点图看起来"也像组织形状"
         run: |
           python tools/verify_spatial_alignment.py --config ${{ github.event.inputs.config || 'assets/config.lymph_node.yml' }}
 

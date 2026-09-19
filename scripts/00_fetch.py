@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import numpy as np  # noqa: E402
 from scipy import sparse  # noqa: E402
 
+from alignment import write_alignment_check  # noqa: E402
 from common import (ensure_dirs, load_config, load_registry,  # noqa: E402
                     load_scalefactors,
                     log_info, log_warn, parse_args, read_tissue_positions,
@@ -258,6 +259,20 @@ def run_00_fetch(cfg: dict) -> dict:
     adata.write_h5ad(out)
     log_info(f"已写出 {out}（{adata.n_obs} spot x {adata.n_vars} 基因，"
              f"含 obsm['spatial'] 与 uns['spatial']）")
+
+    # ---- 8. 坐标对齐验证 ----------------------------------------------------
+    # **必须在这里做，不能只在 workflow 里单独跑。** 验收检查会读
+    # `spatial_alignment_check.json`；如果这个文件在验收时还不存在，
+    # 那一项会被**静默跳过** —— 实测 CI 里 25 项检查、本地 26 项，
+    # 差的就是这一项。一个会因执行顺序而消失的检查等于没有。
+    alignment = write_alignment_check(adata, data_dir, log_info, log_warn)
+    if not alignment["current_is_best"]:
+        raise RuntimeError(
+            f"坐标对齐验证失败：当前坐标不是最佳假设，"
+            f"最佳是「{alignment['best_hypothesis']}」。\n"
+            f"  坐标可能转置或镜像了。散点图看起来仍然像组织形状，\n"
+            f"  所以这个问题不检查就发现不了。\n"
+            f"  详见 {data_dir / 'spatial_alignment_check.json'}")
 
     info = {
         "dataset_id": cfg["dataset_id"],

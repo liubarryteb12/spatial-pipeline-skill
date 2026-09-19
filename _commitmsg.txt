@@ -1,0 +1,19 @@
+对齐检查变成流水线的一步，修掉会静默消失的验收项
+
+CI 上跑出 25 项验收检查，本地是 26 项。差的是 spatial:alignment
+那一项 —— 因为 verify_spatial_alignment.py 在 workflow 里跑在
+main_analysis.py 之后，验收时 spatial_alignment_check.json 还不存在，
+那一项被静默跳过。
+
+一个会因执行顺序而消失的检查等于没有。
+
+修法：把核心逻辑抽到 scripts/lib/alignment.py，由 00_fetch.py 在写完
+raw.h5ad 后直接调用 —— 对齐检查现在是流水线的一部分，产物必然在
+验收之前存在。tools/verify_spatial_alignment.py 变成命令行封装，
+在 workflow 里保留为独立复核（独立进程 + 退出码）。
+
+坐标不是最佳假设时 00_fetch 直接抛异常，不给带着错坐标往下跑的选项。
+
+alignment.py 是唯一允许直接访问 obsm['spatial'] 的模块 —— 它就是
+负责验证列序对不对的地方，所以必须拿到原始数组。其他脚本一律走
+common.spatial_xy()。
