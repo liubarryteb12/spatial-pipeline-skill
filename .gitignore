@@ -25,3 +25,7 @@ env/
 # 临时
 *.part
 *.tmp
+
+# 提交信息临时文件（用 git commit -F 时产生，不该入库）
+_commitmsg.txt
+_*msg.txt
