@@ -158,3 +158,60 @@ matplotlib 用 DejaVu Sans，**没有 CJK 字形** —— 图上显示成一个�
 `spatial_xy()` 重构涉及 7 个文件、12 处调用。改完立刻对比重构前后的
 `communication_lr_scores.csv` 与 `svg_results.csv` —— **0 行差异**。
 只看"跑通了"是不够的。
+
+## 15. 图幅按毫米，宽度夹在标准栏宽内
+
+参考规范：K-Dense `scientific-visualization` skill（样式文件已 vendored 到
+`assets/publication.mplstyle`，与 `scrna-pipeline-skill` 逐字节一致）。
+
+**期刊栏宽是按毫米规定的**，英寸是排版软件内部单位。写英寸时"这图多宽"
+要靠换算才知道，写毫米时一眼能对上投稿要求。
+
+| 常量 | 值 | 用途 |
+|---|---|---|
+| `W_SINGLE` | 89 mm | 单栏 |
+| `W_ONE_HALF` | 136 mm | 一栏半 |
+| `W_DOUBLE` | 183 mm | 双栏（通栏）|
+
+- **宽度随类别数增长的图必须夹住**：`min(W_DOUBLE, max(W_ONE_HALF, ...))`。
+  无上限增长会画出装不进任何期刊一页的图 —— 实测修之前最宽的
+  `domain_markers_dotplot` 是 370 mm。
+- `save_fig()` 默认**不再用 tight bbox**。`bbox_inches="tight"` 会**改变物理
+  输出尺寸**，让上面的毫米约定失效。溢出改由 `_content_overflow()` 检测并告警。
+- **`set_seed()` 末尾会 `apply_style()`** —— rcParams 在**图创建时**就被读取，
+  在 `save_fig()` 里设样式已经太晚。
+- 图上文字一律英文（见规则 11）。
+
+**两处与参考规范的偏差**（已写在 `.mplstyle` 文件头）：
+
+1. `figure.constrained_layout.use: True` 全局开启。参考规范要求逐图 opt-in，
+   但本仓库有 19 张图、9 个脚本，逐处改容易漏。
+2. `font.sans-serif: DejaVu Sans, Arial, Helvetica`。参考规范首选 Arial，
+   但 Ubuntu CI 上没有 Arial 而 Windows 上有 —— 会导致 CI 与本地渲染出
+   **不同的字形**，破坏可复现性。DejaVu Sans 随 matplotlib 分发，处处一致。
+
+**constrained layout 不会自动折行长标题。** 实测 `domains_on_he` 的单行
+suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下文件照样
+生成、`check_figures.mjs` 也照样报"有墨"）。长标题必须自己换行。
+
+## 16. 步骤崩溃不能靠旧文件冒充成功
+
+`main_analysis.py` 在每步开跑前**先删掉该步的状态文件**，并在验收里
+逐步骤检查 `status == "ok"`。
+
+只检查"产物文件在不在"是不够的：步骤崩溃时旧文件还在，产物检查会通过，
+而本轮实际上什么都没产出。姊妹项目 Part 2 实测踩过 —— `07_grn` 因漏 import
+崩溃，而它的状态文件是上一轮的，验收照样全绿。
+
+## 17. 静态检查要挡住"未定义名字"
+
+`py_compile` **只做编译，看不出未定义名字**。漏 import 一个 `W_SINGLE`
+时它照样报"语法通过"，要等运行时才炸 —— 实测因此白跑一整轮流水线。
+
+`tools/check_py_syntax.mjs` 现在会检查：用到的 `W_SINGLE` / `W_ONE_HALF` /
+`W_DOUBLE` / `mm` / `PAL` / `PAL_CYCLE` / `apply_style` 是否都 import 了。
+
+名单是**写死的**，不是"common 导出的所有名字"。后者会把函数参数名当成用法
+（`alignment.py` 里 `def verify_alignment(adata, log_info=None)` 的 `log_info`），
+要正确处理得做作用域分析 —— 那是重写一个 linter。同时会剥掉注释和字符串再扫，
+避免"名字只出现在注释里"的误报。
