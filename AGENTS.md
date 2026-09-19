@@ -215,3 +215,26 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 （`alignment.py` 里 `def verify_alignment(adata, log_info=None)` 的 `log_info`），
 要正确处理得做作用域分析 —— 那是重写一个 linter。同时会剥掉注释和字符串再扫，
 避免"名字只出现在注释里"的误报。
+
+## 18. 每轮运行必须留下可追溯的运行清单（模块零）
+
+参考规范：三大部分整合文档的「模块零」（§0.2–§0.4）。姊妹项目
+`scrna-pipeline-skill/AGENTS.md` 规则 16 有完整说明，这里只写空间特有的。
+
+`common.py` 的清单层产出 `results/<dataset_id>/run_manifest.json`。
+空间这边有两点不同：
+
+1. **`KEY_PACKAGES` 包含大量"本仓库没装"的工具** —— STAGATE / SpaGCN /
+   BayesSpace / cell2location / Bering / BOMS / SpaceFlow / ISORT 等。
+   它们会记成 `null`，这是**有意为之**：空间方法的可选项比单细胞多得多，
+   "哪些没装"本身就是结论适用范围的一部分。
+   全部省略键会让清单看起来"该有的都有"。
+2. **`record_input` 在 `run_acceptance` 开头跑，不在 `run_steps` 开头。**
+   可选步骤（去卷积、空间轨迹）这轮有没有产物，要等步骤跑完才知道。
+
+**人工复核节点默认 `pending`，不算失败**（`cell_segmentation` /
+`domain_number` / `deconv_reference` / `spatial_traj_direction`）——
+和规则 16 同一条理由：判成 FAIL 会让每个 job 都红，反而没人看。
+
+**`init_manifest` 必须清掉上一轮**，否则上轮的清单冒充本轮，
+比没有清单更糟（同规则 16）。

@@ -25,7 +25,10 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts" / "lib"))
 sys.path.insert(0, str(REPO / "scripts"))
 
-from common import ensure_dirs, load_config, log_info, log_warn, write_json  # noqa: E402
+from common import (capture_versions, ensure_dirs, init_manifest,  # noqa: E402
+                    load_config, log_info, log_warn, manifest_path,
+                    manifest_summary, record_human_review, record_input,
+                    record_params, write_json)
 
 STEPS = [
     ("fetch", "00_fetch", "run_00_fetch"),
@@ -56,10 +59,48 @@ STEP_STATUS_FILES = {
     "spatial_trajectory": "spatial_trajectory_status.json",
 }
 
+# 文档 §3「本部分人工复核节点」。**默认 pending，不是 confirmed** ——
+# 自动化流水线不能替人签字，把未确认的节点记成已确认，等于把复核节点
+# 变成摆设。验收里作为**可见但不阻断**的项列出。
+HUMAN_REVIEW_NODES = [
+    ("cell_segmentation",   "细胞分割参数调整",       False),
+    ("domain_number",       "空间域数量确定",         True),
+    ("deconv_reference",    "去卷积参考数据选择",     True),
+    ("spatial_traj_direction", "空间拟时序轨迹方向验证", True),
+]
+
+# 需要登记哈希的输入（相对 data_dir）。(文件名, 中文说明, 是否必需)
+INPUT_FILES = [
+    ("raw.h5ad",          "原始计数矩阵", True),
+    ("dataset_info.json", "数据集元信息",  True),
+    ("qc_filtered.h5ad",  "QC 后矩阵",    True),
+    ("normalized.h5ad",   "标准化后矩阵",  True),
+    ("domains.h5ad",      "最终态矩阵",    True),
+]
+
 
 def run_steps(cfg: dict, only: list = None) -> dict:
     ensure_dirs(cfg)
     res_dir = Path(cfg["output"]["results_dir"])
+
+    # ---- 模块零：建立本轮运行清单（§0.3 / §0.4）-----------------------------
+    # **必须在任何步骤之前建，且先清掉上一轮** —— 清单描述的是本轮。
+    # 清单和 state.json / acceptance_report.json 分开：那两个记"跑没跑成"，
+    # 清单记"在什么条件下跑出来的"（证据，写入后不该再变）。
+    init_manifest(cfg)
+    capture_versions(cfg)
+    record_params(cfg, {
+        "seed": cfg.get("analysis", {}).get("seed"),
+        "qc": cfg.get("qc", {}),
+        "normalize": cfg.get("normalize", {}),
+        "domains": cfg.get("domains", {}),
+        "deconvolution": cfg.get("deconvolution", {}),
+    })
+    for node, label, req in HUMAN_REVIEW_NODES:
+        record_human_review(cfg, node, required=req, status="pending",
+                            note=f"{label} —— 需人工确认，本轮自动化未确认")
+    log_info(f"运行清单：{manifest_path(cfg)}")
+
     results = {}
     for name, mod_name, fn_name in STEPS:
         if only and name not in only:
@@ -108,6 +149,14 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
     data_dir = Path(cfg["output"]["data_dir"])
     res_dir = Path(cfg["output"]["results_dir"])
     fig_dir = Path(cfg["output"]["figures_dir"])
+
+    # ---- 模块零：登记输入哈希（§0.4）----------------------------------------
+    # 放在验收里 —— 所有步骤已经跑完，这轮到底产出了哪些文件此刻才确定。
+    for fname, desc, req in INPUT_FILES:
+        record_input(cfg, data_dir / fname, label=f"{desc} ({fname})",
+                     required=req)
+    msum = manifest_summary(cfg)
+
     checks = []
 
     def chk(cid, kind, ok, detail, severity="required"):
@@ -273,6 +322,32 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
                 f"选根方式: {(d.get('root_selection') or {}).get('method')}",
                 severity="honesty")
 
+    # ---- 模块零：运行清单（§0.3 / §0.4）-------------------------------------
+    # 清单缺项不是"分析错了"，而是"这轮跑出来的东西没法追溯"。
+    # **人工复核未确认不算失败** —— 默认就是 pending，那是设计如此；
+    # 把它判成 FAIL 会让每个 job 都红，反而没人看。但必须可见。
+    chk("manifest:present", "required", msum.get("present", False),
+        (f"{msum.get('n_versions', 0)} 个包版本、{msum.get('n_inputs', 0)} 项输入、"
+         f"{msum.get('n_decisions', 0)} 条决策"
+         if msum.get("present") else "**缺 run_manifest.json**"))
+    if msum.get("present"):
+        chk("manifest:versions", "required", msum["n_versions"] >= 20,
+            f"{msum['n_versions']} 个已安装包（pip freeze 全量）")
+        chk("manifest:inputs", "required",
+            # **只看 required 的缺失。** 可选项本来就可以不存在，
+            # 算进来会让没有该文件的数据集全部误判失败。
+            msum["n_inputs"] >= len(INPUT_FILES)
+            and not msum["inputs_missing_required"],
+            f"{msum['n_inputs']} 项"
+            + (f"，必需缺失 {','.join(msum['inputs_missing_required'])}"
+               if msum["inputs_missing_required"] else "，必需项齐全")
+            + (f"（可选缺失 {','.join(msum['inputs_missing'])}）"
+               if msum["inputs_missing"] else ""))
+        pend = msum["human_review_pending"]
+        chk("manifest:human_review", "honesty", True,
+            f"{len(pend)} 个人工复核节点待确认（不阻断 job）："
+            + (", ".join(pend) if pend else "全部已确认"))
+
     n_req_fail = sum(1 for c in checks
                      if not c["passed"] and c["severity"] == "required")
     n_con_fail = sum(1 for c in checks
@@ -289,6 +364,7 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         "n_honesty_failed": n_hon_fail,
         "passed": n_req_fail == 0,
         "checks": checks,
+        "manifest": msum,
     }
     write_json(res_dir / "acceptance_report.json", report)
 
