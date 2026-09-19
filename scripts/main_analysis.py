@@ -37,6 +37,8 @@ STEPS = [
     ("niche", "06_niche", "run_06_niche"),
     ("spatial_communication", "07_spatial_communication",
      "run_07_spatial_communication"),
+    ("spatial_trajectory", "08_spatial_trajectory",
+     "run_08_spatial_trajectory"),
 ]
 
 
@@ -101,7 +103,7 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
     # ---- required: 结果 JSON ----
     for f in ("qc_status.json", "normalize_status.json", "domain_status.json",
               "svg_status.json", "deconvolution_status.json", "niche_status.json",
-              "communication_status.json"):
+              "communication_status.json", "spatial_trajectory_status.json"):
         p = res_dir / f
         chk(f"result:{f}", "required", p.exists(), f"{f} {'存在' if p.exists() else '缺失'}")
 
@@ -132,7 +134,8 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
 
     # ---- content: CSV 有数据行 ----
     for f in ("svg_results.csv", "domain_markers.csv",
-              "communication_lr_scores.csv", "niche_enrichment_domains.csv"):
+              "communication_lr_scores.csv", "niche_enrichment_domains.csv",
+              "spatial_pseudotime.csv"):
         p = res_dir / f
         if not p.exists():
             chk(f"content:{f}", "content", False, f"{f} 缺失", severity="content")
@@ -149,6 +152,7 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         "deconvolution_status.json": "limitations",
         "niche_status.json": "limitations",
         "communication_status.json": "limitations",
+        "spatial_trajectory_status.json": "limitations",
     }
     for f, key in honest_map.items():
         p = res_dir / f
@@ -203,6 +207,42 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         chk("spatial:alignment", "content", d.get("current_is_best", False),
             f"最佳假设: {d.get('best_hypothesis')}；"
             f"当前是否最佳: {d.get('current_is_best')}", severity="content")
+
+    # ---- 空间拟时序：读 status 的真实字段，不是只看文件在不在 ------------
+    #
+    # 姊妹项目 Part 1 的教训：TF 第一次跑时 tf_status.json 正常产出、
+    # 验收全绿，而 figure_written 其实是 false（图一张没出）。
+    p = res_dir / "spatial_trajectory_status.json"
+    if p.exists():
+        d = json.loads(p.read_text(encoding="utf-8"))
+        if d.get("status") == "ok":
+            has_both = (d.get("morans_I_expression_only") is not None
+                        and d.get("morans_I_spatially_smoothed") is not None)
+            chk("content:spatial_traj_comparison", "content", has_both,
+                f"Moran's I 朴素 {d.get('morans_I_expression_only')} → "
+                f"空间感知 {d.get('morans_I_spatially_smoothed')}"
+                f"（增益 {d.get('morans_I_gain')}）" if has_both
+                else "**没有记录朴素 vs 空间感知的对比数值** —— "
+                     "那就只剩一个排序，说明不了空间感知有没有用",
+                severity="content")
+            ntu = d.get("named_tools_not_used") or {}
+            chk("honesty:named_tools", "honesty", len(ntu) >= 3,
+                f"写明了 {len(ntu)} 个具名工具未使用及原因：{','.join(list(ntu)[:5])}"
+                if len(ntu) >= 3 else
+                f"**只写了 {len(ntu)} 个** —— 文档点名的工具没用就要说明为什么",
+                severity="honesty")
+            chk("honesty:not_a_developmental_trajectory", "honesty",
+                any("不是发育轨迹" in x or "空间排序" in x
+                    for x in (d.get("limitations") or [])),
+                "已写明这是空间排序而非发育轨迹"
+                if any("不是发育轨迹" in x or "空间排序" in x
+                       for x in (d.get("limitations") or []))
+                else "**没有写明这不是发育轨迹** —— 一个空间排序会被读成分化过程",
+                severity="honesty")
+            chk("honesty:root_is_heuristic", "honesty",
+                bool((d.get("root_selection") or {}).get("method")),
+                f"选根方式: {(d.get('root_selection') or {}).get('method')}",
+                severity="honesty")
 
     n_req_fail = sum(1 for c in checks
                      if not c["passed"] and c["severity"] == "required")
