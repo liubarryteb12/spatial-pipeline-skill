@@ -196,10 +196,11 @@ pip install slingshot -> "Index Migration for ElasticSearch"
 
 **前半句是实测的，后半句的推论是错的。** 读 SpaGCN 1.2.7 的源码：
 
-- `SpaGCN/SpaGCN.py`、`models.py`、`util.py` 里**没有一处** `import louvain`；
-- 它走的是 `scanpy.tl.louvain`（`models.py:69`、`util.py:272`）；
+- `SpaGCN/SpaGCN.py`、以及 SpaGCN 包内的 `models.py`、`util.py`
+  里**没有一处** `import louvain`；
+- 它走的是 `scanpy.tl.louvain`（包内 `models.py:69`、`util.py:272`）；
 - `simple_GC_DEC.fit` 的 `init` 参数有 **`"kmeans"` 分支**
-  （`models.py:52-61`），完全不碰 louvain。
+  （包内 `models.py:52-61`），完全不碰 louvain。
 
 所以 `pip install --no-deps SpaGCN==1.2.7` + `init="kmeans"` 绕开了整条
 编译链。**`install_requires` 里有某个包，不等于运行时会 import 它** ——
@@ -212,7 +213,7 @@ pip install slingshot -> "Index Migration for ElasticSearch"
 ### 几条实测的依赖链细节
 
 - **`STAGATE`** / `STAGATE_pyG` / `stagate` 三个名字在 PyPI **全部 404**。
-  官方 GitHub 版（`RucDongLab/STAGATE_pyG`）的 `setup.py` 里
+  官方 GitHub 版（`RucDongLab/STAGATE_pyG`）的上游 `setup.py` 里
   `install_requires = ["requests"]` —— **元数据完全没写真实依赖**：
   `STAGATE_pyG/gat_conv.py:10` 是模块级
   `from torch_sparse import SparseTensor, set_diag`。而 `torch-sparse`

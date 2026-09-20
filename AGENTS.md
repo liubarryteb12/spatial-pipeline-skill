@@ -288,10 +288,11 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 
 **前半句是实测的，后半句的推论是错的。** 读 SpaGCN 1.2.7 的源码：
 
-- `SpaGCN/SpaGCN.py`、`models.py`、`util.py` 里**没有一处** `import louvain`；
-- 它走的是 `scanpy.tl.louvain`（`models.py:69`、`util.py:272`）；
+- `SpaGCN/SpaGCN.py`、以及 SpaGCN 包内的 `models.py`、`util.py`
+  里**没有一处** `import louvain`；
+- 它走的是 `scanpy.tl.louvain`（包内 `models.py:69`、`util.py:272`）；
 - `simple_GC_DEC.fit` 的 `init` 参数有 **`"kmeans"` 分支**
-  （`models.py:52-61`），完全不碰 louvain。
+  （包内 `models.py:52-61`），完全不碰 louvain。
 
 所以 `pip install --no-deps SpaGCN==1.2.7` + `init="kmeans"` 绕开了整条
 编译链，SpaGCN 现在**真的在跑**。代价（已写进产物的 `limitations`）：
@@ -303,7 +304,7 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 是同一件事的两面：**装得上但导不进来**（SpatialDE）与
 **元数据说装不上但根本不需要**（SpaGCN），都不能靠读 PyPI 页面判断。
 
-反过来也成立：**`setup.py` 里没写的依赖不代表不需要。**
+反过来也成立：**上游 `setup.py` 里没写的依赖不代表不需要。**
 `STAGATE_pyG` 的 `install_requires = ["requests"]`，而它的
 `gat_conv.py:10` 是模块级 `from torch_sparse import SparseTensor, set_diag`。
 **两个方向都会骗人。**
@@ -474,3 +475,29 @@ torch.manual_seed(seed); torch.set_num_threads(1)
 > **规则：日志的截断位置不该由"字典有多长"决定，该由"哪些字段能定位
 > 问题"决定。** 一个 `[:500]` 会让下一轮排查同样卡住 ——
 > 而 `results/` 的 artifact 有 14 天保留期，日志滚得更快。
+
+---
+
+## 22. 文档改动走独立的 `docs_check.yml`
+
+`spatial_analysis.yml` 有 `paths:` 过滤（只跑 `scripts/` `tools/` `assets/`
+`requirements.txt`），**`*.md` 的改动不触发它** —— 所以文档里的死链接
+以前**没有任何门禁能挡住**，CI 每次都是绿的。
+
+实测就踩到了：AGENTS 与 `references/module0.md` 让读者去看 `models.py` /
+`util.py` / `setup.py`，**但没说那是哪个包的** —— 它们是 SpaGCN 与
+STAGATE_pyG 包内的文件，不在本仓库里。
+
+现在 `tools/check_doc_refs.mjs` + `.github/workflows/docs_check.yml` 兜住这一类，
+**约 20 秒**、不装依赖、不跑分析。两个逃生舱写在工具文件头：
+
+| 逃生舱 | 标记 | 为什么必须写 |
+|---|---|---|
+| 指向**已删**的文件 | 已删 / 已移除 / 不再存在 / 曾经 / 当时的 / deleted | 读者要能区分"历史"和"笔误" |
+| 指向**第三方包**源码 | 包内 / 上游 / 源码 / site-packages / 该包 | 读者要知道去哪个包里翻 |
+
+**两个逃生舱都故意做成"要写一句话"的** —— 静默豁免会让检查退化成没有检查。
+
+> **为什么文档不并进主 workflow：** 那样改一个错别字要跑完整的空间流水线
+> （约 25 分钟），而且会被主流水线的偶发失败牵连（规则 21 的 ARI 五轮五个值
+> 就是实测记录）—— 文档改动因无关原因判红，反而让"每次推送 CI 必须绿"失效。
