@@ -40,7 +40,7 @@ import scipy.sparse as sp  # noqa: E402
 from scipy.sparse.csgraph import connected_components  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, named_tools_note, parse_args, probe_named_tools,
+                    log_warn, parse_args, pkg_version, probe_named_tools,
                     record_step, save_fig, set_seed,
                     spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, mm, PAL,)
 
@@ -143,6 +143,210 @@ def domain_metrics(adata, labels: np.ndarray, adj) -> dict:
         "fragmented_domains": int(n_frag),
         "domain_sizes": {u: int((labels == u).sum()) for u in uniq},
     }
+
+
+# ---------------------------------------------------------------------------
+# §3.2 点名的空间域方法：SpaGCN / STAGATE
+# ---------------------------------------------------------------------------
+# **这两个是"交叉验证"，不是替换主方法。** 主方法仍是上面的
+# 平滑 + Leiden（内置实现）—— 它可复现、无外部依赖、并且已经验证过。
+# 点名工具跑起来之后，要回答的是"两套划分是不是在说同一件事"，
+# 所以必须报 ARI / NMI / 邻居同域率，**不是只报"跑通了"**。
+#
+# ## SpaGCN 上一轮被登记成「装不上」，那个结论是错的
+#
+# 上一轮的登记写的是：`SpaGCN` 依赖 `louvain`，而 `louvain` 0.8.2
+# 没有 py3.12 wheel、只有 2019 年的 sdist，要编译 C++/Cython。
+# **前半句是实测的，后半句的推论是错的** —— 读 SpaGCN 1.2.7 的源码：
+#
+#   - `SpaGCN/SpaGCN.py`、`models.py`、`util.py` 里**没有一处**
+#     `import louvain`；
+#   - 它走的是 `scanpy.tl.louvain`（`models.py:69`、`util.py:272`）；
+#   - 而 `simple_GC_DEC.fit` 的 `init` 参数有 **`"kmeans"` 分支**
+#     （`models.py:52-61`），完全不碰 louvain。
+#
+# 所以 `pip install --no-deps SpaGCN` + `init="kmeans"` 可以绕开整条编译链。
+# **`install_requires` 里有某个包，不等于运行时会 import 它** ——
+# 判据要读源码，不能只读元数据。
+#
+# 代价（必须说清楚）：`init="louvain"` 让 SpaGCN 用表达+空间初始化簇心，
+# 换成 `kmeans` 后初始化只用空间平滑后的 GCN 特征。`n_clusters` 因此
+# **必须外部给定**，我们传内置方法得到的域数，这样两边域数相同、
+# ARI 才可比。
+
+SPAGCN_DEFAULTS = {"num_pcs": 30, "lr": 0.005, "max_epochs": 200, "tol": 1e-3}
+
+
+def _agreement(labels_a, labels_b, adj, adata, log=log_info) -> dict:
+    """两套域划分的一致程度。
+
+    **ARI 是主判据**：它对"域编号不同但划分相同"免疫（域 3 和域 7 换名
+    不影响），而这正是这里要问的问题。`same_label_frac` 不是 ——
+    它会被编号顺序完全支配，所以只作参考一起报。
+    """
+    from sklearn.metrics import (adjusted_rand_score,
+                                 normalized_mutual_info_score)
+    a = np.asarray(labels_a).astype(str)
+    b = np.asarray(labels_b).astype(str)
+    out = {
+        "n_labels_a": int(len(set(a.tolist()))),
+        "n_labels_b": int(len(set(b.tolist()))),
+        "adjusted_rand_index": round(float(adjusted_rand_score(a, b)), 4),
+        "normalized_mutual_info": round(
+            float(normalized_mutual_info_score(a, b)), 4),
+        "same_label_frac": round(float((a == b).mean()), 4),
+        "note": ("ARI 对域编号置换免疫，是主判据；same_label_frac 会被编号"
+                 "顺序支配，只作参考"),
+    }
+    ma = domain_metrics(adata, a, adj)
+    mb = domain_metrics(adata, b, adj)
+    out["neighbor_same_frac_a"] = ma["neighbor_same_frac"]
+    out["neighbor_same_frac_b"] = mb["neighbor_same_frac"]
+    out["spatial_enrichment_a"] = ma["spatial_enrichment"]
+    out["spatial_enrichment_b"] = mb["spatial_enrichment"]
+    log(f"  ARI={out['adjusted_rand_index']}  NMI={out['normalized_mutual_info']}"
+        f"  邻居同域率 {ma['neighbor_same_frac']} vs {mb['neighbor_same_frac']}")
+    return out
+
+
+def try_spagcn(adata, cfg: dict, n_clusters: int, log=log_info) -> tuple:
+    """跑 SpaGCN（文档 §3.2），返回 `(labels | None, prob | None, info)`。
+
+    **任何异常都吞掉并写进 info** —— 点名工具跑不起来不该让整步失败，
+    但必须让人看见（AGENTS 规则 4）。
+    """
+    info = {"attempted": True, "status": None, "reason": "", "section": "§3.2",
+            "init": "kmeans",
+            "why_kmeans": ("SpaGCN 的 install_requires 里有 `louvain`，但源码"
+                           "从不 import 它（走 scanpy.tl.louvain），且 init 有 "
+                           "kmeans 分支 —— 用 kmeans 绕开 louvain 的 py3.12 "
+                           "编译链")}
+    try:
+        import SpaGCN as spg
+    except Exception as exc:  # noqa: BLE001
+        info["status"] = "package_missing"
+        info["reason"] = f"SpaGCN 未安装（{type(exc).__name__}: {exc}）"
+        log(f"  §3.2 SpaGCN 未跑：{info['reason']}")
+        return None, None, info
+
+    info["version"] = pkg_version("SpaGCN")
+
+    # ---- 坐标：用 Visium 的 array 索引（六边形网格的整数坐标）---------------
+    # 不用像素坐标：像素下 l 是几百，含义要换算才知道；array 坐标下
+    # 最近邻距离就是 1，l 的值一眼能对上网格尺度。
+    for k in ("array_row", "array_col"):
+        if k not in adata.obs.columns:
+            info["status"] = "no_array_coords"
+            info["reason"] = (f"adata.obs 里没有 '{k}' —— SpaGCN 需要 Visium 的 "
+                              f"array 索引；不退回像素坐标（尺度含义会变，"
+                              f"l 就没法解释）")
+            log(f"  §3.2 SpaGCN 未跑：{info['reason']}")
+            return None, None, info
+    x = adata.obs["array_row"].astype(float).to_numpy()
+    y = adata.obs["array_col"].astype(float).to_numpy()
+
+    try:
+        sp_cfg = dict(SPAGCN_DEFAULTS)
+        sp_cfg.update(((cfg.get("domains") or {}).get("spagcn") or {}))
+        # l = array 坐标下的最近邻距离中位数。SpaGCN 的权重是
+        # exp(-d²/(2l²))，所以 l 就是"多远算邻居"的长度尺度。
+        #
+        # **实测 Visium 淋巴结上是 √2 ≈ 1.414，不是 1.0。** 六边形网格在
+        # array(row, col) 索引下的 6 个直接邻居落在 (±1,±1) 与 (0,±2) 上，
+        # 距离是 √2、√2、2 各两对 —— 中位最近邻距离因此是 √2。
+        # （第一版按"最近邻距离 = 1"写了注释，实测才发现是 √2。值本身是
+        # 从数据算的，所以注释错了不影响结果，但会误导读的人。）
+        #
+        # 取中位最近邻距离的效果：直接邻居权重 0.61、次近邻（d=2）0.37 ——
+        # 与内置邻居图"只连直接邻居"的口径接近但不相同。
+        from scipy.spatial import cKDTree
+        dd, _ = cKDTree(np.c_[x, y]).query(np.c_[x, y], k=2)
+        l_scale = float(np.median(dd[:, 1]))
+        info["length_scale_l"] = round(l_scale, 4)
+        info["n_clusters"] = int(n_clusters)
+        info["params"] = {k: v for k, v in sp_cfg.items()}
+
+        adj_d = spg.calculate_adj_matrix(x=x.tolist(), y=y.tolist(),
+                                        histology=False)
+        X = adata.X
+        X = np.asarray(X.todense()) if sp.issparse(X) else np.asarray(X)
+        # SpaGCN 内部走 `adata.X.A`（sparse 的 .A 在新 scipy 上已不保证存在），
+        # 所以直接喂稠密矩阵 —— 等价，且不依赖那个属性。
+        # obs 带上 array 坐标：官方用法就是传完整 adata，只给 X 会让它在
+        # 需要 obs 的分支（如 ez_mode 的绘图）炸掉。
+        sp_ad = sc.AnnData(X=X.astype(np.float32),
+                           obs=adata.obs[["array_row", "array_col"]].copy())
+
+        clf = spg.SpaGCN()
+        clf.set_l(l_scale)
+        clf.train(sp_ad, adj_d,
+                  num_pcs=int(sp_cfg["num_pcs"]),
+                  lr=float(sp_cfg["lr"]),
+                  max_epochs=int(sp_cfg["max_epochs"]),
+                  init="kmeans", n_clusters=int(n_clusters),
+                  init_spa=True, tol=float(sp_cfg["tol"]))
+        y_pred, prob = clf.predict()
+        labels = np.asarray([str(int(v)) for v in y_pred])
+        info["status"] = "ok"
+        info["n_domains"] = int(len(set(labels.tolist())))
+        info["mean_max_prob"] = round(float(np.max(prob, axis=1).mean()), 4)
+        log(f"  §3.2 SpaGCN 完成：{info['n_domains']} 域，"
+            f"平均最大后验 {info['mean_max_prob']}，"
+            f"l={l_scale:.3f}，{sp_cfg['max_epochs']} epochs 上限")
+        return labels, prob, info
+    except Exception as exc:  # noqa: BLE001
+        info["status"] = "failed"
+        info["reason"] = f"{type(exc).__name__}: {exc}"
+        log_warn(f"  §3.2 SpaGCN 跑失败：{info['reason']}")
+        return None, None, info
+
+
+def try_stagate(adata, cfg: dict, log=log_info) -> tuple:
+    """跑 STAGATE（文档 §3.2），返回 `(labels | None, info)`。
+
+    **本环境里它装不上，这条路径大概率不会执行** —— 但代码路径必须
+    在位并且如实记状态，否则"没装"和"没写"分不开。
+    """
+    info = {"attempted": True, "status": None, "reason": "", "section": "§3.2"}
+    try:
+        from STAGATE_pyG import Cal_Spatial_Net, train_STAGATE
+    except Exception as exc:  # noqa: BLE001
+        info["status"] = "package_missing"
+        info["reason"] = (f"STAGATE_pyG 未安装（{type(exc).__name__}: {exc}）—— "
+                          f"PyPI 上 STAGATE / STAGATE_pyG / stagate 三个名字"
+                          f"全部 404；官方只发 GitHub，而它的 gat_conv.py "
+                          f"模块级 `from torch_sparse import SparseTensor, set_diag`，"
+                          f"torch-sparse 在 PyPI 上只有 sdist（0 个 wheel），"
+                          f"要按 torch 版本编译")
+        log(f"  §3.2 STAGATE 未跑：{info['reason'][:90]}")
+        return None, info
+
+    info["version"] = pkg_version("STAGATE_pyG")
+    try:
+        st_cfg = ((cfg.get("domains") or {}).get("stagate") or {})
+        n_epochs = int(st_cfg.get("n_epochs", 500))
+        work = adata.copy()
+        Cal_Spatial_Net(work, rad_cutoff=float(st_cfg.get("rad_cutoff", 150)))
+        train_STAGATE(work, n_epochs=n_epochs,
+                      random_seed=int((cfg.get("analysis") or {}).get("seed", 0)))
+        sc.pp.neighbors(work, use_rep="STAGATE", random_state=cfg["analysis"]["seed"])
+        sc.tl.leiden(work, resolution=float(st_cfg.get("resolution", 0.5)),
+                     key_added="_stagate", flavor="igraph", n_iterations=2,
+                     directed=False, random_state=cfg["analysis"]["seed"])
+        labels = work.obs["_stagate"].astype(str).values
+        info["status"] = "ok"
+        info["n_domains"] = int(len(set(labels.tolist())))
+        info["n_epochs"] = n_epochs
+        info["clustering"] = ("STAGATE 官方用 mclust（R）；本仓库不装 R，"
+                              "所以对它的嵌入跑 Leiden —— 这一步不是 STAGATE "
+                              "原版流程的一部分")
+        log(f"  §3.2 STAGATE 完成：{info['n_domains']} 域（{n_epochs} epochs）")
+        return labels, info
+    except Exception as exc:  # noqa: BLE001
+        info["status"] = "failed"
+        info["reason"] = f"{type(exc).__name__}: {exc}"
+        log_warn(f"  §3.2 STAGATE 跑失败：{info['reason']}")
+        return None, info
 
 
 def run_03_spatial_domains(cfg: dict) -> dict:
@@ -370,6 +574,39 @@ def run_03_spatial_domains(cfg: dict) -> dict:
     except Exception as e:  # noqa: BLE001
         log_warn(f"域标签打分跳过: {type(e).__name__}: {e}")
 
+    # ---- 4c. §3.2 点名方法：SpaGCN / STAGATE（交叉验证）----------------------
+    #
+    # **域数对齐再比。** SpaGCN 用 kmeans 初始化时必须外部给 n_clusters，
+    # 我们传内置方法的域数 —— 两边域数相同，ARI 才在比"划分方式"而不是
+    # 在比"谁切得细"。
+    n_clusters_for_named = int(m_spat["n_domains"])
+    spg_labels, spg_prob, spg_info = try_spagcn(adata, cfg, n_clusters_for_named)
+    stg_labels, stg_info = try_stagate(adata, cfg)
+
+    method_agree = {}
+    if spg_labels is not None:
+        adata.obs["domain_spagcn"] = pd.Categorical(spg_labels)
+        pd.DataFrame({
+            "barcode": adata.obs_names,
+            "domain": adata.obs["domain"].astype(str).values,
+            "domain_spagcn": spg_labels,
+            "spagcn_max_prob": np.round(np.max(spg_prob, axis=1), 5),
+        }).to_csv(res_dir / "spagcn_domains.csv", index=False)
+        method_agree["SpaGCN_vs_builtin"] = _agreement(
+            adata.obs["domain"].astype(str).values, spg_labels, adj, adata)
+    if stg_labels is not None:
+        adata.obs["domain_stagate"] = pd.Categorical(stg_labels)
+        pd.DataFrame({
+            "barcode": adata.obs_names,
+            "domain": adata.obs["domain"].astype(str).values,
+            "domain_stagate": stg_labels,
+        }).to_csv(res_dir / "stagate_domains.csv", index=False)
+        method_agree["STAGATE_vs_builtin"] = _agreement(
+            adata.obs["domain"].astype(str).values, stg_labels, adj, adata)
+    if spg_labels is not None and stg_labels is not None:
+        method_agree["SpaGCN_vs_STAGATE"] = _agreement(
+            spg_labels, stg_labels, adj, adata)
+
     # ---- 5. 叠到 H&E 上（唯一能判断域是否对应组织学的方法）-------------------
     lib = list(adata.uns["spatial"].keys())[0]
     entry = adata.uns["spatial"][lib]
@@ -405,22 +642,75 @@ def run_03_spatial_domains(cfg: dict) -> dict:
                  "(the only way to judge whether domains match real histology)")
     save_fig(cfg, "domains_on_he", fig)
 
+    # ---- 5b. 方法对照图（只在点名方法真的跑了时才画）------------------------
+    #
+    # **"跑通了"不是结论，两套划分是否一致才是。** 所以图和方法名放在一起，
+    # 让读者一眼看到 ARI 之外的东西：哪一块组织两套方法分歧最大。
+    if spg_labels is not None or stg_labels is not None:
+        panels = [("domain", f"Builtin smooth+Leiden ({m_spat['n_domains']})")]
+        if spg_labels is not None:
+            panels.append(("domain_spagcn",
+                           f"SpaGCN, kmeans init ({spg_info['n_domains']})"))
+        if stg_labels is not None:
+            panels.append(("domain_stagate",
+                           f"STAGATE ({stg_info['n_domains']})"))
+        fig_c, axes_c = plt.subplots(1, len(panels), figsize=(W_DOUBLE, mm(52)))
+        axes_c = np.atleast_1d(axes_c)
+        for ax, (key, title) in zip(axes_c, panels):
+            ax.imshow(img, alpha=0.55)
+            cats = adata.obs[key].astype(str).values
+            uniq = sorted(set(cats), key=lambda x: int(x) if x.isdigit() else x)
+            cmap = plt.get_cmap("tab20")
+            for i, u in enumerate(uniq):
+                m = cats == u
+                ax.scatter(xy[m, 0], xy[m, 1], s=8, color=cmap(i % 20),
+                           label=u, linewidths=0)
+            ax.set_title(title)
+            ax.set_xticks([]); ax.set_yticks([])
+        sub = " / ".join(f"{k}: ARI={v['adjusted_rand_index']}"
+                         for k, v in method_agree.items())
+        fig_c.suptitle("Named §3.2 methods vs builtin domains\n" + sub)
+        save_fig(cfg, "domains_method_compare", fig_c)
+
     # ---- 6. 落盘 ------------------------------------------------------------
     adata.obs[["domain", "domain_expr_only"]].to_csv(res_dir / "spatial_domains.csv")
     out = data_dir / "domains.h5ad"
     adata.write_h5ad(out)
     log_info(f"已写出 {out}")
 
-    # ---- 7. 点名工具的可用性登记（§3.2）-------------------------------------
+    # ---- 7. 点名工具的落地登记（§3.2）---------------------------------------
     #
-    # 文档 §3.2 点名 BayesSpace / STAGATE / SpaGCN。**本仓库一个都没用上** ——
-    # 上面跑的两种域划分（不平滑 / 平滑）都是内置实现，不是这三个中的任何一个。
+    # 文档 §3.2 点名 BayesSpace / STAGATE / SpaGCN。**这三条现在是三件不同的事**，
+    # 不能再用一句话概括：
     #
-    # 这一段把"为什么没用上"逐条落盘。**不写这段的话，产物里只有一个
-    # 漂亮的域划分结果，读的人无从知道规范点名的三种方法都没跑。**
-    named = probe_named_tools(log=log_warn, only=("BayesSpace", "STAGATE", "SpaGCN"))
-    for tool, info in named.items():
-        log_info(f"  §3.2 {tool}: 未使用（{info['kind']}）—— {info['reason'][:70]}")
+    #   SpaGCN    —— 真的跑了（`try_spagcn`），结果在 `domain_methods` 里，
+    #                与内置划分的一致性在 `method_agreement` 里
+    #   STAGATE   —— 代码路径在位，但包装不上（PyPI 三个名字全 404 +
+    #                torch-sparse 只有 sdist）；`domain_methods` 里记原因
+    #   BayesSpace—— R/Bioconductor 包，本仓库 CI 不装 R + rpy2，结构上跑不了
+    #
+    # **SpaGCN 已从 `NAMED_TOOLS` 移除**（它不再是"用不了的工具"）；
+    # 留在这里反而会让 `probe_named_tools` 每次都报"登记过期"。
+    named = probe_named_tools(log=log_warn, only=("BayesSpace", "STAGATE"))
+    for tool, tinfo in named.items():
+        log_info(f"  §3.2 {tool}: 未使用（{tinfo['kind']}）—— {tinfo['reason'][:70]}")
+
+    domain_methods = {
+        "builtin_smooth_leiden": {
+            "used": True, "role": "primary", "section": "§3.2",
+            "status": "ok", "n_domains": m_spat["n_domains"],
+            "note": ("本仓库的平滑 + Leiden（`flavor='igraph'`）。"
+                     "**这不是文档点名的三个方法中的任何一个** —— "
+                     "它是可复现、无外部依赖的基线"),
+        },
+        "SpaGCN": dict(spg_info, used=spg_info.get("status") == "ok"),
+        "STAGATE": dict(stg_info, used=stg_info.get("status") == "ok"),
+        "BayesSpace": dict(named["BayesSpace"], used=False),
+    }
+
+    # 验收用的"指名工具落地情况"：每条都要有 used 和（未用时）reason
+    n_used = sum(1 for v in domain_methods.values() if v.get("used"))
+    log_info(f"  §3.2 落地情况：{n_used}/{len(domain_methods)} 个方法实际产出结果")
 
     status = {
         "dataset_id": cfg["dataset_id"],
@@ -432,9 +722,15 @@ def run_03_spatial_domains(cfg: dict) -> dict:
         "spatial": m_spat,
         "smoothing_scan": df_to_records(scan_df),
         "resolution_scan": rscan,
-        # **§3.2 点名的三个方法一个都没跑。** 这是缺口，必须自己说出来。
+        # ---- §3.2 点名工具的**逐条落地状态**（不是"一个都没跑"）------------
+        "domain_methods": domain_methods,
+        "method_agreement": method_agree,
         "named_tools": named,
-        "named_tools_note": named_tools_note(),
+        "named_tools_note": (
+            "§3.2 点名的三个方法里，**SpaGCN 已实际运行**（结果见 "
+            "domain_methods / method_agreement / spagcn_domains.csv）；"
+            "STAGATE 与 BayesSpace 未运行，逐条理由见 domain_methods。"
+            "主方法仍是内置的平滑 + Leiden。"),
         "improvement": {
             "neighbor_same_frac_delta": round(
                 m_spat["neighbor_same_frac"] - m_expr["neighbor_same_frac"], 4),
@@ -455,11 +751,19 @@ def run_03_spatial_domains(cfg: dict) -> dict:
             "肿瘤的癌巢本身就是散布的多个斑块 —— 同一个域出现在多个不相邻"
             "位置是生物学事实。只有对『应当连续』的组织（脑的层状结构、"
             "上皮分层）才能把这个指标当缺陷看",
-            # §3.2 的缺口 —— 必须与"域划分做出来了"并列出现
-            "**§3.2 点名的 BayesSpace / STAGATE / SpaGCN 一个都没跑**，"
-            "上面的域划分是本仓库的平滑 + Leiden 内置实现。"
-            "三个都装不上（R 包 / 不在 PyPI / `louvain` 无 py3.12 wheel），"
-            "逐条理由见 `named_tools` 字段。**这是缺口，不是已覆盖。**",
+            # §3.2 的落地边界 —— 必须与"域划分做出来了"并列出现
+            ("**SpaGCN 跑的是 `init=\"kmeans\"` 路径，不是默认的 "
+             "`init=\"louvain\"`。** 差别在簇心初始化：louvain 用表达+空间，"
+             "kmeans 只用 GCN 特征。`n_clusters` 因此是外部给定的"
+             f"（传了内置方法的 {n_clusters_for_named} 个域）—— "
+             "**这既是可比性的前提，也意味着 SpaGCN 的域数不是它自己选的**"),
+            ("**STAGATE 与 BayesSpace 没有运行。** STAGATE 的三个 PyPI 名字"
+             "全部 404、官方 GitHub 版的 `gat_conv.py` 模块级依赖 torch-sparse"
+             "（PyPI 上只有 sdist、0 个 wheel）；BayesSpace 是 R/Bioconductor 包，"
+             "本仓库 CI 不装 R。逐条理由见 `domain_methods`"),
+            ("**ARI 高不等于两套方法都对。** 它们可能共享同一个错误"
+             "（比如都被同一个技术批次效应驱动）。一致只说明"
+             "『换一种方法也不会得到完全不同的域』"),
         ],
         "status": "ok",
     }

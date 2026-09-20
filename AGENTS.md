@@ -272,3 +272,69 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 所以一致性必须**分 top 组和背景组各报一次** ——
 合并成一个数会把"两边都认为强"和"两边都认为弱"平均掉。
 **背景组的 rho 才是有信息量的那个数**（实测 0.7954，top 组 0.8713）。
+
+
+## 20. `install_requires` 里有某个包，不等于运行时会 import 它
+
+`SpaGCN` 上一轮被登记成"装不上"，理由是：
+
+> PyPI 有真包（1.2.7），但依赖 `louvain` —— 该包最新版 0.8.2 没有
+> py3.12 wheel，只有 sdist，要从 2019 年的 C++/Cython 源码编译。
+
+**前半句是实测的，后半句的推论是错的。** 读 SpaGCN 1.2.7 的源码：
+
+- `SpaGCN/SpaGCN.py`、`models.py`、`util.py` 里**没有一处** `import louvain`；
+- 它走的是 `scanpy.tl.louvain`（`models.py:69`、`util.py:272`）；
+- `simple_GC_DEC.fit` 的 `init` 参数有 **`"kmeans"` 分支**
+  （`models.py:52-61`），完全不碰 louvain。
+
+所以 `pip install --no-deps SpaGCN==1.2.7` + `init="kmeans"` 绕开了整条
+编译链，SpaGCN 现在**真的在跑**。代价（已写进产物的 `limitations`）：
+簇心初始化从"表达+空间"变成"只用 GCN 特征"，`n_clusters` 因此必须
+外部给定 —— 传内置方法的域数，两边域数相同 ARI 才可比。
+
+**规则：判断一个包能不能用，判据是源码里的 import，不是元数据。**
+元数据只说明"pip 会不会去装它"。这一条和规则 19（SpatialDE 垫片）
+是同一件事的两面：**装得上但导不进来**（SpatialDE）与
+**元数据说装不上但根本不需要**（SpaGCN），都不能靠读 PyPI 页面判断。
+
+反过来也成立：**`setup.py` 里没写的依赖不代表不需要。**
+`STAGATE_pyG` 的 `install_requires = ["requests"]`，而它的
+`gat_conv.py:10` 是模块级 `from torch_sparse import SparseTensor, set_diag`。
+**两个方向都会骗人。**
+
+### 落地登记要能表达"缺数据"这一种
+
+`NAMED_TOOLS` 的 `kind` 原来有四类（`r_package` / `not_on_pypi` /
+`deps` / `name_taken`），这一轮加了第五类 **`needs_reference`**：
+
+| kind | 含义 | 例子 |
+|---|---|---|
+| `needs_reference` | **包装得上，缺的是数据** | `cell2location`（§3.3） |
+
+`cell2location` 0.1.5 的依赖（scvi-tools + torch + pyro-ppl + opencv-python）
+都装得上，卡住的是 `Cell2location(...)` 需要 `cell_state_df` ——
+每个细胞类型的全转录组后验表达谱，而默认配置是 marker 签名。
+
+**把"缺数据"写成"装不上"会让下一个人去折腾安装，方向完全错。**
+所以 `probe_named_tools` 对 `needs_reference` 这类**不报"登记过期"** ——
+它可 import 是符合预期的。
+
+### 点名工具跑了，就必须量化它与主方法的一致性
+
+**"跑通了"不是结论。** 一个点名工具跑出 13 个域，如果不说它和内置划分
+的 ARI，读者只能看到一个孤立的划分。所以 `main_analysis.py` 里有一条
+honesty 检查：`domain_methods` 里任何 `used: True` 的工具，
+`method_agreement` 里必须有对应的 `<tool>_vs_builtin`。
+
+ARI 是主判据（对域编号置换免疫）；`same_label_frac` 只作参考 ——
+它会被编号顺序完全支配。**ARI 高也不等于两套方法都对**：
+它们可能共享同一个错误（比如被同一个技术批次效应驱动）。
+
+### 登记位置不唯一，验收要把两张表合并起来看
+
+§3.2 的 SpaGCN 跑起来之后从 `named_tools` 搬到了 `domain_methods`
+（它不再是"用不了的工具"）。所以 `named_tools:*` 这条验收检查必须
+**把 `named_tools` 与 `domain_methods` 合并**再比对点名的工具名单 ——
+只认 `named_tools` 会把"已经跑了的工具"报成"缺登记"，
+**正好把好事判成坏事**。

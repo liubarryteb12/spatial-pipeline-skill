@@ -19,6 +19,12 @@ name: spatial analysis
 #   4. **图的检查在跑完之后。** 空白图只有真画出来才知道。
 #
 #   5. 触发路径过滤：改 *.md / references/ 不触发 CI。
+#
+#   6. **点名工具"装得上"和"跑得了"分开验证。** SpaGCN（§3.2）进主安装路径，
+#      因为它真的会跑；cell2location（§3.3）放在 `continue-on-error` 的
+#      探测步骤里 —— 装得上就留痕，装不上也不让 job 变红，而流水线产物里
+#      记的是"缺参考"（needs_reference）。**"装不上"和"缺数据"是两件事，
+#      不能混成一句"没做"。**
 # ============================================================================
 
 on:
@@ -80,14 +86,45 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
+          # **torch 必须先从 CPU 专用索引装。** 默认 PyPI 上的 torch 是 CUDA
+          # 构建（2.5 GB+），而 GitHub 托管的 runner 没有 GPU —— 装它纯属
+          # 浪费磁盘和时间。requirements.txt 里只声明 `torch>=2.2,<3`，
+          # 所以下面 `-r requirements.txt` 看到已满足就不会再装一遍。
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -r requirements.txt
-          python -c "import scanpy, anndata, squidpy; print('核心依赖 OK')"
+          # **SpaGCN 必须 `--no-deps`。** 它的 install_requires 里有
+          # `louvain`，而 louvain 0.8.2 只有到 cp311 的 wheel（py3.12 上要
+          # 从 2019 年的 Cython/C++ 源码编译）。但 SpaGCN 的源码里**没有一处**
+          # `import louvain` —— 它走 scanpy.tl.louvain，而 init="kmeans"
+          # 分支根本不碰它（models.py:52-61）。`--no-deps` 让整条编译链消失。
+          # 真实依赖已逐个核对并补进 requirements.txt（见那里的说明）。
+          python -m pip install --no-deps SpaGCN==1.2.7
+          python -c "import scanpy, anndata, squidpy, torch, SpaGCN; print('核心依赖 OK')"
+
+      - name: 可选工具探测（不阻断）
+        # **装不上不能让 job 变红，但"装没装上"必须留痕。**
+        # cell2location 是 §3.3 点名的工具，PyPI 有真包 —— 这一步证明
+        # "它装得上"，而流水线产物里记的是"缺参考所以没跑"
+        # （needs_reference，不是装不上）。两者合起来才是完整的事实。
+        #
+        # `continue-on-error: true`：依赖链（scvi-tools + pyro-ppl +
+        # opencv）哪天断了，红的应该是这条探测，不是整个流水线。
+        continue-on-error: true
+        timeout-minutes: 12
+        run: |
+          python -m pip install "cell2location>=0.1.5,<0.2" || \
+            echo "cell2location 安装失败 —— 记为装不上，不影响流水线"
+          python -c "
+          import importlib.util as u
+          for m in ['cell2location', 'cell2location.models', 'STAGATE_pyG', 'SpatialDE']:
+              print('  OK  ' if u.find_spec(m) else '  --  ', m)
+          "
 
       - name: 显示环境
         run: |
           python -c "
           import importlib
-          for m in ['scanpy','anndata','squidpy','skmisc','skimage','leidenalg','igraph','statsmodels','yaml']:
+          for m in ['scanpy','anndata','squidpy','skmisc','skimage','leidenalg','igraph','statsmodels','yaml','torch','numba','SpaGCN','SpatialDE','cell2location']:
               try:
                   mod = importlib.import_module(m)
                   print('  OK  ', m, getattr(mod, '__version__', ''))
@@ -137,6 +174,25 @@ jobs:
           " 2>/dev/null || cat results/lymph_node/acceptance_report.json 2>/dev/null | head -40 || true
           echo "===== 空间对齐 ====="
           cat data/lymph_node/spatial_alignment_check.json 2>/dev/null | head -30 || true
+          echo "===== §3.2 / §3.3 点名工具落地 ====="
+          # **跑通了不等于用上了，用上了不等于对。** 这一段把"哪个点名工具
+          # 真的产出了结果、哪个没有、为什么"直接打在日志里 ——
+          # 否则一个漂亮的域划分结果会让人以为规范点名的三种方法都跑了。
+          python -c "
+          import json, pathlib
+          for f, keys in (
+                  ('results/lymph_node/domain_status.json',
+                   ('domain_methods', 'method_agreement')),
+                  ('results/lymph_node/deconvolution_status.json',
+                   ('cell2location',))):
+              p = pathlib.Path(f)
+              if not p.exists():
+                  print(f, '（缺失）'); continue
+              d = json.loads(p.read_text(encoding='utf-8'))
+              for k in keys:
+                  v = d.get(k)
+                  print('  %s -> %s' % (k, json.dumps(v, ensure_ascii=False)[:500]))
+          " 2>/dev/null || true
 
       - name: 上传产物
         if: always()

@@ -210,15 +210,24 @@ KEY_PACKAGES = [
 # ---- 文档点名、但本仓库用不了的工具 -----------------------------------------
 #
 # 规范 §3.2 点名 BayesSpace / STAGATE / SpaGCN，§3.3 点名 RCTD / cell2location，
-# §3.5 点名 CellChat，§3.6 点名 StPedf / SpaceFlow / ISORT / Stereopy-TGPI / stLearn。
-# **本仓库一个都没用上。** 这一节把"为什么"逐条记下来，判据全部是实测的。
+# §3.4 点名 SPARK-X，§3.5 点名 CellChat，§3.6 点名 StPedf / SpaceFlow / ISORT /
+# Stereopy-TGPI / stLearn。
 #
-# ## 三种不同的"用不了"，不能混为一谈
+# **SpaGCN 已经从这张表里移除了 —— 它现在真的在跑**（`try_spagcn`）。
+# 剩下的每一条都把"为什么没用上"记下来，判据全部是实测的。
 #
-#   r_package    R/Bioconductor 包，本仓库的 Python CI 里没有 rpy2 → 结构上装不了
-#   not_on_pypi  真包不在 PyPI，只能从 GitHub 装（且通常还依赖 torch-geometric）
-#   deps         PyPI 上有真包，但依赖链在当前 CI 上跑不动
-#   name_taken   **PyPI 上那个名字是另一个不相干的包** ← 最危险的一类
+# ## 五种不同的"用不了"，不能混为一谈
+#
+#   r_package       R/Bioconductor 包，本仓库的 Python CI 里没有 rpy2 → 结构上装不了
+#   not_on_pypi     真包不在 PyPI，只能从 GitHub 装（且通常还依赖 torch-geometric）
+#   deps            PyPI 上有真包，但依赖链在当前 CI 上跑不动
+#   needs_reference 包**装得上**，缺的是数据（如解卷积需要带标签的 scRNA 参考）
+#   name_taken      **PyPI 上那个名字是另一个不相干的包** ← 最危险的一类
+#
+# `needs_reference` 是这一轮新加的：`cell2location` 上一轮被记成 `deps`
+# （"GPU 导向，CPU CI 吃不消"），但真读它的接口就会发现**它不是装不上的问题** ——
+# 它缺的是一份带细胞类型标签的参考，而本流水线配的是 marker 签名。
+# 把"缺数据"写成"装不上"会让下一个人去折腾安装，方向完全错。
 #
 # ## `name_taken` 为什么单列一类
 #
@@ -238,32 +247,58 @@ KEY_PACKAGES = [
 # **summary / author / project_urls**，不是"名字存在与否"。
 NAMED_TOOLS = {
     # ---- §3.2 空间域 --------------------------------------------------------
+    # **SpaGCN 已经不在这张表里了。** 它上一轮被登记为 `deps`（理由是
+    # "依赖 louvain，而 louvain 没有 py3.12 wheel"）—— 那个理由是
+    # **读元数据推出来的，读源码就能推翻**：SpaGCN 1.2.7 的源码里没有一处
+    # `import louvain`，它走 `scanpy.tl.louvain`，而 `init="kmeans"` 分支
+    # 根本不碰它。现在 `pip install --no-deps SpaGCN` + `init="kmeans"`
+    # 真的在跑（见 `03_spatial_domains.py` 的 `try_spagcn`）。
+    # **留在表里会让 `probe_named_tools` 每轮都报"登记过期"。**
     "BayesSpace": dict(
         kind="r_package", section="§3.2",
-        reason="Bioconductor R 包，没有 Python 发行版；本仓库 CI 不装 R + rpy2",
+        reason=("Bioconductor R 包（`BayesSpace`），PyPI 上无同名包"
+                "（实测 `BayesSpace` 404）；本仓库 CI 不装 R + rpy2，"
+                "结构上跑不了"),
     ),
     "STAGATE": dict(
         kind="not_on_pypi", section="§3.2",
-        reason=("PyPI 上 STAGATE / STAGATE_pyG / stagate 三个名字**全部 404**；"
-                "官方只发 GitHub，且依赖 torch + torch-geometric"),
-    ),
-    "SpaGCN": dict(
-        kind="deps", section="§3.2",
-        reason=("PyPI 有真包（1.2.7，作者 Jian Hu），但依赖 `louvain` —— "
-                "**该包最新版 0.8.2 没有 py3.12 wheel，只有 sdist**，"
-                "要从 2019 年的 C++/Cython 源码编译。CI 的 3.12 上未验证能编过，"
-                "不敢押一轮 CI"),
+        reason=("PyPI 上 `STAGATE` / `STAGATE_pyG` / `stagate` 三个名字"
+                "**全部 404**（实测 pypi.org/pypi/<name>/json）。官方只发 GitHub"
+                "（`RucDongLab/STAGATE_pyG`），而它的 `setup.py` 里 "
+                "`install_requires = [\"requests\"]` —— **元数据完全没写真实依赖**："
+                "`STAGATE_pyG/gat_conv.py:10` 是模块级 "
+                "`from torch_sparse import SparseTensor, set_diag`。"
+                "`torch-sparse` 0.6.18 在 PyPI 上**只有 sdist、0 个 wheel**"
+                "（要按 torch 版本编译 C++ 扩展），而且 `gat_conv.py` 还用 "
+                "`from torch_geometric.typing import OptPairTensor, Adj, Size, NoneType` "
+                "—— 这些名字在 PyG>=2.4 已移除，等于同时钉死 torch-sparse 与 "
+                "PyG<2.4。**两条都要满足才跑得起来，代价远大于它作为交叉验证的价值**"),
     ),
     # ---- §3.3 解卷积 --------------------------------------------------------
     "RCTD": dict(
         kind="r_package", section="§3.3",
-        reason="`spacexr` 是 R 包（Bioconductor/GitHub），PyPI 上无同名包",
+        reason="`spacexr` 是 R 包（Bioconductor/GitHub dmcable/RCTD），PyPI 上无同名包",
     ),
     "cell2location": dict(
-        kind="deps", section="§3.3",
-        reason=("PyPI 有真包（0.1.5，BayraktarLab），但依赖 "
-                "`scvi-tools>=1.3.0` + `torch>=1.9.0` + `pyro-ppl` + `opencv-python`；"
-                "GPU 导向，CPU CI 上的时间与磁盘都吃不消"),
+        kind="needs_reference", section="§3.3",
+        reason=("PyPI 有真包（0.1.5，BayraktarLab），依赖 scvi-tools + torch + "
+                "pyro-ppl + opencv-python —— **都装得上**（torch 本来就要为 "
+                "SpaGCN 装）。**但装得上不等于跑得了**：cell2location 的 "
+                "`RegressionModel` 需要一份**带细胞类型标签的 scRNA-seq 参考**"
+                "（`cell_state_df`），而本流水线的配置是 "
+                "`deconvolution.reference: builtin`（marker 签名）—— "
+                "没有匹配的参考，硬跑只会得到一个不含信息的均匀组成"
+                "（这正是 `05_deconvolution.py` 里 NNLS 那一版踩过的坑）。"
+                "所以状态是 **needs_reference，不是装不上**；"
+                "配上 `reference: h5ad` + `celltype_key` 就会走它"),
+    ),
+    # ---- §3.4 空间可变基因 --------------------------------------------------
+    "SPARK-X": dict(
+        kind="r_package", section="§3.4",
+        reason=("SPARK-X 是 R 包（xzhoulab/SPARK），PyPI 上无同名包。"
+                "**注意 `pip install sparkx` 会成功但装错东西** —— PyPI 上的 "
+                "`sparkx` 2.2.0 是高能物理的碰撞相对论运动学包，"
+                "与空间可变基因毫无关系。所以这个名字不能进 requirements.txt"),
     ),
     # ---- §3.5 空间通讯 ------------------------------------------------------
     "CellChat": dict(
@@ -273,12 +308,14 @@ NAMED_TOOLS = {
     # ---- §3.6 空间轨迹 ------------------------------------------------------
     "StPedf": dict(
         kind="not_on_pypi", section="§3.6",
-        reason="PyPI 上无此包",
+        reason="PyPI 上无此包（`StPedf` / `stpedf` 都 404）",
     ),
     "SpaceFlow": dict(
         kind="deps", section="§3.6",
-        reason=("PyPI 有真包（1.0.4），但依赖 torch-geometric + torch-sparse + "
-                "torch-scatter —— 后两者要按 torch 版本编译，是出了名的难装"),
+        reason=("PyPI 有真包（1.0.4，wheel 是 py3-none-any），但依赖 "
+                "torch-geometric + torch-sparse + torch-scatter —— 后两者在 "
+                "PyPI 上只有 sdist（0 个 wheel），要按 torch 版本编译，"
+                "与 STAGATE 撞在同一道墙上"),
     ),
     "ISORT": dict(
         kind="name_taken", section="§3.6",
@@ -292,10 +329,10 @@ NAMED_TOOLS = {
     ),
     "stLearn": dict(
         kind="deps", section="§3.5/§3.6",
-        reason=("PyPI 有真包（1.4.1），但依赖 `numpy>=2.4.0` / `scipy>=1.17.0` / "
-                "`scanpy>=1.12.0` / `zarr>=3.1` / spatialdata 全家桶 + torch + "
-                "torchvision + geopandas + dask（20+ 个），与本仓库钉的 "
-                "scanpy/numpy 区间冲突"),
+        reason=("PyPI 有真包（1.4.1，`requires_python='>=3.12'`），但依赖 "
+                "`numpy>=2.4.0` / `scipy>=1.17.0` / `scanpy>=1.12.0` / "
+                "`zarr>=3.1` / spatialdata 全家桶 + torch + torchvision + "
+                "geopandas + dask（20+ 个），与本仓库钉的 scanpy/numpy 区间冲突"),
     ),
     # ---- 细胞分割（§3.1 的平台分支）------------------------------------------
     "Bering": dict(
@@ -304,10 +341,30 @@ NAMED_TOOLS = {
     ),
     "BOMS": dict(
         kind="deps", section="§3.1",
-        reason=("PyPI 有真包（1.1.0），依赖 `mkl` + `mkl-service` —— "
-                "那是 conda 时代的 Intel MKL 绑定，pip 环境下不可靠"),
+        reason=("PyPI 有真包（1.1.0），但 wheel 只到 cp310（无 cp312），"
+                "依赖 `mkl` + `mkl-service` —— conda 时代的 Intel MKL 绑定，"
+                "pip 环境下不可靠"),
     ),
 }
+
+
+def pkg_version(name: str):
+    """单个发行版的版本号；查不到返回 None（**不编造**）。
+
+    与 `capture_versions` 的区别：那个是全量枚举 + 写清单，这个只回答
+    "某个点名工具现在装的是哪个版本"，给状态 JSON 里的
+    `domain_methods` / `named_tools` 用。
+
+    名字按 PEP 503 归一化后再查 —— `STAGATE_pyG` 与 `stagate-pyg` 是同一个
+    发行版，直接拿原名查会漏。
+    """
+    from importlib import metadata as _md
+    for cand in (name, _norm_pkg(name), name.replace("_", "-").lower()):
+        try:
+            return _md.version(cand)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
 
 
 def probe_named_tools(log=None, only=None) -> dict:
@@ -324,10 +381,10 @@ def probe_named_tools(log=None, only=None) -> dict:
 
     # 名字 -> 真正会被 import 的模块名（不总是一样）
     import_name = {
-        "SpaGCN": "SpaGCN", "SpaceFlow": "spaceflow", "stLearn": "stlearn",
+        "SpaceFlow": "spaceflow", "stLearn": "stlearn",
         "cell2location": "cell2location", "Bering": "Bering", "BOMS": "boms",
         "ISORT": "isort", "STAGATE": "STAGATE", "BayesSpace": None,
-        "RCTD": None, "CellChat": None, "StPedf": None,
+        "RCTD": None, "CellChat": None, "StPedf": None, "SPARK-X": None,
         "Stereopy-TGPI": "stereopy",
     }
     out = {}
@@ -341,8 +398,11 @@ def probe_named_tools(log=None, only=None) -> dict:
                 avail = importlib.util.find_spec(mod) is not None
             except (ImportError, ValueError):
                 avail = False
-        if avail and log:
-            # 登记说过不了、环境里却有 —— 登记过期了，必须报出来
+        if avail and log and meta["kind"] != "needs_reference":
+            # 登记说过不了、环境里却有 —— 登记过期了，必须报出来。
+            # **`needs_reference` 不算"说过不了"**：那一类的意思正是
+            # "包装得上，缺的是数据"，所以它可 import 是符合预期的，
+            # 报"登记过期"是误报。
             log_warn(f"工具 {tool} 登记为不可用，但环境里能 import —— 登记需要更新")
         out[tool] = {
             "available": bool(avail),
@@ -354,13 +414,17 @@ def probe_named_tools(log=None, only=None) -> dict:
 
 
 def named_tools_note() -> str:
-    """一句话说明本仓库为什么一个 §3.2/§3.3 点名工具都没用上。"""
-    return ("文档 §3.2 / §3.3 / §3.5 / §3.6 点名的工具本仓库**一个都没用上**："
+    """一句话说明文档点名的工具里哪些没用上、为什么。"""
+    return ("文档 §3.2–§3.6 点名的工具**大部分没有用上**："
             "要么是 R/Bioconductor 包（CI 无 rpy2），要么不在 PyPI，"
-            "要么依赖链（torch / scvi-tools / torch-geometric / 旧版 mkl）"
-            "在当前 CPU CI 上跑不动，要么 **PyPI 上那个名字是另一个不相干的包**。"
-            "逐条理由见 domain_status.json 的 named_tools 字段。"
-            "**这是缺口，不是「已覆盖」。**")
+            "要么依赖链（torch-sparse / torch-scatter / 旧版 mkl）"
+            "在当前 CPU CI 上跑不动，要么缺的是数据而不是包"
+            "（cell2location 需要带标签的 scRNA 参考），"
+            "要么 **PyPI 上那个名字是另一个不相干的包**。"
+            "**例外：SpaGCN 已经真的跑了**（`init=\"kmeans\"` 绕开了 louvain 的"
+            "py3.12 编译链）—— 它的状态在 `domain_status.json` 的 "
+            "`domain_methods` 里，不在缺口登记里。逐条理由见各步状态 JSON 的 "
+            "`named_tools` / `domain_methods` 字段。")
 
 
 

@@ -60,7 +60,8 @@ SpatialDE、输入的 h5ad 是哪个哈希、随机种子是多少、Moran's I �
 | `record_cross_language(cfg, src, dst, fmt, before, after, lost, ...)` | 跨语言转换 | |
 | `manifest_summary(cfg)` | 供验收用的摘要 | 见 §3.3 |
 | `probe_named_tools(log, only)` | 把 `NAMED_TOOLS` 整理成可写进状态 JSON 的表 | |
-| `named_tools_note()` | 一句话说明为什么多数点名工具没用上 | |
+| `pkg_version(name)` | 单个发行版的版本号；查不到返回 `None`（**不编造**） | 见 §5.1 |
+| `named_tools_note()` | 一句话说明点名工具的落地边界 | |
 
 ---
 
@@ -122,34 +123,59 @@ inputs_missing_required  只有 required=True 的缺失（供验收判 FAIL）
 
 ---
 
-## 5. `NAMED_TOOLS`：点名工具"为什么没用上"的登记
+## 5. 点名工具的落地登记：`NAMED_TOOLS` + `domain_methods`
 
 **这是本仓库最容易被误读的地方。** 域划分、解卷积、通讯、轨迹四步
-都有产出、都有图 —— 看起来"§3 做完了"，而文档点名的方法
-**一个都没用上**，跑的全是内置实现。
+都有产出、都有图 —— 看起来"§3 做完了"。真实情况是**两种都有**：
 
-所以把"为什么没用上"逐条落盘。**判据是"理由写了没有"，
-不是"工具跑了没有"。** 将来某个工具能装了，验收应该依然 PASS
-（理由变成"已装"），而不是因为 `available=False` 就变红 ——
-那会把"如实记录"惩罚成失败。
+| §  | 点名工具 | 本轮落地 |
+|---|---|---|
+| §3.2 | **SpaGCN** | **真的跑了**（`init="kmeans"`，见下） |
+| §3.2 | STAGATE | 装不上（PyPI 三个名字全 404） |
+| §3.2 | BayesSpace | R/Bioconductor 包，CI 无 rpy2 |
+| §3.3 | cell2location | **装得上，缺数据**（`needs_reference`） |
+| §3.3 | RCTD | R 包（`spacexr`） |
+| §3.4 | **SpatialDE** | **真的跑了**（带 scipy 垫片，见 AGENTS 规则 19） |
+| §3.4 | SPARK-X | R 包；PyPI 上的 `sparkx` 是另一个东西 |
+| §3.5 | CellChat | R 包 |
+| §3.6 | StPedf / SpaceFlow / ISORT / Stereopy-TGPI / stLearn | 不在 PyPI / 依赖链跑不动 / 名字被顶 |
 
-四类 `kind`：
+所以**登记的位置不唯一**，读的人要知道去哪找：
+
+| 位置 | 装的是 | 出现在 |
+|---|---|---|
+| `named_tools` | **用不了**的点名工具 + 理由 | 各步状态 JSON |
+| `domain_methods` | §3.2 每个方法**实际有没有产出结果**（`used`） | `domain_status.json` |
+| `cell2location` | §3.3 cell2location 的落地状态 | `deconvolution_status.json` |
+| `spatialde` | §3.4 SpatialDE 的落地状态 | `svg_status.json` |
+
+**验收的判据是"每个点名工具都在登记里、且要么 `used: True` 要么写了理由"**，
+不是"工具跑了没有" —— 那会把"如实记录"惩罚成失败。
+`main_analysis.py` 的 `named_tools:*` 检查会**把两个表合并起来看**：
+只认 `named_tools` 会把已经跑了的 SpaGCN 报成"缺登记"，正好把好事判成坏事。
+
+### 五种 `kind`，不能混为一谈
 
 | kind | 含义 | 本仓库的例子 |
 |---|---|---|
-| `r_package` | R/Bioconductor 包，CI 无 rpy2 | `BayesSpace`（§3.2）`RCTD`（§3.3）`CellChat`（§3.5） |
-| `not_on_pypi` | 真包不在 PyPI | `STAGATE`（§3.2）`StPedf`（§3.6） |
-| `deps` | PyPI 有真包，依赖链跑不动 | `SpaGCN` `cell2location` `SpaceFlow` `Stereopy-TGPI` `stLearn` `Bering` `BOMS` |
-| `name_taken` | **PyPI 上那个名字是另一个不相干的包** | `ISORT`（§3.6） |
+| `r_package` | R/Bioconductor 包，CI 无 rpy2 | `BayesSpace` `RCTD` `CellChat` `SPARK-X` |
+| `not_on_pypi` | 真包不在 PyPI | `STAGATE` `StPedf` |
+| `deps` | PyPI 有真包，依赖链跑不动 | `SpaceFlow` `Stereopy-TGPI` `stLearn` `Bering` `BOMS` |
+| `needs_reference` | **包装得上，缺的是数据** | `cell2location` |
+| `name_taken` | **PyPI 上那个名字是另一个不相干的包** | `ISORT` |
+
+`needs_reference` 是单独一类，因为**把"缺数据"写成"装不上"会让下一个人
+去折腾安装，方向完全错**。`probe_named_tools` 对这类工具**不报"登记过期"** ——
+它可 import 是符合预期的。
 
 ### `name_taken` 是最危险的一类
 
 因为 `pip install` 会**成功**，装进来的是完全无关的东西。实测元数据：
 
 ```
-pip install ISORT -> PyCQA/isort，Python 的 import 排序工具
-pip install sparkx -> 高能物理的碰撞相对论运动学
-pip install edgeR  -> "Redirect Microsoft Edge to your preferred browser"
+pip install ISORT   -> PyCQA/isort，Python 的 import 排序工具
+pip install sparkx  -> 高能物理的碰撞相对论运动学
+pip install edgeR   -> "Redirect Microsoft Edge to your preferred browser"
 pip install slingshot -> "Index Migration for ElasticSearch"
 ```
 
@@ -160,17 +186,49 @@ pip install slingshot -> "Index Migration for ElasticSearch"
 **判断依据是 summary / author / project_urls，不是"名字存不存在"。**
 反例：`SingleR` 在 PyPI 上就是真的 BiocPy/singler。
 
+### `SpaGCN` 为什么从这张表里搬走了（一条被推翻的登记）
+
+上一轮它登记为 `deps`，理由是：
+
+> PyPI 有真包（1.2.7），但依赖 `louvain` —— 该包最新版 0.8.2 没有
+> py3.12 wheel，只有 sdist，要从 2019 年的 C++/Cython 源码编译。
+
+**前半句是实测的，后半句的推论是错的。** 读 SpaGCN 1.2.7 的源码：
+
+- `SpaGCN/SpaGCN.py`、`models.py`、`util.py` 里**没有一处** `import louvain`；
+- 它走的是 `scanpy.tl.louvain`（`models.py:69`、`util.py:272`）；
+- `simple_GC_DEC.fit` 的 `init` 参数有 **`"kmeans"` 分支**
+  （`models.py:52-61`），完全不碰 louvain。
+
+所以 `pip install --no-deps SpaGCN==1.2.7` + `init="kmeans"` 绕开了整条
+编译链。**`install_requires` 里有某个包，不等于运行时会 import 它** ——
+判据要读源码，不能只读元数据。
+
+代价（写进产物的 `limitations`）：`init="louvain"` 让 SpaGCN 用表达+空间
+初始化簇心，`kmeans` 只用 GCN 特征。`n_clusters` 因此必须外部给定 ——
+传内置方法的域数，两边域数相同 ARI 才可比。
+
 ### 几条实测的依赖链细节
 
-- **`SpaGCN`** 1.2.7 是真包，但依赖 `louvain` —— **该包最新版 0.8.2
-  没有 py3.12 wheel，只有 sdist**，要从 2019 年的 C++/Cython 源码编译。
 - **`STAGATE`** / `STAGATE_pyG` / `stagate` 三个名字在 PyPI **全部 404**。
+  官方 GitHub 版（`RucDongLab/STAGATE_pyG`）的 `setup.py` 里
+  `install_requires = ["requests"]` —— **元数据完全没写真实依赖**：
+  `STAGATE_pyG/gat_conv.py:10` 是模块级
+  `from torch_sparse import SparseTensor, set_diag`。而 `torch-sparse`
+  0.6.18 在 PyPI 上**只有 sdist、0 个 wheel**（要按 torch 版本编译），
+  且同一文件还用 `from torch_geometric.typing import OptPairTensor, Adj,
+  Size, NoneType` —— 这些名字在 PyG>=2.4 已移除。**两条约束要同时满足。**
 - **`Stereopy`** 1.6.2 的 `requires_python` 是 `'<3.9,>=3.8'` ——
   **上限卡死**，与 CI 的 3.12 不兼容。
 - **`stLearn`** 1.4.1 依赖 `numpy>=2.4.0` / `scipy>=1.17.0` /
   `scanpy>=1.12.0` / `zarr>=3.1` / spatialdata 全家桶 + torch +
   torchvision + geopandas + dask（20+ 个），与本仓库钉的区间冲突。
-- **`BOMS`** 依赖 `mkl` + `mkl-service`（conda 时代的 Intel MKL 绑定）。
+- **`BOMS`** wheel 只到 cp310，且依赖 `mkl` + `mkl-service`
+  （conda 时代的 Intel MKL 绑定）。
+- **`cell2location`** 0.1.5 的依赖（scvi-tools + torch + pyro-ppl +
+  opencv-python）**都装得上**。卡住的是 `Cell2location(...)` 需要
+  `cell_state_df` —— 每个细胞类型的全转录组后验表达谱。默认配置是
+  marker 签名，没有这份参考，所以状态是 `needs_reference`。
 
 ---
 

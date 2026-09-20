@@ -52,6 +52,22 @@ domains:
   resolution: 0.8
   # 分辨率扫描（让"选 0.8"有依据）
   resolution_scan: [0.2, 0.4, 0.6, 0.8, 1.0, 1.5]
+  # ---- 文档 §3.2 点名方法的交叉验证 -----------------------------------------
+  # **这两个是交叉验证，不是主方法。** 主方法仍是上面的平滑 + Leiden。
+  # SpaGCN 会真的跑（n_clusters 自动取主方法的域数，保证可比）；
+  # STAGATE 的代码路径在位，但本环境装不上（见 common.NAMED_TOOLS）。
+  spagcn:
+    num_pcs: 30
+    lr: 0.005
+    # **200 而不是默认的 2000。** 稠密邻接矩阵下每个 epoch 是
+    # O(n² × num_pcs)，4025 个 spot 上 2000 epoch 要十几分钟；
+    # 早停（tol=1e-3）通常几百轮内就触发。调大前先看 CI 时间。
+    max_epochs: 200
+    tol: 0.001
+  stagate:
+    n_epochs: 500
+    rad_cutoff: 150
+    resolution: 0.5
 
 # ---- 空间高变基因（SVG）-----------------------------------------------------
 svg:
@@ -76,6 +92,22 @@ deconvolution:
   min_proportion: 0.01
   # 重建误差高于此值的 spot 标为不可靠
   max_reconstruction_error: 0.5
+
+  # ---- 文档 §3.3 点名的 cell2location ---------------------------------------
+  # **只有在 reference: h5ad（真的有带标签的 scRNA 参考）时才谈得上跑它。**
+  # 用 builtin 时它会记成 needs_reference —— 缺的是数据，不是包。
+  #
+  # **默认关。** CPU 上要跑两轮变分推断（参考模型 + 映射模型），
+  # 实测数量级是几十分钟；开了它会显著拉长这一轮。开了之后它与 NNLS
+  # 用**同一份参考**，所以两者的差异只来自似然（负二项 vs 最小二乘），
+  # 产物里会报逐类型的 Spearman 相关。
+  use_cell2location: false
+  # cell2location:
+  #   max_epochs_reference: 250
+  #   max_epochs_mapping: 3000
+  #   n_cells_per_location: 8.0
+  #   detection_alpha: 20.0
+  #   min_cells_per_type: 10
 
 # ---- 空间邻域 / niche -------------------------------------------------------
 niche:

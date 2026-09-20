@@ -150,25 +150,43 @@ python scripts/main_analysis.py --config assets/config.lymph_node.yml
 | 分析 | 限制 |
 |---|---|
 | 空间域 | spot 直径 55 μm 含 1-10 个细胞 —— **不能说"某个域是某一种细胞"**，只能说这个区域的细胞组成不同。域边界有 ±1 spot 不确定性 |
+| 空间域 | 交叉验证的 **SpaGCN 走的是 `init="kmeans"`**，不是默认的 `louvain`（后者依赖的 `louvain` 包没有 py3.12 wheel）。`n_clusters` 因此由外部给定（取内置方法的域数），**域数不是 SpaGCN 自己选的** |
 | 域标签 | `z_margin <= 0.5` 时标签不可信（实测 7/13 个域如此） |
 | SVG | Moran's I 依赖空间权重矩阵；置换次数限制了最小 p 值 |
 | 组成 | `builtin` 模式是 **marker 打分法，不是解卷积**（`is_deconvolution: false`）；**不给出细胞比例**，只有相对空间趋势 |
+| 组成 | **§3.3 的 cell2location 是 `needs_reference`** —— 包装得上，但缺带细胞类型标签的 scRNA 参考。配 `reference: h5ad` + `use_cell2location: true` 才会走它（CPU 上要几十分钟） |
 | 邻域 | 用 argmax 硬分配细胞类型，丢失 spot 内混合信息；z-score 没做多重检验校正 |
 | 通讯 | **共表达 ≠ 通讯**；不做"通讯与否"的判定 |
+
+## 具名工具的落地边界
+
+文档 §3 点名了一批工具（BayesSpace / STAGATE / SpaGCN / RCTD /
+cell2location / SpatialDE / SPARK-X / CellChat / StPedf / SpaceFlow /
+ISORT / Stereopy-TGPI / stLearn）。**本仓库不是"全都没做"，也不是
+"全都做了"**：
+
+- **真的跑了**：`SpaGCN`（§3.2）、`SpatialDE`（§3.4）
+- **装得上、缺数据**：`cell2location`（§3.3，`needs_reference`）
+- **装不上**：其余（R 包 / 不在 PyPI / 依赖链跑不动 / 名字被顶名）
+
+逐条状态与理由写在 `results/<dataset_id>/domain_status.json` 的
+`domain_methods`、`deconvolution_status.json` 的 `cell2location`、
+`svg_status.json` 的 `spatialde` 里。**`needs_reference` 和"装不上"
+是两件事** —— 混成一句"没做"，下一个人就会去折腾安装。
 
 ## 目录结构
 
 ```
-scripts/         00_fetch … 07_spatial_communication, main_analysis
-scripts/lib/     common.py（spatial_xy 等）
+scripts/         00_fetch … 08_spatial_trajectory, main_analysis
+scripts/lib/     common.py（spatial_xy、清单层、点名工具登记）
 assets/          datasets.yml, config.*.yml, reference_signatures.yml,
-                 ligand_receptor.yml
+                 ligand_receptor.yml, publication.mplstyle
 tools/           check_py_syntax.mjs, check_figures.mjs,
                  check_artifact_paths.mjs, verify_spatial_alignment.py
-references/      methods.md, troubleshooting.md
+references/      methods.md, module0.md, troubleshooting.md
 ```
 
 ## 工程规则
 
-见 `AGENTS.md`。14 条规则全部来自实测踩过的坑，
+见 `AGENTS.md`。20 条规则全部来自实测踩过的坑，
 每条都写了"为什么"和"错误长什么样"。

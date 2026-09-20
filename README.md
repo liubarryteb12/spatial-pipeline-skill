@@ -86,6 +86,10 @@ Visium 的数据是**两半**：表达矩阵 + `spatial.tar.gz`（坐标/缩放/
 流水线**两种都跑并量化差别**：不平滑 9 域（邻居同域率 0.536，
 随机基线 0.133）→ 平滑后 13 域（同域率 **0.672**）。
 
+此外还跑**文档 §3.2 点名的 SpaGCN** 做交叉验证（`init="kmeans"`，
+域数对齐到 13），并报它与内置划分的 ARI / NMI / 邻居同域率 ——
+**"跑通了"不是结论，两套划分是否在说同一件事才是。**
+
 ---
 
 ## 流程
@@ -94,15 +98,40 @@ Visium 的数据是**两半**：表达矩阵 + `spatial.tar.gz`（坐标/缩放/
 00_fetch      下载矩阵 + 空间信息 → obsm['spatial'], uns['spatial']
 01_qc         spot 质控（组织特异阈值）+ 组织连通性检查
 02_normalize  HVG + 标准化 + PCA + PC 的空间投影诊断
-03_domains    空间域（平滑 vs 不平滑对照）+ 域标签
-04_svg        Moran's I / Geary's C + 置换检验
-05_deconvo    spot 组成（marker 打分 / 真解卷积）
+03_domains    空间域（平滑 vs 不平滑对照）+ §3.2 SpaGCN 交叉验证 + 域标签
+04_svg        Moran's I / Geary's C + 置换检验 + §3.4 SpatialDE 交叉验证
+05_deconvo    spot 组成（marker 打分 / NNLS 解卷积 / §3.3 cell2location）
 06_niche      邻域富集（置换检验）+ 共现曲线
 07_comm       空间约束的配体-受体分析
 08_spatial_traj 空间拟时序（空间感知 vs 朴素的定量对比）
 ```
 
 每一步都是独立的可执行脚本，可以单独重跑。
+
+---
+
+## 点名工具的落地边界（重要）
+
+文档 §3 点名了一批具名工具。**本仓库不是"全都没做"，也不是"全都做了"** ——
+逐条状态写在 `results/<dataset_id>/domain_status.json` 的 `domain_methods`、
+`deconvolution_status.json` 的 `cell2location`、`svg_status.json` 的
+`spatialde` 里。摘要：
+
+| §  | 工具 | 状态 |
+|---|---|---|
+| §3.2 | **SpaGCN** | **跑了**（`init="kmeans"` 绕开 louvain 的 py3.12 编译链） |
+| §3.2 | STAGATE | 装不上：PyPI 三个名字全 404，官方版模块级依赖 torch-sparse（无 wheel） |
+| §3.2 | BayesSpace | R/Bioconductor 包，CI 不装 R |
+| §3.3 | **cell2location** | **装得上，缺数据**（`needs_reference`）：需要带标签的 scRNA 参考 |
+| §3.3 | RCTD | R 包（`spacexr`） |
+| §3.4 | **SpatialDE** | **跑了**（带 scipy `misc.derivative` 垫片） |
+| §3.4 | SPARK-X | R 包；PyPI 上的 `sparkx` 是高能物理的另一个包 |
+| §3.5 | CellChat | R 包 |
+| §3.6 | StPedf / SpaceFlow / ISORT / Stereopy-TGPI / stLearn | 不在 PyPI / 依赖链跑不动 / 名字被顶 |
+
+**`needs_reference` 和"装不上"是两件事。** 把"缺数据"写成"装不上"，
+下一个人就会去折腾安装 —— 方向完全错。理由与判据见
+`references/module0.md` §5。
 
 ---
 

@@ -244,31 +244,79 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         except Exception as e:  # noqa: BLE001
             chk("svg:spatialde", "honesty", False, f"读取失败: {e}")
 
-    # ---- honesty: §3.2/§3.3/§3.5/§3.6 点名的工具一个都没跑 --------------------
+    # ---- honesty: §3.2 点名的 SpaGCN 是否真跑了、跑了是否可比 ----------------
+    #
+    # **和 SpatialDE 那条同构。** SpaGCN 这一轮才真正跑起来（`init="kmeans"`
+    # 绕开了 louvain 的 py3.12 编译链），所以它的失败模式是新的：
+    # torch 装不上、SpaGCN 装不上、kmeans 收敛不了 —— 任何一种都会让它退回
+    # "内置实现 + 一句没做"。**那种情况必须红字显示**，否则一个漂亮的域划分
+    # 会被当成"§3.2 的三个方法都跑了"。
+    #
+    # 跑了的情况：产物必须齐（CSV 有行 + 与主方法的一致性被量化），
+    # 因为**孤立的一个划分说明不了任何事**。
+    dp = res_dir / "domain_status.json"
+    if dp.exists():
+        try:
+            dd = json.loads(dp.read_text(encoding="utf-8"))
+            spg = (dd.get("domain_methods") or {}).get("SpaGCN") or {}
+            st = spg.get("status")
+            if st == "ok":
+                csv_p = res_dir / "spagcn_domains.csv"
+                n_row = (sum(1 for _ in open(csv_p, encoding="utf-8")) - 1
+                         if csv_p.exists() else 0)
+                ag = (dd.get("method_agreement") or {}).get("SpaGCN_vs_builtin") or {}
+                chk("domain:spagcn", "honesty", n_row > 0 and bool(ag),
+                    (f"SpaGCN（§3.2）status=ok：{spg.get('n_domains')} 域"
+                     f"（kmeans init，n_clusters={spg.get('n_clusters')}，"
+                     f"l={spg.get('length_scale_l')}），"
+                     f"与主方法 ARI={ag.get('adjusted_rand_index')}、"
+                     f"邻居同域率 {ag.get('neighbor_same_frac_a')} vs "
+                     f"{ag.get('neighbor_same_frac_b')}，"
+                     f"spagcn_domains.csv {n_row} 行"
+                     if n_row > 0 and ag else
+                     f"SpaGCN 报 status=ok 但产物不全："
+                     f"spagcn_domains.csv {n_row} 行，method_agreement {bool(ag)}"))
+            else:
+                chk("domain:spagcn", "honesty", False,
+                    f"SpaGCN（§3.2）**未跑成** status={st}：{spg.get('reason')} "
+                    f"—— 上面的域划分是内置实现，不是 SpaGCN")
+        except Exception as e:  # noqa: BLE001
+            chk("domain:spagcn", "honesty", False, f"读取失败: {e}")
+
+    # ---- honesty: §3.2/§3.3/§3.5/§3.6 点名的工具逐条登记 ----------------------
     #
     # **这是本仓库最容易被误读的地方。** 域划分、解卷积、通讯、轨迹四步都
-    # 有产出、都有图，看起来"§3 做完了" —— 但文档点名的 BayesSpace /
-    # STAGATE / SpaGCN / RCTD / cell2location / CellChat / StPedf / SpaceFlow /
-    # ISORT / Stereopy-TGPI / stLearn **一个都没用上**，跑的全是内置实现。
+    # 有产出、都有图，看起来"§3 做完了" —— 但文档点名的工具里，
+    # **只有 SpaGCN 和 SpatialDE 真的跑了**，其余（BayesSpace / STAGATE /
+    # RCTD / cell2location / CellChat / StPedf / SpaceFlow / ISORT /
+    # Stereopy-TGPI / stLearn）都跑不了或没参考。
     #
-    # 所以这四条检查的判据是"**那份缺口登记存在且每条都写了理由**"，
-    # 不是"工具有没有跑"。工具将来能装了，这四条应该**依然 PASS**
-    # （理由变成"已装"），而不是因为"登记表里 available=False"就变红 ——
+    # 所以这几条检查的判据是"**每个点名工具都在登记里、且要么 `used: True`
+    # 要么写了理由**"，不是"工具有没有跑"。工具将来能装了，这几条应该
+    # **依然 PASS**（理由变成"已跑"），而不是因为"available=False"就变红 ——
     # 那会把"如实记录"惩罚成失败。
+    #
+    # **登记位置不唯一。** §3.2 的 SpaGCN 跑起来之后从 `named_tools` 挪到了
+    # `domain_methods`（它不再是"用不了的工具"）。所以这里把两个表合并起来
+    # 看 —— 只认 `named_tools` 会把"已经跑了的工具"报成"缺登记"，
+    # 正好把好事判成坏事。
     tool_registry_files = {
-        "domain_status.json": ("§3.2 空间域", ("BayesSpace", "STAGATE", "SpaGCN")),
-        "deconvolution_status.json": ("§3.3 解卷积", ("RCTD", "cell2location")),
-        "communication_status.json": ("§3.5 空间通讯", ("CellChat",)),
+        "domain_status.json": ("§3.2 空间域", ("BayesSpace", "STAGATE", "SpaGCN"),
+                               ("domain_methods",)),
+        "deconvolution_status.json": ("§3.3 解卷积", ("RCTD", "cell2location"),
+                                      ("cell2location",)),
+        "communication_status.json": ("§3.5 空间通讯", ("CellChat",), ()),
         "spatial_trajectory_status.json": ("§3.6 空间轨迹",
                                            ("StPedf", "SpaceFlow", "ISORT",
-                                            "Stereopy-TGPI", "stLearn")),
+                                            "Stereopy-TGPI", "stLearn"), ()),
     }
-    for f, (section, expect) in tool_registry_files.items():
+    for f, (section, expect, extra_keys) in tool_registry_files.items():
         p = res_dir / f
         if not p.exists():
             continue
         try:
-            nt = json.loads(p.read_text(encoding="utf-8")).get("named_tools")
+            d = json.loads(p.read_text(encoding="utf-8"))
+            nt = d.get("named_tools")
         except Exception as e:  # noqa: BLE001
             chk(f"named_tools:{f}", "honesty", False, f"读取失败: {e}")
             continue
@@ -277,14 +325,45 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
                 f"{section}：{f} 里没有 named_tools 登记 —— "
                 "读者会以为文档点名的方法已经用上了")
             continue
-        missing = [t for t in expect if t not in nt]
-        no_reason = [t for t, i in nt.items() if not (i or {}).get("reason")]
+        registry = dict(nt)
+        for k in extra_keys:
+            if isinstance(d.get(k), dict):
+                registry.update(d[k])
+        missing = [t for t in expect if t not in registry]
+        # 未使用必须有 reason；使用了必须有 used=True —— 两者都没有 = 没说清
+        unexplained = [t for t, i in registry.items()
+                       if not (i or {}).get("reason") and not (i or {}).get("used")]
+        n_used = sum(1 for i in registry.values() if (i or {}).get("used"))
         chk(f"named_tools:{f}", "honesty",
-            not missing and not no_reason,
-            (f"{section}：{len(nt)} 个点名工具已登记，"
-             f"{sum(1 for i in nt.values() if i.get('available'))} 个当前可用"
-             if not missing and not no_reason else
-             f"缺登记 {missing}；无理由 {no_reason}"))
+            not missing and not unexplained,
+            (f"{section}：{len(registry)} 个点名工具已登记，"
+             f"其中 {n_used} 个实际产出了结果"
+             if not missing and not unexplained else
+             f"缺登记 {missing}；既没说 used 也没写理由 {unexplained}"))
+
+    # ---- honesty: §3.2 跑了点名工具就必须量化它与主方法的一致性 --------------
+    #
+    # **"跑通了"不是结论。** 一个点名工具跑出 13 个域，如果不说它和主方法
+    # 的 ARI，读者只能看到一个孤立的划分 —— 而"两套划分是不是在说同一件事"
+    # 才是这次交叉验证的全部意义。这条检查把"跑了但没比"变成红的。
+    p = res_dir / "domain_status.json"
+    if p.exists():
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            dm = d.get("domain_methods") or {}
+            ag = d.get("method_agreement") or {}
+            named_ran = [t for t, i in dm.items()
+                         if (i or {}).get("used") and t != "builtin_smooth_leiden"]
+            uncompared = [t for t in named_ran if f"{t}_vs_builtin" not in ag]
+            chk("honesty:domain_method_agreement", "honesty",
+                not uncompared,
+                (f"§3.2 实际产出结果的点名方法 {named_ran}；"
+                 f"与主方法的一致性对照 {sorted(ag)}"
+                 if not uncompared else
+                 f"{uncompared} 跑了但**没有量化与主方法的一致性** —— "
+                 f"孤立的一个划分说明不了任何事"))
+        except Exception as e:  # noqa: BLE001
+            chk("honesty:domain_method_agreement", "honesty", False, f"读取失败: {e}")
 
     # ---- honesty: 每步必须说明自己没做什么 ----
     # 这是防止"静默跳过"的检查。
@@ -342,6 +421,46 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
                 f"is_deconvolution={d.get('is_deconvolution')}；{str(d.get('method'))[:90]}"
                 if ok else "**没有标明是真解卷积还是打分法**",
                 severity="honesty")
+
+    # ---- honesty: §3.3 点名的 cell2location 落地状态必须自洽 ------------------
+    #
+    # **`needs_reference` 和"装不上"是两件事。** cell2location 的 PyPI 包
+    # 装得上，缺的是带细胞类型标签的 scRNA 参考。把这两件事混成一句
+    # "没做"，下一个人就会去折腾安装 —— 方向完全错。
+    #
+    # 判据：
+    #   - status=ok        -> 必须有比例 CSV 且与 NNLS 的一致性被量化
+    #   - needs_reference  -> 必须说清"缺的是什么参考"
+    #   - 其它             -> 必须有 reason
+    p = res_dir / "deconvolution_status.json"
+    if p.exists():
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            c2l = d.get("cell2location") or {}
+            st = c2l.get("status")
+            if st == "ok":
+                csv_p = res_dir / "deconvolution_proportions_cell2location.csv"
+                n_row = (sum(1 for _ in open(csv_p, encoding="utf-8")) - 1
+                         if csv_p.exists() else 0)
+                cmp_ = c2l.get("vs_nnls") or {}
+                chk("deconv:cell2location", "honesty",
+                    n_row > 0 and (cmp_.get("mean_spearman") is not None
+                                   or cmp_.get("compared") is False),
+                    (f"cell2location（§3.3）status=ok：v{c2l.get('version')}，"
+                     f"{c2l.get('n_types')} 种类型，{n_row} 行，"
+                     f"与 NNLS 平均 Spearman {cmp_.get('mean_spearman')}"
+                     if n_row > 0 else
+                     f"cell2location 报 status=ok 但没有比例 CSV（{n_row} 行）"))
+            elif st == "needs_reference":
+                chk("deconv:cell2location", "honesty", bool(c2l.get("reason")),
+                    f"cell2location（§3.3）status=needs_reference："
+                    f"{str(c2l.get('reason'))[:150]}")
+            else:
+                chk("deconv:cell2location", "honesty", bool(c2l.get("reason")),
+                    f"cell2location（§3.3）status={st}："
+                    f"{str(c2l.get('reason'))[:150]}")
+        except Exception as e:  # noqa: BLE001
+            chk("deconv:cell2location", "honesty", False, f"读取失败: {e}")
 
     # ---- 空间对齐检查（如果有）----
     p = data_dir / "spatial_alignment_check.json"

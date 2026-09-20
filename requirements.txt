@@ -49,6 +49,33 @@ statsmodels>=0.14
 # 垫片只影响标准误列，不影响这里要用的 FSV / qval。
 SpatialDE>=1.1,<2
 
+# ---- 空间域交叉验证（文档 §3.2）---------------------------------------------
+# SpaGCN 把每个 spot 的表达 + 空间邻接一起送进图卷积，再做自编码聚类。
+# 它与本仓库的「平滑 + Leiden」是**两条独立的路**，所以能当交叉验证。
+#
+# **torch 走 CPU 专用索引。** 默认 PyPI 上的 torch 是 CUDA 构建
+# （2.5 GB+），而 GitHub 托管的 runner 没有 GPU —— 装它纯属浪费磁盘和时间。
+# 所以 workflow 里先单独执行：
+#     python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+# 这一行在这里只作**声明**（版本区间），pip 看到已满足就不会重装。
+torch>=2.2,<3
+
+# **SpaGCN 用 `--no-deps` 装，不能写在这里。**
+# 它的 install_requires 里有 `louvain`，而 louvain 0.8.2 只有到 cp311 的
+# wheel（py3.12 上要从 2019 年的 Cython/C++ 源码编译）。但读源码就知道
+# **SpaGCN 从不 import louvain** —— 它走 scanpy.tl.louvain，而
+# `init="kmeans"` 分支根本不碰它（models.py:52-61）。
+# 所以 workflow 里：pip install --no-deps SpaGCN==1.2.7
+# 见 scripts/03_spatial_domains.py 的 try_spagcn()。
+#
+# **`--no-deps` 的代价：SpaGCN 真实用到的依赖要在这里自己补全。**
+# 逐个核对过它的模块级 import：numba（calculate_adj.py 的 pairwise_distance）、
+# statsmodels（calculate_moran_I.py）、scikit-learn、matplotlib、pandas、
+# torch —— 除了 numba，其余上面都已经有了。numba 平时是 umap-learn/
+# pynndescent 的传递依赖，**写出来是因为不能靠传递依赖活着**：
+# 上游哪天把 pynndescent 换掉，SpaGCN 就会在 import 时炸。
+numba>=0.58
+
 # ---- 图像（读 H&E、算 spot 半径）--------------------------------------------
 scikit-image>=0.22
 pillow>=10.0
@@ -60,9 +87,16 @@ requests>=2.31
 
 # ---- 说明 -------------------------------------------------------------------
 # **不在依赖里的：**
-#   - RCTD（R 包）—— 真正的解卷积需要它或 cell2location。
-#     本流水线用 marker 打分法并在产物里写明「不是解卷积」。
-#   - cell2location —— 需要 GPU；GitHub 托管 runner 无 GPU。
+#   - RCTD（R 包）—— `spacexr` 是 R/Bioconductor 包，本仓库 CI 不装 R。
+#     要用真正的解卷积需配 `reference: h5ad` + 一份 scRNA-seq 参考，
+#     那时走 NNLS（05_deconvolution.py）。
+#   - cell2location —— **装得上，缺的是数据**。它的 `cell_state_df` 必须
+#     来自带细胞类型标签的 scRNA-seq 参考，而默认配置是 marker 签名
+#     （`reference: builtin`）。配上 `reference: h5ad` + `celltype_key` +
+#     `use_cell2location: true` 就会走它（05_deconvolution.py 的
+#     try_cell2location）。默认不开是因为 CPU 上两轮变分推断要几十分钟。
 #   - CellChat / CellPhoneDB —— 细胞通讯的统计框架。
 #     本流水线只算空间约束下的共表达强度，不判定「通讯与否」。
+#   - STAGATE —— PyPI 上三个名字全 404；官方 GitHub 版模块级依赖
+#     torch-sparse（PyPI 上只有 sdist、0 个 wheel）。见 common.NAMED_TOOLS。
 #   - harmonypy —— 空间流水线不做多样本整合（一个切片一个样本）。
