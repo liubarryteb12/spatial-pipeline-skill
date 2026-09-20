@@ -643,8 +643,10 @@ def run_05_deconvolution(cfg: dict) -> dict:
         ax.set_title(f"{ct}\nmean={mean_prop[ct]:.3f}", fontsize=8)
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
-        fig.colorbar(s, ax=ax, shrink=0.75, pad=0.02, fraction=0.046,
-                     label=f"{ct} (shared scale)")
+        # **colorbar 不加长 label**：12 个面板各挂一条竖排文字会互相重叠
+        # （实测第一版把 "Fibroblastic_reticular_cell (shared scale)" 挤进
+        # 相邻面板）。共享量程这件事由 suptitle 统一说明，刻度数字足够。
+        fig.colorbar(s, ax=ax, shrink=0.75, pad=0.02, fraction=0.046)
     for ax in axes[len(show):]:
         ax.axis("off")
     fig.suptitle("Deconvolved composition — spatial trends only, "

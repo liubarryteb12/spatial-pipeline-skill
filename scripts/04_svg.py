@@ -501,9 +501,16 @@ def run_04_svg(cfg: dict) -> dict:
     ax.hist(res[stat_name], bins=60, color=PAL["primary"], alpha=0.85)
     ax.axvline(expected, color=PAL["highlight"], ls="--", lw=1.2,
                label=f"expected under no autocorrelation = {expected:.4f}")
-    # **显著性阈值也要画出来**（评审 3.8：只画了期望值，读者看不出
-    # "哪些基因算显著"）。用本轮的 BH 判据倒数：画出分配到 0.05 的
-    # 统计量临界值，作为视觉参考线。
+    # **显著性用标题报数 + 一条真实可算的参考线。** 临界值不能画成"BH 阈值
+    # 竖线"—— BH 临界值是逐基因 p 的函数、不是统计量的固定值。能画的是
+    # **显著基因集合的边界值**：Moran's I 越大越有结构，取 min；Geary's C
+    # 反之越小越有结构，取 max。两者都是 res 里直接取出的实测值。
+    sig = res[res["p_adj_bh"] < 0.05]
+    if len(sig):
+        edge = (float(sig[stat_name].min()) if method == "moran"
+                else float(sig[stat_name].max()))
+        ax.axvline(edge, color=PAL["up"], ls=":", lw=1.2,
+                   label=f"{stat_label} at the significant-set edge = {edge:.3f}")
     ax.set_xlabel(stat_label)
     ax.set_ylabel("number of genes")
     ax.set_title(f"{stat_label} distribution across {len(res)} genes\n"
