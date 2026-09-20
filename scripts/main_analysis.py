@@ -28,8 +28,9 @@ sys.path.insert(0, str(REPO / "scripts"))
 from common import (NAMED_TOOLS, capture_versions, ensure_dirs,  # noqa: E402
                     init_manifest, load_config, log_info, log_warn,
                     manifest_path, manifest_summary, probe_named_tools,
-                    read_json, record_decision, record_human_review,
-                    record_input, record_params, write_json)
+                    read_json, read_manifest, record_decision,
+                    record_human_review, record_input, record_params,
+                    write_json)
 
 STEPS = [
     ("fetch", "00_fetch", "run_00_fetch"),
@@ -727,8 +728,14 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         #
         # **读全量清单而不是 `msum`** —— `manifest_summary()` 只给
         # `n_decisions` 这个计数，看不到节点名（和 scrna 那边同一个写法）。
+        #
+        # 用 `read_manifest(cfg)` 而不是 `read_json(res_dir /
+        # "run_manifest.json")`：两者等价，但**文件名只该有一处**。
+        # `MANIFEST_NAME` 改了而这里写死字符串的话，这条检查会静默地
+        # 读一个不存在的文件、`_dec_nodes` 变空 —— 然后报"没解释"，
+        # 而真实原因是路径写错了。
         _cl = msum.get("n_cross_language", 0)
-        _full = read_json(res_dir / "run_manifest.json")
+        _full = read_manifest(cfg)
         _dec_nodes = {d.get("node") for d in (_full.get("decisions") or [])}
         chk("manifest:cross_language", "honesty",
             _cl > 0 or "cross_language" in _dec_nodes,
