@@ -347,7 +347,8 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
                      if isinstance(i, dict) and i.get("used"))
         chk(f"named_tools:{f}", "honesty",
             not missing and not unexplained,
-            (f"{section}：{len(registry)} 个点名工具已登记，"
+            (f"{section}：{len(registry)} 个登记项"
+             f"（点名 + 各步自己的方法表），"
              f"其中 {n_used} 个实际产出了结果"
              if not missing and not unexplained else
              f"缺登记 {missing}；既没说 used 也没写理由 {unexplained}"))
@@ -363,13 +364,18 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
     # domain_methods / cell2location / spatialde **合并**过，
     # 早写会漏掉"实际跑了"的工具。
     try:
-        _tools, _used = {}, []
+        _tools, _used, _named = {}, [], set()
         for f, (_sec, _exp, extra_keys) in tool_registry_files.items():
             _p = res_dir / f
             if not _p.exists():
                 continue
             _d = json.loads(_p.read_text(encoding="utf-8"))
             _reg = dict(_d.get("named_tools") or {})
+            # **`named_tools` 里的才是"文档点名的工具"。** 各步自己的表
+            # （`domain_methods` / `cell2location`）还包含**内置基线**
+            # （`builtin_smooth_leiden`）—— 它当然产出了结果，但它不是
+            # 文档点名的东西。混在一起数会把"点名 13 个"报成"14 个"。
+            _named.update(_reg)
             for _k, _as_tool in extra_keys:
                 _v = _d.get(_k)
                 if not isinstance(_v, dict) or not _v:
@@ -389,18 +395,26 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
                 if _i.get("used"):
                     _used.append(f"{_t}（{_sec}）")
         _n = len(_tools)
+        _n_named = len(_named)
+        _n_extra = _n - _n_named
         record_decision(
             cfg, "named_tools",
             "文档 §3.2–§3.6 点名的空间方法，哪些真的产出了结果？",
-            (f"登记 {_n} 个；实际产出结果的是 {sorted(_used) or '无'}"
+            (f"点名工具登记 {_n_named} 个"
+             + (f"（另有内置基线等 {_n_extra} 个）" if _n_extra else "")
+             + f"；实际产出结果的是 {sorted(_used) or '无'}"
              if _used else
-             f"登记 {_n} 个，**本轮没有一个点名工具产出结果** —— "
-             "全部回退到内置实现"),
+             f"点名工具登记 {_n_named} 个，"
+             "**本轮没有一个点名工具产出结果** —— 全部回退到内置实现"),
             evidence=("逐条理由写在各步状态 JSON 的 named_tools / "
-                      "domain_methods / cell2location / spatialde 里；"
+                      "domain_methods / cell2location 里；"
                       "SpaGCN 是 §3.2 唯一能真跑的点名工具（init=\"kmeans\"），"
-                      "cell2location 属 needs_reference（缺参考，不是装不上）"))
-        log_info(f"决策链已登记：点名工具 {_n} 个，"
+                      "cell2location 属 needs_reference（缺参考，不是装不上）。"
+                      "**`builtin_smooth_leiden` 不是点名工具** —— 它是本仓库的"
+                      "基线，出现在产出结果名单里是因为它确实产出了结果，"
+                      "不是因为文档点了它"))
+        log_info(f"决策链已登记：点名工具 {_n_named} 个"
+                 f"（另有内置基线等 {_n_extra} 个），"
                  f"实际产出结果的 {len(_used)} 个")
     except Exception as e:  # noqa: BLE001
         # 决策链写不进去不该让验收崩 —— 但必须可见
