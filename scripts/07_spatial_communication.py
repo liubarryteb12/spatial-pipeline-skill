@@ -204,8 +204,24 @@ def run_07_spatial_communication(cfg: dict) -> dict:
         log_info(f"按域的 LR 强度表: {len(dom_df)} 行")
 
     # ---- 5. 出图 ------------------------------------------------------------
+    # **高度公式必须单位一致。** 原写法 max(mm(56), 0.32*len(top)+1.6) 把
+    # 英寸当毫米用：mm(56)=2.2in，而 0.32*20+1.6=8.0"=203mm —— 评审量到
+    # 203.2mm 高、宽高比 0.67 的根因。现在统一为英寸并夹在 [2.2, 5.4]"。
     top = lr_df.head(20).iloc[::-1]
-    fig, ax = plt.subplots(figsize=(W_ONE_HALF, max(mm(56), 0.32 * len(top) + 1.6)))
+    fig_h = min(max(2.2, 0.18 * len(top) + 1.2), 5.4)
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, fig_h))
+    # **条形颜色有含义就必须有图例。** 红灰蓝三色此前没有任何说明，
+    # 蓝色 z=-2 虚线更是画在"通常没有数据"的左侧空白处，读者无从知道它是什么。
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+    handles = [
+        Patch(facecolor="#B2182B", label="z > +2 (enriched near)"),
+        Patch(facecolor="#999999", label="-2 <= z <= +2"),
+        Patch(facecolor="#2166AC", label="z < -2 (depleted near)"),
+        Line2D([0], [0], color="#B2182B", ls="--", lw=0.8, label="z = +2"),
+        Line2D([0], [0], color="#2166AC", ls="--", lw=0.8, label="z = -2"),
+    ]
+    ax.legend(handles=handles, fontsize=6, loc="lower right", frameon=True)
     colors = ["#B2182B" if z > 2 else ("#2166AC" if z < -2 else "#999999")
               for z in top["z_score"]]
     ax.barh(range(len(top)), top["z_score"], color=colors)
@@ -217,8 +233,7 @@ def run_07_spatial_communication(cfg: dict) -> dict:
     ax.axvline(-2, color="#2166AC", ls="--", lw=0.8)
     ax.set_xlabel("spatial enrichment z-score (near vs random)")
     ax.set_title(f"Ligand–receptor spatial enrichment\n"
-                 f"{len(usable)}/{len(pairs)} pairs usable; "
-                 f"|z|>2 dashed")
+                 f"{len(usable)}/{len(pairs)} pairs usable")
     save_fig(cfg, "03-07-01-unit1-communication-lr-enrichment", fig)
 
     # 空间表达图：top 3 对

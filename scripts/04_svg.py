@@ -39,6 +39,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
+import matplotlib as mpl  # noqa: E402
+from matplotlib.cm import ScalarMappable  # noqa: E402
+from matplotlib.colors import Normalize  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import scanpy as sc  # noqa: E402
@@ -460,9 +463,20 @@ def run_04_svg(cfg: dict) -> dict:
                ["scalefactors"]["tissue_hires_scalef"])
     xy = spatial_xy(adata, sf)
     gi = {g: i for i, g in enumerate(genes)}
+    # **30 个定量面板必须共享一个色标。** 原版逐基因 scatter 默认各自
+    # min-max 归一化（且无任何 colorbar）：每个面板自己的"最暗"都是 0、
+    # 自己的"最亮"都是该基因最大值 —— 面板之间完全不可比，绝对值也读不出。
+    # 对策：vmin=0 固定（log1p 后 0 = 不表达），vmax 取 top 基因表达值的
+    # 全局 p99（绘图分位数，不是统计阈值；单基因离群值不至于把整体压暗）。
+    sub = X[:, [gi[g] for g in top_genes]]
+    sub_arr = np.asarray(sub.todense()) if hasattr(sub, "todense") else np.asarray(sub)
+    vmax = float(np.quantile(sub_arr, 0.99))
+    vmin = 0.0
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    cmap = mpl.colormaps["viridis"]
     for ax, g in zip(axes, top_genes):
         v = X[:, gi[g]]
-        sc_ = ax.scatter(xy[:, 0], xy[:, 1], c=v, s=3, cmap="viridis")
+        ax.scatter(xy[:, 0], xy[:, 1], c=v, s=3, cmap=cmap, norm=norm)
         row = res[res["gene"] == g].iloc[0]
         ax.set_title(f"{g}\nI={row[stat_name]:.3f}", fontsize=7)
         ax.set_aspect("equal"); ax.invert_yaxis()
@@ -470,7 +484,13 @@ def run_04_svg(cfg: dict) -> dict:
     for ax in axes[len(top_genes):]:
         ax.axis("off")
     fig.suptitle(f"Top {len(top_genes)} spatially variable genes "
-                 f"({stat_name}, BH p<0.05: {n_sig})")
+                 f"({stat_name}, BH p<0.05: {n_sig})\n"
+                 f"shared colour scale 0 -> p99 = {vmax:.2f} (log1p)")
+    # 共享 colorbar：constrained layout 会为它让出一列，不再逐面板画
+    fig.colorbar(ScalarMappable(norm=norm, cmap=cmap),
+                 ax=list(axes[:len(top_genes)]),
+                 label="expression (log1p, shared scale)",
+                 fraction=0.025, pad=0.01, shrink=0.6)
     save_fig(cfg, "03-04-01-unit1-svg-top-genes", fig)
 
     # 统计量分布

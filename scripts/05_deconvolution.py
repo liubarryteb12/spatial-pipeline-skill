@@ -655,10 +655,23 @@ def run_05_deconvolution(cfg: dict) -> dict:
             ax.bar(range(len(by_dom)), by_dom[ct].values, bottom=bottom,
                    label=ct, color=cmap(i % 20))
             bottom += by_dom[ct].values
+        # **x 轴按数值感知排序，不按字符串。** 域标签是 "0".."12" 这类数字串时，
+        # sorted() 给 0,1,10,11,12,2,...—— 刻度顺序与读图直觉相反。
+        # 能转 int 的按 int 排；混入非数字标签时回退字典序（顺序稳定即可）。
+        dom_order = sorted(by_dom.index,
+                           key=lambda d: (0, int(d)) if str(d).isdigit() else (1, str(d)))
+        by_dom = by_dom.loc[dom_order]
         ax.set_xticks(range(len(by_dom)))
         ax.set_xticklabels(by_dom.index, fontsize=8)
-        ax.set_xlabel("spatial domain"); ax.set_ylabel("mean relative weight")
-        ax.set_title("Composition per spatial domain")
+        ax.set_xlabel("spatial domain")
+        # **ylabel 必须说清这不是细胞比例。** 本仓库无参考时走 marker 打分法
+        # （domain_status.json 里 is_deconvolution: false），数值只是"该域内
+        # marker 打分的相对构成"。姊妹图 deconvolution_spatial 有免责句，
+        # 这张原先一句都没有 —— 评审认定它才是真正会误导读者的那张。
+        ax.set_ylabel("mean marker score per domain (relative;\n"
+                      "NOT deconvolved cell fractions)")
+        ax.set_title("Marker-score composition per spatial domain\n"
+                     "(no reference available: scores, not real deconvolution)")
         ax.legend(fontsize=6, ncol=2, loc="center left", bbox_to_anchor=(1.0, 0.5))
         save_fig(cfg, "03-05-02-unit1-deconvolution-by-domain", fig)
         by_dom.to_csv(res_dir / "deconvolution_by_domain.csv")

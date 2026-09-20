@@ -248,18 +248,24 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
     out.to_csv(res_dir / "spatial_pseudotime.csv", index=False)
 
     # ---- 8. 出图 -----------------------------------------------------------
+    # **colorbar 会挤压面板标题**：constrained layout 给每个 colorbar 分出的
+    # 空间把 183 mm 宽的三个面板压得很窄，长标题被劈开/截断（实测 panel 2 的
+    # "(alpha=0.5)" 断成两行、panel 3 只剩 "[difference] between the"）。
+    # 对策：标题压成短行（统计量进第二行），colorbar 显式收窄（fraction/pad）。
     fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(60)))
     s0 = axes[0].scatter(xy[:, 0], xy[:, 1], c=expr_pt, s=7, cmap="viridis")
-    axes[0].set_title(f"Expression-only pseudotime\nMoran's I = {I_expr:.3f}")
-    fig.colorbar(s0, ax=axes[0], label="pseudotime")
+    axes[0].set_title(f"Expression only\nMoran's I = {I_expr:.3f}")
+    fig.colorbar(s0, ax=axes[0], label="pseudotime",
+                 fraction=0.046, pad=0.02, shrink=0.8)
     s1 = axes[1].scatter(xy[:, 0], xy[:, 1], c=spatial_pt, s=7, cmap="viridis")
-    axes[1].set_title(f"Spatially-smoothed pseudotime\nMoran's I = {I_spatial:.3f}"
-                      f" (alpha={alpha})")
-    fig.colorbar(s1, ax=axes[1], label="pseudotime")
+    axes[1].set_title(f"Spatially smoothed (alpha={alpha})\nMoran's I = {I_spatial:.3f}")
+    fig.colorbar(s1, ax=axes[1], label="pseudotime",
+                 fraction=0.046, pad=0.02, shrink=0.8)
     s2 = axes[2].scatter(xy[:, 0], xy[:, 1],
                          c=np.abs(expr_pt - spatial_pt), s=7, cmap="magma")
-    axes[2].set_title("|difference| between the two")
-    fig.colorbar(s2, ax=axes[2], label="|delta pseudotime|")
+    axes[2].set_title("|difference| of the two")
+    fig.colorbar(s2, ax=axes[2], label="|delta pseudotime|",
+                 fraction=0.046, pad=0.02, shrink=0.8)
     for ax in axes:
         ax.set_xlabel("x (fullres px)"); ax.set_ylabel("y (fullres px)")
         ax.set_aspect("equal")
