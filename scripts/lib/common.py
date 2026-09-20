@@ -87,7 +87,14 @@ def load_config(path: str) -> dict:
 
     ana = cfg.setdefault("analysis", {})
     ana.setdefault("seed", 20260919)
-    ana.setdefault("figure_dpi", 150)
+    # **300 dpi 是投稿图的底线。** 原来默认 150：183 mm 宽的图只有 1080 px，
+    # 放大或印刷后字形和细线都发虚 —— 而"发虚"从图注上完全看不出来，
+    # 文件大小也正常。
+    # **注意这只是兜底**：`assets/config.lymph_node.yml` 里显式写了
+    # `figure_dpi`，而 `setdefault` 只在键缺失时才生效 —— 所以那份配置
+    # 不会用到这个默认值。**两处都要对。**（姊妹项目 scrna 实测踩过：
+    # 只改了这里的默认值，artifact 里的 PNG 仍然是 150 dpi。）
+    ana.setdefault("figure_dpi", 300)
     return cfg
 
 

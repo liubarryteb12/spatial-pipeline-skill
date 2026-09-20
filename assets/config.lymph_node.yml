@@ -140,7 +140,13 @@ spatial_trajectory:
 # ---- 分析选项 ---------------------------------------------------------------
 analysis:
   seed: 20260919
-  figure_dpi: 150
+  # **300 是投稿底线，别往下调。** 原来写 150：183 mm 宽的图只有 1080 px，
+  # 放大或印刷后字形和细线发虚 —— 而"发虚"从图注上看不出来，文件大小也正常。
+  # **这个键会覆盖 common.py 的默认值**（`setdefault` 只在键缺失时才生效），
+  # 所以只改 common.py 对这份配置没有任何作用 —— 两处都要对。
+  # 姊妹项目 scrna-pipeline-skill 实测踩过：只改了默认值，
+  # artifact 里的 PNG 仍是 150 dpi（907 px 而不是 1814 px）。
+  figure_dpi: 300
   top_markers: 25
   # 域标签打分用哪个签名集（assets/reference_signatures.yml 的键）。
   # 不填则跟随 deconvolution.signature_set。
