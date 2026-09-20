@@ -43,7 +43,8 @@ import yaml  # noqa: E402
 from scipy.optimize import nnls  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed,
+                    log_warn, parse_args, probe_named_tools, record_step, save_fig,
+                    set_seed,
                     spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm,)
 
 
@@ -347,6 +348,11 @@ def run_05_deconvolution(cfg: dict) -> dict:
     common_limits = [
         "Visium 的 spot 含 1-10 个细胞，所以即使组成准确，"
         "空间分辨率也受限于 spot 尺寸",
+        # §3.3 的缺口 —— 与 method 并列，不藏起来
+        "**§3.3 点名的 RCTD / cell2location 一个都没跑。** RCTD（`spacexr`）"
+        "是 R 包，PyPI 上无同名包；cell2location 有 PyPI 真包，但依赖 "
+        "scvi-tools + torch + pyro-ppl + opencv-python，CPU CI 上跑不动。"
+        "逐条理由见 `named_tools` 字段。",
     ]
     if is_deconv:
         method_desc = "**NNLS 解卷积**，参考谱来自 scRNA-seq 参考（覆盖全部共同基因）"
@@ -389,6 +395,10 @@ def run_05_deconvolution(cfg: dict) -> dict:
         "reconstruction_error": err_block,
         "mean_composition": {k: round(float(v), 5) for k, v in mean_prop.items()},
         "method": method_desc,
+        # **§3.3 点名的 RCTD / cell2location 一个都没跑。**
+        # 上面的 method 是 marker 打分法（is_deconvolution=False）——
+        # 不把这条放在 method 旁边，读者会以为"解卷积做过了"。
+        "named_tools": probe_named_tools(log=log_warn, only=("RCTD", "cell2location")),
         "limitations": limits,
     }
     write_json(res_dir / "deconvolution_status.json", status)

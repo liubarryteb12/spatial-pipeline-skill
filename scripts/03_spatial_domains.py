@@ -40,7 +40,8 @@ import scipy.sparse as sp  # noqa: E402
 from scipy.sparse.csgraph import connected_components  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed,
+                    log_warn, named_tools_note, parse_args, probe_named_tools,
+                    record_step, save_fig, set_seed,
                     spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, mm, PAL,)
 
 
@@ -410,6 +411,17 @@ def run_03_spatial_domains(cfg: dict) -> dict:
     adata.write_h5ad(out)
     log_info(f"已写出 {out}")
 
+    # ---- 7. 点名工具的可用性登记（§3.2）-------------------------------------
+    #
+    # 文档 §3.2 点名 BayesSpace / STAGATE / SpaGCN。**本仓库一个都没用上** ——
+    # 上面跑的两种域划分（不平滑 / 平滑）都是内置实现，不是这三个中的任何一个。
+    #
+    # 这一段把"为什么没用上"逐条落盘。**不写这段的话，产物里只有一个
+    # 漂亮的域划分结果，读的人无从知道规范点名的三种方法都没跑。**
+    named = probe_named_tools(log=log_warn, only=("BayesSpace", "STAGATE", "SpaGCN"))
+    for tool, info in named.items():
+        log_info(f"  §3.2 {tool}: 未使用（{info['kind']}）—— {info['reason'][:70]}")
+
     status = {
         "dataset_id": cfg["dataset_id"],
         "n_spots": int(adata.n_obs),
@@ -420,6 +432,9 @@ def run_03_spatial_domains(cfg: dict) -> dict:
         "spatial": m_spat,
         "smoothing_scan": df_to_records(scan_df),
         "resolution_scan": rscan,
+        # **§3.2 点名的三个方法一个都没跑。** 这是缺口，必须自己说出来。
+        "named_tools": named,
+        "named_tools_note": named_tools_note(),
         "improvement": {
             "neighbor_same_frac_delta": round(
                 m_spat["neighbor_same_frac"] - m_expr["neighbor_same_frac"], 4),
@@ -440,6 +455,11 @@ def run_03_spatial_domains(cfg: dict) -> dict:
             "肿瘤的癌巢本身就是散布的多个斑块 —— 同一个域出现在多个不相邻"
             "位置是生物学事实。只有对『应当连续』的组织（脑的层状结构、"
             "上皮分层）才能把这个指标当缺陷看",
+            # §3.2 的缺口 —— 必须与"域划分做出来了"并列出现
+            "**§3.2 点名的 BayesSpace / STAGATE / SpaGCN 一个都没跑**，"
+            "上面的域划分是本仓库的平滑 + Leiden 内置实现。"
+            "三个都装不上（R 包 / 不在 PyPI / `louvain` 无 py3.12 wheel），"
+            "逐条理由见 `named_tools` 字段。**这是缺口，不是已覆盖。**",
         ],
         "status": "ok",
     }

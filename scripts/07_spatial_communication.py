@@ -38,7 +38,8 @@ import scipy.sparse as sp  # noqa: E402
 import yaml  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed,
+                    log_warn, parse_args, probe_named_tools, record_step, save_fig,
+                    set_seed,
                     spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm,)
 
 
@@ -260,6 +261,9 @@ def run_07_spatial_communication(cfg: dict) -> dict:
                        "CellPhoneDB / CellChat 那样的统计框架"
                        "（含置换检验与受体复合物建模）。本工具只给"
                        "空间约束下的描述性强度"),
+        # §3.5 点名的 CellChat 没跑 —— 和 not_a_call 并列，别让读者以为
+        # "既然有 not_a_call 说明替代方案已经上了"
+        "named_tools": probe_named_tools(log=log_warn, only=("CellChat",)),
         "limitations": [
             f"**只有 {len(usable)}/{len(pairs)} 对 LR 可用** —— "
             "结论建立在这些对上；不可用的原因是基因不在 Visium 覆盖里"

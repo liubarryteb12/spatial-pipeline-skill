@@ -244,6 +244,48 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         except Exception as e:  # noqa: BLE001
             chk("svg:spatialde", "honesty", False, f"读取失败: {e}")
 
+    # ---- honesty: §3.2/§3.3/§3.5/§3.6 点名的工具一个都没跑 --------------------
+    #
+    # **这是本仓库最容易被误读的地方。** 域划分、解卷积、通讯、轨迹四步都
+    # 有产出、都有图，看起来"§3 做完了" —— 但文档点名的 BayesSpace /
+    # STAGATE / SpaGCN / RCTD / cell2location / CellChat / StPedf / SpaceFlow /
+    # ISORT / Stereopy-TGPI / stLearn **一个都没用上**，跑的全是内置实现。
+    #
+    # 所以这四条检查的判据是"**那份缺口登记存在且每条都写了理由**"，
+    # 不是"工具有没有跑"。工具将来能装了，这四条应该**依然 PASS**
+    # （理由变成"已装"），而不是因为"登记表里 available=False"就变红 ——
+    # 那会把"如实记录"惩罚成失败。
+    tool_registry_files = {
+        "domain_status.json": ("§3.2 空间域", ("BayesSpace", "STAGATE", "SpaGCN")),
+        "deconvolution_status.json": ("§3.3 解卷积", ("RCTD", "cell2location")),
+        "communication_status.json": ("§3.5 空间通讯", ("CellChat",)),
+        "spatial_trajectory_status.json": ("§3.6 空间轨迹",
+                                           ("StPedf", "SpaceFlow", "ISORT",
+                                            "Stereopy-TGPI", "stLearn")),
+    }
+    for f, (section, expect) in tool_registry_files.items():
+        p = res_dir / f
+        if not p.exists():
+            continue
+        try:
+            nt = json.loads(p.read_text(encoding="utf-8")).get("named_tools")
+        except Exception as e:  # noqa: BLE001
+            chk(f"named_tools:{f}", "honesty", False, f"读取失败: {e}")
+            continue
+        if not isinstance(nt, dict) or not nt:
+            chk(f"named_tools:{f}", "honesty", False,
+                f"{section}：{f} 里没有 named_tools 登记 —— "
+                "读者会以为文档点名的方法已经用上了")
+            continue
+        missing = [t for t in expect if t not in nt]
+        no_reason = [t for t, i in nt.items() if not (i or {}).get("reason")]
+        chk(f"named_tools:{f}", "honesty",
+            not missing and not no_reason,
+            (f"{section}：{len(nt)} 个点名工具已登记，"
+             f"{sum(1 for i in nt.values() if i.get('available'))} 个当前可用"
+             if not missing and not no_reason else
+             f"缺登记 {missing}；无理由 {no_reason}"))
+
     # ---- honesty: 每步必须说明自己没做什么 ----
     # 这是防止"静默跳过"的检查。
     honest_map = {

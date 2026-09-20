@@ -34,7 +34,8 @@ import pandas as pd  # noqa: E402
 import scipy.sparse as sp  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed,
+                    log_warn, parse_args, probe_named_tools, record_step, save_fig,
+                    set_seed,
                     spatial_xy, write_json, W_DOUBLE, mm,)
 
 # 复用 03 的空间平滑与 04 的 Moran's I —— 不重复实现。
@@ -291,6 +292,12 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
         "morans_I_expected_no_autocorrelation": round(expected, 4),
         "morans_I_gain": round(I_spatial - I_expr, 4),
         "spatial_smoothing_improves_coherence": bool(improved),
+        # **§3.6 点名的 StPedf / SpaceFlow / ISORT / Stereopy-TGPI / stLearn
+        # 一个都没跑。** 上面跑的是扩散图 + DPT 的内置实现 ——
+        # 不记这条，读者会以为空间轨迹用的是文档点名的框架。
+        "named_tools": probe_named_tools(
+            log=log_warn,
+            only=("StPedf", "SpaceFlow", "ISORT", "Stereopy-TGPI", "stLearn")),
         "neighbor_gap_expression_only": round(gap_expr, 4),
         "neighbor_gap_spatially_smoothed": round(gap_spatial, 4),
         "spearman_between_two": round(rho_two, 4),

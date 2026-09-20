@@ -207,6 +207,163 @@ KEY_PACKAGES = [
 ]
 
 
+# ---- 文档点名、但本仓库用不了的工具 -----------------------------------------
+#
+# 规范 §3.2 点名 BayesSpace / STAGATE / SpaGCN，§3.3 点名 RCTD / cell2location，
+# §3.5 点名 CellChat，§3.6 点名 StPedf / SpaceFlow / ISORT / Stereopy-TGPI / stLearn。
+# **本仓库一个都没用上。** 这一节把"为什么"逐条记下来，判据全部是实测的。
+#
+# ## 三种不同的"用不了"，不能混为一谈
+#
+#   r_package    R/Bioconductor 包，本仓库的 Python CI 里没有 rpy2 → 结构上装不了
+#   not_on_pypi  真包不在 PyPI，只能从 GitHub 装（且通常还依赖 torch-geometric）
+#   deps         PyPI 上有真包，但依赖链在当前 CI 上跑不动
+#   name_taken   **PyPI 上那个名字是另一个不相干的包** ← 最危险的一类
+#
+# ## `name_taken` 为什么单列一类
+#
+# `pip install <名字>` 会**成功**，装进来的是完全无关的东西。实测：
+#
+#   pip install edgeR     -> "Redirect Microsoft Edge to your preferred browser"
+#   pip install ISORT     -> PyCQA/isort，Python 的 import 排序工具
+#   pip install slingshot -> ElasticSearch 索引迁移
+#   pip install sparkx    -> 高能物理的碰撞相对论运动学
+#
+# 这比"装不上"糟得多：装不上会立刻报错，装错了要到 import 或跑出结果才发现，
+# 而那时"结果"可能已经在图上看着挺像回事了。所以这些名字**不能出现在
+# requirements.txt 里**，哪怕文档点名了。
+#
+# 反例：`SingleR` 在 PyPI 上是 **BiocPy/singler**，是 R 那个算法的官方
+# Python 绑定（作者 Aaron Lun）—— 名字对得上，不是顶名的。所以判断依据是
+# **summary / author / project_urls**，不是"名字存在与否"。
+NAMED_TOOLS = {
+    # ---- §3.2 空间域 --------------------------------------------------------
+    "BayesSpace": dict(
+        kind="r_package", section="§3.2",
+        reason="Bioconductor R 包，没有 Python 发行版；本仓库 CI 不装 R + rpy2",
+    ),
+    "STAGATE": dict(
+        kind="not_on_pypi", section="§3.2",
+        reason=("PyPI 上 STAGATE / STAGATE_pyG / stagate 三个名字**全部 404**；"
+                "官方只发 GitHub，且依赖 torch + torch-geometric"),
+    ),
+    "SpaGCN": dict(
+        kind="deps", section="§3.2",
+        reason=("PyPI 有真包（1.2.7，作者 Jian Hu），但依赖 `louvain` —— "
+                "**该包最新版 0.8.2 没有 py3.12 wheel，只有 sdist**，"
+                "要从 2019 年的 C++/Cython 源码编译。CI 的 3.12 上未验证能编过，"
+                "不敢押一轮 CI"),
+    ),
+    # ---- §3.3 解卷积 --------------------------------------------------------
+    "RCTD": dict(
+        kind="r_package", section="§3.3",
+        reason="`spacexr` 是 R 包（Bioconductor/GitHub），PyPI 上无同名包",
+    ),
+    "cell2location": dict(
+        kind="deps", section="§3.3",
+        reason=("PyPI 有真包（0.1.5，BayraktarLab），但依赖 "
+                "`scvi-tools>=1.3.0` + `torch>=1.9.0` + `pyro-ppl` + `opencv-python`；"
+                "GPU 导向，CPU CI 上的时间与磁盘都吃不消"),
+    ),
+    # ---- §3.5 空间通讯 ------------------------------------------------------
+    "CellChat": dict(
+        kind="r_package", section="§3.5",
+        reason="R 包（GitHub JinmiaoChenLab/CellChat），PyPI 上无同名包",
+    ),
+    # ---- §3.6 空间轨迹 ------------------------------------------------------
+    "StPedf": dict(
+        kind="not_on_pypi", section="§3.6",
+        reason="PyPI 上无此包",
+    ),
+    "SpaceFlow": dict(
+        kind="deps", section="§3.6",
+        reason=("PyPI 有真包（1.0.4），但依赖 torch-geometric + torch-sparse + "
+                "torch-scatter —— 后两者要按 torch 版本编译，是出了名的难装"),
+    ),
+    "ISORT": dict(
+        kind="name_taken", section="§3.6",
+        reason=("**PyPI 上的 `ISORT` 是 PyCQA/isort —— Python 的 import 排序工具，"
+                "和空间轨迹的 ISORT 毫无关系。** 真 ISORT 无 PyPI 发行版"),
+    ),
+    "Stereopy-TGPI": dict(
+        kind="deps", section="§3.6",
+        reason=("PyPI 有 `Stereopy` 1.6.2，但 `requires_python = '<3.9,>=3.8'` —— "
+                "**与 CI 的 3.12 不兼容**（是上限卡死，不是下限）"),
+    ),
+    "stLearn": dict(
+        kind="deps", section="§3.5/§3.6",
+        reason=("PyPI 有真包（1.4.1），但依赖 `numpy>=2.4.0` / `scipy>=1.17.0` / "
+                "`scanpy>=1.12.0` / `zarr>=3.1` / spatialdata 全家桶 + torch + "
+                "torchvision + geopandas + dask（20+ 个），与本仓库钉的 "
+                "scanpy/numpy 区间冲突"),
+    ),
+    # ---- 细胞分割（§3.1 的平台分支）------------------------------------------
+    "Bering": dict(
+        kind="deps", section="§3.1",
+        reason="PyPI 有真包（0.1.2，KANG-BIOINFO/Bering），但依赖 torch + torch-geometric",
+    ),
+    "BOMS": dict(
+        kind="deps", section="§3.1",
+        reason=("PyPI 有真包（1.1.0），依赖 `mkl` + `mkl-service` —— "
+                "那是 conda 时代的 Intel MKL 绑定，pip 环境下不可靠"),
+    ),
+}
+
+
+def probe_named_tools(log=None, only=None) -> dict:
+    """把 NAMED_TOOLS 整理成可写进状态 JSON 的登记表。
+
+    **不尝试 import** —— 这一节的结论是"没装/装不了"，去 import 只会
+    反复报同一个 ImportError。真正的可用性判断在 `importlib.util.find_spec`，
+    这里只做一次，用来区分"登记说装不了，但实际上环境里有"（那说明
+    登记过期了，值得报出来）。
+
+    返回 {tool: {available, kind, section, reason}}。
+    """
+    import importlib.util
+
+    # 名字 -> 真正会被 import 的模块名（不总是一样）
+    import_name = {
+        "SpaGCN": "SpaGCN", "SpaceFlow": "spaceflow", "stLearn": "stlearn",
+        "cell2location": "cell2location", "Bering": "Bering", "BOMS": "boms",
+        "ISORT": "isort", "STAGATE": "STAGATE", "BayesSpace": None,
+        "RCTD": None, "CellChat": None, "StPedf": None,
+        "Stereopy-TGPI": "stereopy",
+    }
+    out = {}
+    for tool, meta in NAMED_TOOLS.items():
+        if only is not None and tool not in only:
+            continue
+        mod = import_name.get(tool)
+        avail = False
+        if mod:
+            try:
+                avail = importlib.util.find_spec(mod) is not None
+            except (ImportError, ValueError):
+                avail = False
+        if avail and log:
+            # 登记说过不了、环境里却有 —— 登记过期了，必须报出来
+            log_warn(f"工具 {tool} 登记为不可用，但环境里能 import —— 登记需要更新")
+        out[tool] = {
+            "available": bool(avail),
+            "kind": meta["kind"],
+            "section": meta["section"],
+            "reason": meta["reason"],
+        }
+    return out
+
+
+def named_tools_note() -> str:
+    """一句话说明本仓库为什么一个 §3.2/§3.3 点名工具都没用上。"""
+    return ("文档 §3.2 / §3.3 / §3.5 / §3.6 点名的工具本仓库**一个都没用上**："
+            "要么是 R/Bioconductor 包（CI 无 rpy2），要么不在 PyPI，"
+            "要么依赖链（torch / scvi-tools / torch-geometric / 旧版 mkl）"
+            "在当前 CPU CI 上跑不动，要么 **PyPI 上那个名字是另一个不相干的包**。"
+            "逐条理由见 domain_status.json 的 named_tools 字段。"
+            "**这是缺口，不是「已覆盖」。**")
+
+
+
 def manifest_path(cfg: dict) -> Path:
     return Path(cfg["output"]["results_dir"]) / MANIFEST_NAME
 
