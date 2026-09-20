@@ -5,6 +5,14 @@ description: Run an end-to-end Visium spatial transcriptomics pipeline — fetch
 
 # 空间转录组（Visium）分析流水线
 
+## 这个 skill 做什么
+
+从 10x Visium 的**两半数据**（表达矩阵 + 空间信息）出发，跑到
+空间域、空间高变基因、spot 组成、空间邻域与空间通讯，
+全程在 GitHub Actions 上跑，产物作为 artifact 下载。
+
+参考数据集：**正常人淋巴结**（10x 官方 Visium，4035 spot）。
+
 ## 这是一个**框架**，不是一条焊死的流水线
 
 本仓库提供的是**生信分析的骨架与判据**：数据门禁、方法学约定、验收项、
@@ -40,14 +48,6 @@ SKILL=$(./use.sh --print-path)    # 只取路径，便于脚本里用
 > `use.sh` 里每个可能失败的步骤都显式 `|| die`，**不依赖 `set -e`**。
 > 实测（bash 5.3）在 `resolved="$(pull)"` 这种「函数在命令替换里」的结构下，
 > 函数内部的失败不一定会中止外层脚本。出错的路径必须自己说出来。
-
-## 这个 skill 做什么
-
-从 10x Visium 的**两半数据**（表达矩阵 + 空间信息）出发，跑到
-空间域、空间高变基因、spot 组成、空间邻域与空间通讯，
-全程在 GitHub Actions 上跑，产物作为 artifact 下载。
-
-参考数据集：**正常人淋巴结**（10x 官方 Visium，4035 spot）。
 
 ## 为什么需要单独的流水线（不是把单细胞流程改改）
 
