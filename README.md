@@ -90,12 +90,13 @@ Visium 的数据是**两半**：表达矩阵 + `spatial.tar.gz`（坐标/缩放/
 域数对齐到 13），并报它与内置划分的 ARI / NMI / 邻居同域率 ——
 **"跑通了"不是结论，两套划分是否在说同一件事才是。**
 
-> **这个 ARI 是一个范围，不是一个数。** 四轮 CI（同一份代码、同一批包版本）
-> 给过 `0.3639` ~ `0.4216` —— 因为 SpaGCN 的 `KMeans` 没设 `random_state`，
-> 而它的 GCN 训练走 torch 的 RNG（本仓库的 `set_seed()` 不 seed torch）。
+> **这个 ARI 是一个范围，不是一个数。** 五轮 CI（同一份代码、同一批包版本）
+> 给过 `0.3639` ~ `0.4216`。**三次归因都被日志否证了** —— 先怪 BLAS 归约
+> 顺序，后怪 Numba 并行，最后怪"`set_seed()` 没 seed torch"（这一条读源码
+> 是真的，但钉住三个全局 RNG 之后 ARI 仍在变）。**残留随机源尚未定位。**
 > 详见 [`references/module0.md`](references/module0.md) §9.1 与
 > `domain_status.json` 的 `reproducibility` 字段。
-> **主方法的数（Moran's I `0.7670`、域数 13、邻居同域率）四轮逐位相同，
+> **主方法的数（Moran's I `0.7670`、域数 13、邻居同域率）五轮逐位相同，
 > 可以当定值用。**
 
 ---

@@ -103,6 +103,11 @@ jobs:
         run: |
           node tools/check_py_syntax.mjs
           node tools/check_artifact_paths.mjs
+          # 「汇总产物」那段打印逻辑的自检：喂合成 JSON，确认诊断字段
+          # （seeded_before_train / adjusted_rand_index / ari_observed_range）
+          # **不再被 [:500] 截断掉**。这段逻辑写错了不会有任何报错 ——
+          # 只会让日志里少几行，而少了哪几行正是排查时最需要的。
+          python tools/selftest_summary_fields.py
 
       - name: 缓存 pip
         uses: actions/cache@v4
@@ -207,20 +212,60 @@ jobs:
           # **跑通了不等于用上了，用上了不等于对。** 这一段把"哪个点名工具
           # 真的产出了结果、哪个没有、为什么"直接打在日志里 ——
           # 否则一个漂亮的域划分结果会让人以为规范点名的三种方法都跑了。
+          #
+          # **原来这里是 `json.dumps(v)[:500]`，而 `domain_methods` 一长就
+          # 从中间被切断** —— 实测排查 SpaGCN 的 ARI 漂移时，最需要的
+          # `seeded_before_train` / `seed` 恰好落在第 500 个字符之后，
+          # **日志里根本看不到**，只能靠猜。截断的位置不该由"字典有多长"
+          # 决定，该由"哪些字段能定位问题"决定。
+          #
+          # 所以这里改成**按字段名挑**：数值与短标记逐条打全，
+          # 长散文（`reason` / `note` / `why_kmeans`）才截断。
           python -c "
           import json, pathlib
+
+          SHORT = ('status', 'used', 'role', 'version', 'n_domains',
+                   'length_scale_l', 'n_clusters', 'seed', 'torch_seeded',
+                   'seeded_before_train', 'available', 'attempted',
+                   'init', 'is_deconvolution', 'compared')
+          LONG = ('reason', 'note', 'why_kmeans', 'limitations')
+
+          def show(k, v, ind='    '):
+              if isinstance(v, dict):
+                  print('%s%s:' % (ind, k))
+                  for kk, vv in v.items():
+                      show(kk, vv, ind + '  ')
+              elif isinstance(v, list):
+                  print('%s%s: %s' % (ind, k, json.dumps(v, ensure_ascii=False)[:220]))
+              elif k in LONG:
+                  print('%s%s: %s' % (ind, k, str(v)[:200]))
+              else:
+                  print('%s%s: %s' % (ind, k, v))
+
           for f, keys in (
                   ('results/lymph_node/domain_status.json',
-                   ('domain_methods', 'method_agreement')),
+                   ('domain_methods', 'method_agreement', 'reproducibility')),
                   ('results/lymph_node/deconvolution_status.json',
                    ('cell2location',))):
               p = pathlib.Path(f)
               if not p.exists():
                   print(f, '（缺失）'); continue
+              print('=====', f)
               d = json.loads(p.read_text(encoding='utf-8'))
               for k in keys:
                   v = d.get(k)
-                  print('  %s -> %s' % (k, json.dumps(v, ensure_ascii=False)[:500]))
+                  if isinstance(v, dict) and k == 'domain_methods':
+                      # 只挑诊断用的字段，别把整段散文倒出来
+                      v = {t: {kk: vv for kk, vv in (tv or {}).items()
+                               if kk in SHORT or kk in LONG}
+                           for t, tv in v.items()}
+                  print('  %s ->' % k)
+                  if isinstance(v, dict):
+                      for kk, vv in v.items():
+                          show(kk, vv, '    ')
+                  else:
+                      print('    %s'
+                            % json.dumps(v, ensure_ascii=False)[:220])
           " 2>/dev/null || true
 
       - name: 上传产物

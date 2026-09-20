@@ -312,7 +312,9 @@ def try_spagcn(adata, cfg: dict, n_clusters: int, log=log_info) -> tuple:
         # 两个函数都不经过 —— 于是它的 seeding 全部被跳过。
         #
         # 所以这里照抄它自己的做法，在 train 之前把三个全局 RNG 钉死。
-        # **效果待下一轮 CI 确认** —— 这次不提前声称已修复。
+        # **实测这不足以让 ARI 稳定**（第五轮 CI 仍给 0.3708，又是一个新值），
+        # 详见 domain_status.json 的 reproducibility.falsified_hypotheses。
+        # 留着它是因为成本为零、方向正确，且 `seeded_before_train` 可核对。
         _seed = int((cfg.get("analysis") or {}).get("seed", 0))
         random.seed(_seed)
         np.random.seed(_seed)
@@ -799,49 +801,63 @@ def run_03_spatial_domains(cfg: dict) -> dict:
                  "它要与 `random_baseline_same_frac` 比较才有意义"),
         # ---- 哪些数可以当确定值报，哪些不能 --------------------------------
         #
-        # **"跑通了"不等于"这个数可复现"。** 实测四轮 CI（同一份代码、
-        # 同一批包版本、四种不同的并行度设置），SpaGCN 与内置划分的
-        # ARI 给了四个值：0.3734 / 0.3784 / 0.3639 / 0.4216。
+        # **"跑通了"不等于"这个数可复现"。** 实测五轮 CI（同一份代码、
+        # 同一批包版本、五种不同的并行度/种子设置），SpaGCN 与内置划分的
+        # ARI 给了五个值：0.3734 / 0.3784 / 0.3639 / 0.4216 / 0.3708。
         #
         # **而同一轮里，主方法的数全部逐位相同**：Moran's I 0.7670、
-        # 域数 13、不平滑邻居同域率 0.507、平滑后 0.668 —— 四轮一致。
+        # 域数 13、不平滑邻居同域率 0.507、平滑后 0.668 —— 五轮一致。
         # 所以漂的只有 §3.2 的交叉验证那一块。
         #
-        # 根因（读 SpaGCN 1.2.7 源码得到，不是推理）：
+        # 三次归因，三次被否证：
+        #
+        #   1. 多线程 BLAS 归约顺序 —— 钉住 OMP/OPENBLAS/MKL + CORETYPE
+        #      之后 ARI 仍从 0.3784 变 0.3639；
+        #   2. Numba 的 prange 线程数 —— 补上 NUMBA_NUM_THREADS=1 之后
+        #      仍给 0.4216；
+        #   3. torch 未 seed（下面这段代码就是为它加的）—— 钉住
+        #      random/numpy/torch 三个全局 RNG 之后仍给 0.3708。
+        #
+        # **所以残留随机源尚未定位。** 三次"读源码看着很有道理"的归因
+        # 都被日志否证了 —— 第四次动手之前先读日志（AGENTS 规则 13）。
+        #
+        # 已确认的源码事实（不是推测）：
         #   - `models.py:55` 的 `KMeans(n_clusters, n_init=20)` **没有
         #     `random_state`**，走全局 numpy 遗留 RNG；
         #   - `train()` 训练 GCN 走 torch，而本仓库的 `set_seed()`
         #     **只 seed 了 random 与 numpy，没有 seed torch**。
-        #   SpaGCN 自己在 `search_res()` / `ez_mode` 里 seed 了这三个，
-        #   但本仓库走的 `init="kmeans"` 路径两个函数都不经过。
-        #
-        # 已做的缓解：在 `clf.train()` 之前照抄它自己的做法把三个全局
-        # RNG 钉死（见 `try_spagcn` 的注释）。**效果待下一轮 CI 确认。**
+        # 下面把这三个 RNG 都钉住了 —— 但实测**不足以**让 ARI 稳定。
         "reproducibility": {
             "stable": ["morans_I", "n_domains", "neighbor_same_frac",
                        "resolution_scan", "smoothing_scan"],
             "unstable": ["method_agreement.SpaGCN_vs_builtin"
                          ".adjusted_rand_index"],
             "ari_observed_range": [0.3639, 0.4216],
-            "evidence": ("四轮 CI（35488906157 / 35489064432 / 35489172104 / "
-                         "35489534090，同一份代码、同一批包版本）：ARI = "
-                         "0.3734 / 0.3784 / 0.3639 / 0.4216；"
-                         "同四轮的 Moran's I 全部 0.7670、域数全部 13、"
+            "evidence": ("五轮 CI（35488906157 / 35489064432 / 35489172104 / "
+                         "35489534090 / 35489962167，同一份代码、同一批包版本）："
+                         "ARI = 0.3734 / 0.3784 / 0.3639 / 0.4216 / 0.3708；"
+                         "同五轮的 Moran's I 全部 0.7670、域数全部 13、"
                          "平滑邻居同域率全部 0.668"),
             "range_is_from": ("**历史观测值，不是本轮的** —— 本轮的 ARI 见 "
                               "`method_agreement`"),
-            "cause": ("SpaGCN 1.2.7 `models.py:55` 的 "
-                      "`KMeans(n_clusters, n_init=20)` 没有 `random_state`"
-                      "（走全局 numpy 遗留 RNG），且 `train()` 的 GCN 走 "
-                      "torch 而 `set_seed()` 没有 seed torch；"
-                      "SpaGCN 自己在 `search_res()` / `ez_mode` 里 seed 了"
-                      "这三个 RNG，但本仓库走的 `init=\"kmeans\"` 路径"
-                      "两个函数都不经过"),
-            "mitigation": ("`try_spagcn` 在 `clf.train()` 之前照抄 SpaGCN "
-                           "自己的做法：`random.seed` + `np.random.seed` + "
-                           "`torch.manual_seed` + `torch.set_num_threads(1)`；"
-                           "是否钉住成功记在 `domain_methods.SpaGCN."
-                           "seeded_before_train` 里。**效果待下一轮 CI 确认**"),
+            "cause": ("**尚未定位。** 已知 SpaGCN 1.2.7 有两处不受本仓库"
+                      "控制的随机源（`models.py:55` 的 `KMeans` 没有 "
+                      "`random_state`；`train()` 的 GCN 走 torch 而 "
+                      "`set_seed()` 不 seed torch），但把这三个全局 RNG "
+                      "都钉住之后 ARI 仍在变"),
+            "falsified_hypotheses": [
+                ("多线程 BLAS 归约顺序 —— 否证：钉住 OMP/OPENBLAS/MKL + "
+                 "OPENBLAS_CORETYPE 之后 ARI 仍从 0.3784 变 0.3639"),
+                ("Numba `prange` 的线程数 —— 否证：补上 "
+                 "NUMBA_NUM_THREADS=1 之后仍给 0.4216"),
+                ("torch 未 seed —— 否证：在 `clf.train()` 前钉住 "
+                 "random/numpy/torch 三个全局 RNG 之后仍给 0.3708"),
+            ],
+            "mitigation": ("`try_spagcn` 在 `clf.train()` 之前钉住三个全局 "
+                           "RNG（照抄 SpaGCN 自己 `search_res()` 的做法），"
+                           "结果记在 `domain_methods.SpaGCN."
+                           "seeded_before_train`。**实测这不足以让 ARI "
+                           "可复现**，所以不要以为设了就可复现 —— 按范围报"),
             "how_to_report": ("主方法的数（Moran's I、域数、邻居同域率）可按"
                               "确定值报；**`SpaGCN_vs_builtin` 的 ARI 必须带"
                               "范围报**，不能只报一个数 —— 而且"

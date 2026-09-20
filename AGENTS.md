@@ -375,24 +375,41 @@ ARI 是主判据（对域编号置换免疫）；`same_label_frac` 只作参考 
 姊妹项目 `scrna-pipeline-skill/AGENTS.md` 规则 20 记了同一类问题的另一面
 （那边是 `pynndescent` 的 Numba 并行）。空间这边实测踩到的是 **torch**。
 
-**证据（四轮 CI，同一份代码、同一批包版本，只改并行度设置）：**
+**证据（五轮 CI，同一份代码、同一批包版本，只改并行度/种子设置）：**
 
-| run | 并行度设置 | SpaGCN vs 内置 ARI | NMI |
+| run | 并行度 / 种子设置 | SpaGCN vs 内置 ARI | NMI |
 |---|---|---|---|
 | 35488906157 | 无钉 | 0.3734 | 0.5535 |
 | 35489064432 | +OMP/OPENBLAS/MKL + CORETYPE | 0.3784 | 0.5557 |
 | 35489172104 | 同上 | 0.3639 | 0.5310 |
 | 35489534090 | +`NUMBA_NUM_THREADS=1` | 0.4216 | 0.5762 |
+| 35489962167 | +`random`/`numpy`/`torch` 三个全局 RNG | **0.3708** | 0.5451 |
 
-**四轮四个值，钉 BLAS 和钉 Numba 都没用 —— 因为变量根本不在这里。**
+**五轮五个值。三次归因、三次被否证 —— 变量不在这里。**
 
-而同一四轮里，**主方法的数全部逐位相同**：Moran's I（空间平滑后）
+而同一五轮里，**主方法的数全部逐位相同**：Moran's I（空间平滑后）
 `0.7670`、域数 `13`、不平滑邻居同域率 `0.507`、平滑后 `0.668`。
 
 **"某个量在变"不等于"所有量都在变"** —— 先看哪些**没**变，
 范围一下就缩小了。这一步比"设了种子"有用得多。
 
-### 21.1 根因：`set_seed()` 少 seed 了一个 RNG
+### 21.1 三次归因都被否证了
+
+| # | 归因 | 依据 | 否证 |
+|---|---|---|---|
+| 1 | 多线程 BLAS 归约顺序 | geo 规则 12 的经验 | 钉住 OMP/OPENBLAS/MKL + CORETYPE 后仍从 0.3784 变 0.3639 |
+| 2 | Numba `prange` 线程数 | SpaGCN 走 numpy，怀疑并行归约 | 补 `NUMBA_NUM_THREADS=1` 后仍给 0.4216 |
+| 3 | **torch 未 seed** | `set_seed()` 确实没 seed torch（读源码确认） | 钉住三个全局 RNG 后仍给 **0.3708** |
+
+**第 3 条的依据是真的**（`set_seed()` 确实只 seed 了 `random` 与
+`numpy`），**但"依据为真"不等于"它就是变量"。** 三次都是"读源码
+看着很有道理"就动手，三次都被日志否证。
+
+> **残留随机源尚未定位。** 第四次动手之前先读日志（规则 13）。
+> 上面那五轮 ARI 摆在一起，说明问题不在"哪个 RNG 没设"这个层面 ——
+> 继续加环境变量只是碰运气。
+
+### 21.2 已确认的源码事实（不是推测）
 
 ```python
 def set_seed(cfg):
@@ -401,12 +418,11 @@ def set_seed(cfg):
     apply_style(cfg)
 ```
 
-而 SpaGCN 1.2.7 的两处随机源：
+SpaGCN 1.2.7 的两处随机源：
 
 1. `models.py:55` `KMeans(self.n_clusters, n_init=20)` —— **没有
    `random_state`**，走全局 numpy 遗留 RNG；
-2. `train()` 训练 GCN 走 **torch**（权重初始化 + dropout）——
-   `set_seed()` 从来没 seed 过它。
+2. `train()` 训练 GCN 走 **torch**（权重初始化 + dropout）。
 
 **SpaGCN 自己知道要 seed。** `util.search_res()` 与
 `ez_mode.detect_spatial_domains_ez_mode()` 开头都有
@@ -419,9 +435,9 @@ random.seed(r_seed); torch.manual_seed(t_seed); np.random.seed(n_seed)
 （规则 20 为了绕开 louvain 的 py3.12 编译链选的），两个函数都不经过 ——
 **它的 seeding 全部被跳过。**
 
-### 21.2 处理
+### 21.3 处理
 
-在 `clf.train()` 之前**照抄 SpaGCN 自己的做法**把三个全局 RNG 钉死：
+在 `clf.train()` 之前照抄 SpaGCN 自己的做法把三个全局 RNG 钉死：
 
 ```python
 random.seed(seed); np.random.seed(seed)
@@ -431,14 +447,30 @@ torch.manual_seed(seed); torch.set_num_threads(1)
 并把结果记进 `domain_methods.SpaGCN.seeded_before_train` ——
 **没有 torch 时要如实记 `torch_seeded: False`，不能假装 seed 成功。**
 
-**效果待下一轮 CI 确认**（这次不提前声称已修复）。
+**留着它**：成本为零、方向正确、`seeded_before_train` 可核对。
+**但不要以为设了就可复现** —— 实测不足以让 ARI 稳定。
 
-### 21.3 报数
+### 21.4 报数
 
 **ARI 是范围，不是定值。** `domain_status.json` 的 `reproducibility`
 字段写明哪些量能按定值报（Moran's I、域数、邻居同域率）、
-哪些必须带范围报（`SpaGCN_vs_builtin` 的 ARI）。
+哪些必须带范围报（`SpaGCN_vs_builtin` 的 ARI，实测
+`0.3639` ~ `0.4216`），以及**被否证的三条假设**。
 
 **别把数值写死在 README 里。** 实测 README 里"不平滑 9 域、同域率 0.536、
 基线 0.133"早就对不上了（现在是 11 域 / 0.507 / 0.111）——
 **文档里写死的数一定会过时**，而读者不会知道它过时了。
+
+### 21.5 诊断字段必须扛得住日志截断
+
+排查这个 ARI 时卡了很久，一部分原因是**日志里根本看不到需要的字段**：
+`汇总产物` 那一步原来打的是 `json.dumps(v)[:500]`，而 `domain_methods`
+一长就从中间被切断 —— `seeded_before_train` / `seed` 恰好落在第 500 个
+字符之后。**只能靠猜，而我已经猜错三次了。**
+
+现在改成**按字段名挑**：短标记与数值逐条打全，长散文（`reason` /
+`note` / `why_kmeans`）才截断，并把 `reproducibility` 一起打出来。
+
+> **规则：日志的截断位置不该由"字典有多长"决定，该由"哪些字段能定位
+> 问题"决定。** 一个 `[:500]` 会让下一轮排查同样卡住 ——
+> 而 `results/` 的 artifact 有 14 天保留期，日志滚得更快。

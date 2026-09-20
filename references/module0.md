@@ -302,45 +302,67 @@ m["cross_language"]  # 跨语言转换记录
 
 ### 9.1 版本相同也会对不上：§3.2 的 ARI 是一个**范围**，不是一个数
 
-**别把"版本相同"当成"数就该一样"。** 四轮 CI（**同一份代码、同一批包
-版本**，只改并行度设置），SpaGCN 与内置划分的 ARI 给了四个值：
+**别把"版本相同"当成"数就该一样"。** 五轮 CI（**同一份代码、同一批包
+版本**，只改并行度/种子设置），SpaGCN 与内置划分的 ARI 给了五个值：
 
-| run | 并行度设置 | ARI | NMI | 内置邻居同域率 |
+| run | 并行度 / 种子设置 | ARI | NMI | 内置邻居同域率 |
 |---|---|---|---|---|
 | 35488906157 | 无钉 | 0.3734 | 0.5535 | 0.6587 |
 | 35489064432 | +OMP/OPENBLAS/MKL + CORETYPE | 0.3784 | 0.5557 | 0.6616 |
 | 35489172104 | 同上 | 0.3639 | 0.5310 | 0.6585 |
 | 35489534090 | +`NUMBA_NUM_THREADS=1` | 0.4216 | 0.5762 | 0.6913 |
+| 35489962167 | +`random`/`numpy`/`torch` 三个全局 RNG | 0.3708 | 0.5451 | 0.6727 |
 
-**四轮四个值，钉 BLAS 和钉 Numba 都没用 —— 因为变量根本不在这里。**
-同一四轮里，主方法的数**全部逐位相同**：
+**五轮五个值。三次归因、三次被否证 —— 变量不在这里。**
+同一五轮里，主方法的数**全部逐位相同**：
 
-    Moran's I（空间平滑后）  0.7670    四轮相同
-    域数                     13        四轮相同
-    不平滑邻居同域率          0.507     四轮相同
-    平滑后邻居同域率          0.668     四轮相同
+    Moran's I（空间平滑后）  0.7670    五轮相同
+    域数                     13        五轮相同
+    不平滑邻居同域率          0.507     五轮相同
+    平滑后邻居同域率          0.668     五轮相同
 
 **"某个量在变"不等于"所有量都在变"** —— 先看哪些没变，范围一下就缩小了。
 
-**根因（读 SpaGCN 1.2.7 源码得到，不是推理）：**
+**三次被否证的归因：**
 
-1. `models.py:55` 的 `KMeans(self.n_clusters, n_init=20)` **没有
+| # | 归因 | 依据 | 否证 |
+|---|---|---|---|
+| 1 | 多线程 BLAS 归约顺序 | geo §9 的经验 | 钉住后仍从 0.3784 变 0.3639 |
+| 2 | Numba `prange` 线程数 | 怀疑并行归约 | 补 `NUMBA_NUM_THREADS=1` 后仍给 0.4216 |
+| 3 | torch 未 seed | `set_seed()` 确实没 seed torch | 钉住三个全局 RNG 后仍给 **0.3708** |
+
+**第 3 条的依据是真的，但"依据为真"不等于"它就是变量"。**
+
+**已确认的源码事实（不是推测）** —— SpaGCN 1.2.7：
+
+1. `models.py:55` `KMeans(self.n_clusters, n_init=20)` **没有
    `random_state`** —— 走全局 numpy 遗留 RNG；
 2. `train()` 训练 GCN 走 **torch**，而本仓库的 `set_seed()` **只 seed 了
    `random` 与 `numpy`，没有 seed `torch`**。
 
-SpaGCN 自己知道要 seed：`util.search_res()` 与
-`ez_mode.detect_spatial_domains_ez_mode()` 开头都有
-`random.seed(r_seed); torch.manual_seed(t_seed); np.random.seed(n_seed)`。
-**但本仓库走的是 `init="kmeans"` + 外部给定 `n_clusters` 那条路**
-（为了绕开 louvain 的 py3.12 编译链），两个函数都不经过 ——
-**它的 seeding 全部被跳过。**
+SpaGCN 自己知道要 seed（`util.search_res()` 与
+`ez_mode.detect_spatial_domains_ez_mode()` 开头都有那三行），
+**但本仓库走 `init="kmeans"` + 外部给定 `n_clusters` 那条路，
+两个函数都不经过 —— 它的 seeding 全部被跳过。**
 
-**已做的缓解**：`try_spagcn` 在 `clf.train()` 之前照抄它自己的做法钉住三个
-全局 RNG（并把结果记进 `domain_methods.SpaGCN.seeded_before_train`）。
-**效果待下一轮 CI 确认。**
+**已做的缓解**：`try_spagcn` 在 `clf.train()` 之前照抄它自己的做法钉住
+三个全局 RNG（结果记进 `domain_methods.SpaGCN.seeded_before_train`）。
+**实测不足以让 ARI 稳定。残留随机源尚未定位。**
 
 **报数要求**：`domain_status.json` 的 `reproducibility` 字段写明哪些量可以
-按定值报、哪些必须带范围报。**`SpaGCN_vs_builtin` 的 ARI 必须带范围报** ——
-而"ARI 高也不等于两套方法都对"：它们可能共享同一个错误
-（比如被同一个技术批次效应驱动）。
+按定值报、哪些必须带范围报、以及**被否证的假设**。
+**`SpaGCN_vs_builtin` 的 ARI 必须带范围报** —— 而"ARI 高也不等于两套
+方法都对"：它们可能共享同一个错误（比如被同一个技术批次效应驱动）。
+
+### 9.2 诊断字段必须扛得住日志截断
+
+排查上面这个 ARI 时卡了很久，一部分原因是**日志里根本看不到需要的字段**：
+workflow 的 `汇总产物` 那一步打的是 `json.dumps(v)[:500]`，而
+`domain_methods` 一长就从中间被切断 —— `seeded_before_train` / `seed`
+恰好落在第 500 个字符之后。**只能靠猜。**
+
+现在改成**按字段名挑**：短标记与数值逐条打全，长散文（`reason` /
+`note` / `why_kmeans`）才截断，并把 `reproducibility` 一起打出来。
+
+> **规则：日志的截断位置不该由"字典有多长"决定，该由"哪些字段能定位
+> 问题"决定。**
