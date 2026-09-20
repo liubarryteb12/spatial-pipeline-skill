@@ -509,7 +509,7 @@ def run_04_svg(cfg: dict) -> dict:
     if len(sig):
         edge = (float(sig[stat_name].min()) if method == "moran"
                 else float(sig[stat_name].max()))
-        ax.axvline(edge, color=PAL["up"], ls=":", lw=1.2,
+        ax.axvline(edge, color=PAL["highlight"], ls=":", lw=1.2,
                    label=f"{stat_label} at the significant-set edge = {edge:.3f}")
     ax.set_xlabel(stat_label)
     ax.set_ylabel("number of genes")

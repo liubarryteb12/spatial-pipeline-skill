@@ -586,3 +586,26 @@ Patch/Line2D 显式图例（含两条阈值线），title 里不再用 "`|z|>2 d
   逐个受损）。colorbar 显式给 `fraction≈0.046, pad≈0.02, shrink≈0.8`，
   标题压成短行、统计量移到第二行。
 
+## 25. `PAL` 的键名不能靠记；多面板别给每个 colorbar 挂长标签
+
+**25.1 `PAL["xxx"]` 的键必须真存在 —— 本地门禁已挡住这一类。**
+实测（2026-09-20）：给 `svg_stat_distribution` 加参考线时写了
+`PAL["up"]` —— 那是 **geo（R 侧）**的语义键；本仓库 PAL 只有
+`highlight` / `primary` / `muted` / 定性色。本地静态检查全绿（`PAL`
+这个**名字**确实 import 了），CI 跑到 svg 步骤才 `KeyError: 'up'`、整步判红。
+`PAL` 键是**本仓库自己的字典，本地完全查得到**，所以
+`check_py_syntax.mjs` 现在会从 `common.py` 解析 PAL 的字面量键集合再扫
+所有脚本，键不存在就本地判红（scrna 侧同款检查器，两份逐字节相同）。
+
+> **实现上踩到的坑（值得记）：** 第一版在 `stripComments()` 的结果上扫，
+> 而它把字符串字面量换成 `""` —— `PAL["up"]` 变成 `PAL[""]`，
+> **检查器把要检查的东西本身擦掉了**，负向验证时照样报"通过"。
+> 现在改为在**原始源码**上正则。与 `check_r_syntax` 当年
+> "stripLiterals 擦掉隐式拼接"同一个坑：**新写检查器时，必须用
+> "故意塞一个错"验证它真的会响**（本条已做双向验证：正向绿、错键红）。
+
+**25.2 多面板共享量程时，别给每条 colorbar 挂长 label。** 实测
+`deconvolution_spatial` 给 12 个面板各挂 `"<类型名> (shared scale)"`，
+长类型名（Fibroblastic_reticular_cell）的竖排文字挤进相邻面板 ——
+修共享量程却引入新重叠。共享量程由 suptitle 统一说明，刻度数字足够。
+
