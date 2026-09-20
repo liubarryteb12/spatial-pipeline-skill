@@ -116,6 +116,13 @@ def run_01_qc(cfg: dict) -> dict:
     log_info(f"QC 指标已算（{', '.join(qc_vars)}）；线粒体基因 {n_mt} 个")
 
     # ---- 2. 过滤前的空间图 --------------------------------------------------
+    # **面板标题与 colorbar 都必须是人类可读标签**（评审 3.7/3.5）：
+    # 原先把 obs 列名（total_counts 等）当标题、colorbar 无单位。
+    QC_LABELS = {
+        "total_counts": "Total counts per spot",
+        "n_genes_by_counts": "Genes detected per spot",
+        "pct_counts_mt": "Mitochondrial fraction (%)",
+    }
     fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(58)))
     xy = spatial_xy(adata)
     for ax, key, cmap in zip(axes,
@@ -123,10 +130,11 @@ def run_01_qc(cfg: dict) -> dict:
                              ("viridis", "viridis", "magma")):
         s = ax.scatter(xy[:, 0], xy[:, 1], c=adata.obs[key].astype(float),
                        s=4, cmap=cmap)
-        ax.set_title(key)
+        ax.set_title(QC_LABELS[key])
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
-        fig.colorbar(s, ax=ax, shrink=0.8)
+        fig.colorbar(s, ax=ax, shrink=0.8, pad=0.02, fraction=0.046,
+                     label=QC_LABELS[key])
     fig.suptitle(f"QC metrics on tissue (n={n0})")
     save_fig(cfg, "03-01-01-unit1-qc-metrics-on-tissue", fig)
 
@@ -175,16 +183,21 @@ def run_01_qc(cfg: dict) -> dict:
                  "检查是不是阈值过严，或组织本身就有分离的区域")
 
     # ---- 5. 过滤后的空间图 --------------------------------------------------
+    # **两个面板都要写清"哪个指标 + 已过滤"**（评审 3.8：左面板标题只有
+    # "After filtering (n=4025)" 不含指标名；右面板未标 after，无法与
+    # 过滤前 n=4035 直接对照）。
     fig, axes = plt.subplots(1, 2, figsize=(W_DOUBLE, mm(72)))
     xy = spatial_xy(adata)
     s0 = axes[0].scatter(xy[:, 0], xy[:, 1], c=adata.obs["total_counts"].astype(float),
                          s=5, cmap="viridis")
-    axes[0].set_title(f"After filtering (n={adata.n_obs})")
-    fig.colorbar(s0, ax=axes[0], shrink=0.8)
+    axes[0].set_title(f"Total counts per spot, after filtering (n={adata.n_obs})")
+    fig.colorbar(s0, ax=axes[0], shrink=0.8, pad=0.02, fraction=0.046,
+                 label="Total counts per spot")
     s1 = axes[1].scatter(xy[:, 0], xy[:, 1], c=adata.obs["pct_counts_mt"].astype(float),
                          s=5, cmap="magma")
-    axes[1].set_title("pct_counts_mt")
-    fig.colorbar(s1, ax=axes[1], shrink=0.8)
+    axes[1].set_title(f"Mitochondrial fraction (%), after filtering (n={adata.n_obs})")
+    fig.colorbar(s1, ax=axes[1], shrink=0.8, pad=0.02, fraction=0.046,
+                 label="Mitochondrial fraction (%)")
     for ax in axes:
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])

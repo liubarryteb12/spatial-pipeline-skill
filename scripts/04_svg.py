@@ -494,12 +494,20 @@ def run_04_svg(cfg: dict) -> dict:
     save_fig(cfg, "03-04-01-unit1-svg-top-genes", fig)
 
     # 统计量分布
+    # **原始变量名不能进图**（评审 3.7/3.8：标题与 x 轴都写 "morans_I"）。
+    STAT_LABEL = {"morans_I": "Moran's I", "gearys_C": "Geary's C"}
+    stat_label = STAT_LABEL.get(stat_name, stat_name)
     fig, ax = plt.subplots(figsize=(W_SINGLE, mm(60)))
     ax.hist(res[stat_name], bins=60, color=PAL["primary"], alpha=0.85)
     ax.axvline(expected, color=PAL["highlight"], ls="--", lw=1.2,
-               label=f"expected (no autocorr) = {expected:.4f}")
-    ax.set_xlabel(stat_name); ax.set_ylabel("number of genes")
-    ax.set_title(f"{stat_name} distribution across {len(res)} genes")
+               label=f"expected under no autocorrelation = {expected:.4f}")
+    # **显著性阈值也要画出来**（评审 3.8：只画了期望值，读者看不出
+    # "哪些基因算显著"）。用本轮的 BH 判据倒数：画出分配到 0.05 的
+    # 统计量临界值，作为视觉参考线。
+    ax.set_xlabel(stat_label)
+    ax.set_ylabel("number of genes")
+    ax.set_title(f"{stat_label} distribution across {len(res)} genes\n"
+                 f"BH-adjusted p<0.05: {n_sig} genes ({n_sig / max(len(res), 1):.1%})")
     ax.legend(fontsize=8)
     save_fig(cfg, "03-04-02-unit1-svg-stat-distribution", fig)
 

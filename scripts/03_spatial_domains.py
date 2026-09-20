@@ -528,7 +528,12 @@ def run_03_spatial_domains(cfg: dict) -> dict:
         # scanpy 自己按基因数定尺寸，这里拉回标准双栏宽。
         # 高度 96 mm 是实测值：80 mm 时域标签顶出画布 +4.2%，88 mm 时 +2.6%
         fig.set_size_inches(W_DOUBLE, mm(96))
-        fig.suptitle("Top markers per spatial domain")
+        # **轴语义与归一化口径写在图上**（评审 3.8：y 轴 0–12 无轴标题；
+        # "Mean expression in group" 是否 z-score 未说明）。
+        fig.suptitle("Top markers per spatial domain\n"
+                     "rows = spatial domains; dot size = fraction of spots "
+                     "expressing the gene; colour = mean expression "
+                     "(z-scored per gene)")
         save_fig(cfg, "03-03-02-unit1-domain-markers-dotplot", fig)
 
     # ---- 4b. 域的组织学标签（用 marker 签名打分）----------------------------
@@ -718,11 +723,21 @@ def run_03_spatial_domains(cfg: dict) -> dict:
                 m = cats == u
                 ax.scatter(xy[m, 0], xy[m, 1], s=8, color=cmap(i % 20),
                            label=u, linewidths=0)
+            # **每个面板都要有 domain ID 图例**（评审 3.6：原先两个面板都
+            # 没有颜色→域编号的对照，读者只能看色块猜）。两套方法的域数不同，
+            # 所以各自给一份；域多时两列排。
+            ax.legend(fontsize=5, markerscale=2.0, loc="upper right",
+                      ncol=2 if len(uniq) > 8 else 1, framealpha=0.8,
+                      title="domain", title_fontsize=6)
             ax.set_title(title)
             ax.set_xticks([]); ax.set_yticks([])
         sub = " / ".join(f"{k}: ARI={v['adjusted_rand_index']}"
                          for k, v in method_agree.items())
-        fig_c.suptitle("Named §3.2 methods vs builtin domains\n" + sub)
+        # **不要在图面上引用正文小节号，也不要用内部命名**（评审 3.8：
+        # "Named §3.2 methods vs builtin domains" 里的 §3.2 是正文编号、
+        # "builtin" 是代码内部叫法，读者都无从对应）。
+        fig_c.suptitle("Spatial domain methods compared on the same section\n"
+                       "each panel's legend gives its own domain IDs. " + sub)
         save_fig(cfg, "03-03-04-unit1-domains-method-compare", fig_c)
 
     # ---- 6. 落盘 ------------------------------------------------------------

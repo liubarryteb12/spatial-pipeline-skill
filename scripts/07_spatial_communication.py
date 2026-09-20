@@ -242,16 +242,25 @@ def run_07_spatial_communication(cfg: dict) -> dict:
     xyp = xy * sf
     top3 = lr_df.head(3)
     fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(62)))
+    # **三个 colorbar 必须共享量程**（评审 3.5：原先自动量程 0–12 / 0–5 / 0–6，
+    # 面板间深浅不可比；且无标题无单位）。统一 vmax = 三对联合 p99。
+    _prods = []
+    for r in top3.itertuples():
+        _prods.append(X[:, gi[r.ligand]] * X[:, gi[r.receptor]])
+    vmax_lr = float(np.quantile(np.concatenate(_prods), 0.99))
     for ax, r in zip(axes, top3.itertuples()):
         li, ri_ = gi[r.ligand], gi[r.receptor]
         prod = X[:, li] * X[:, ri_]
-        s = ax.scatter(xyp[:, 0], xyp[:, 1], c=prod, s=4, cmap="viridis")
+        s = ax.scatter(xyp[:, 0], xyp[:, 1], c=prod, s=4, cmap="viridis",
+                       vmin=0, vmax=vmax_lr)
         ax.set_title(f"{r.ligand} × {r.receptor}\nz={r.z_score:.2f}")
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
-        fig.colorbar(s, ax=ax, shrink=0.8)
+        fig.colorbar(s, ax=ax, shrink=0.8, pad=0.02, fraction=0.046,
+                     label="ligand × receptor (log1p expression)")
     fig.suptitle("Top spatially enriched ligand–receptor pairs "
-                 "(product of ligand and receptor expression)")
+                 "(product of ligand and receptor expression)\n"
+                 f"all panels share one colour scale (0 – {vmax_lr:.2f})")
     save_fig(cfg, "03-07-02-unit1-communication-top-pairs-on-tissue", fig)
 
     # ---- 6. 落盘 ------------------------------------------------------------

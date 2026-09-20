@@ -631,17 +631,25 @@ def run_05_deconvolution(cfg: dict) -> dict:
     xy = spatial_xy(adata, sf)
     fig, axes = plt.subplots(nrow, ncol, figsize=(W_DOUBLE, W_DOUBLE * 3.1 * nrow / (3.0 * ncol)))
     axes = np.atleast_1d(axes).ravel()
+    # **12 个 colorbar 必须共享量程**（评审 3.5：原先各自 vmin=0 + 自动 vmax，
+    # 实测量程 0–0.3 / 0–0.6 / 0–0.15 / 0–0.20 四种，面板之间深浅不可比 ——
+    # 同一个"偏黄"在两张图里是两倍差异）。统一 vmax = 全部展示类型
+    # 联合 p99，并给每个 colorbar 一个说明性 label。
+    vmax_shared = float(np.quantile(
+        np.concatenate([prop_df[ct].values for ct in show]), 0.99))
     for ax, ct in zip(axes, show):
         s = ax.scatter(xy[:, 0], xy[:, 1], c=prop_df[ct].values, s=4,
-                       cmap="magma", vmin=0)
+                       cmap="magma", vmin=0, vmax=vmax_shared)
         ax.set_title(f"{ct}\nmean={mean_prop[ct]:.3f}", fontsize=8)
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
-        fig.colorbar(s, ax=ax, shrink=0.75)
+        fig.colorbar(s, ax=ax, shrink=0.75, pad=0.02, fraction=0.046,
+                     label=f"{ct} (shared scale)")
     for ax in axes[len(show):]:
         ax.axis("off")
     fig.suptitle("Deconvolved composition — spatial trends only, "
-                 "absolute values are not cell fractions")
+                 "absolute values are not cell fractions\n"
+                 f"all panels share one colour scale (0 – {vmax_shared:.2f})")
     save_fig(cfg, "03-05-01-unit1-deconvolution-spatial", fig)
 
     # 组成堆叠（按某个域聚合，看域之间的组成差异）

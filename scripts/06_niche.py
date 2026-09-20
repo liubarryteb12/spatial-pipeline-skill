@@ -198,8 +198,12 @@ def run_06_niche(cfg: dict) -> dict:
         piv = ne_ct.pivot(index="type_a", columns="type_b", values="z_score")
         piv = piv.combine_first(piv.T)
         # 宽度夹在 [单栏半, 双栏]，避免类型数多时画出装不进一页的图
+        # **高度公式必须单位一致**（评审 3.9：这一张实测 203.2 mm）：
+        # 原写法 max(5.5, 0.5*len(piv)+2.0) 把英寸当毫米比 ——
+        # 12 个类型给 8.0in = 203 mm，超出常规页面。这里统一为英寸并夹到 5.4"。
+        fig_h = min(max(3.2, 0.30 * len(piv) + 1.6), 5.4)
         fig, ax = plt.subplots(figsize=(min(W_DOUBLE, max(W_ONE_HALF, 0.5 * len(piv) + 2.5)),
-                                        max(5.5, 0.5 * len(piv) + 2.0)))
+                                        fig_h))
         im = ax.imshow(piv.values, cmap="RdBu_r", vmin=-8, vmax=8)
         ax.set_xticks(range(len(piv.columns)))
         ax.set_xticklabels(piv.columns, rotation=45, ha="right", fontsize=7)
@@ -207,7 +211,8 @@ def run_06_niche(cfg: dict) -> dict:
         ax.set_yticklabels(piv.index, fontsize=7)
         ax.set_title("Neighborhood enrichment z-score (cell types)\n"
                      "red = preferentially adjacent, blue = avoid each other")
-        fig.colorbar(im, ax=ax, label="z-score", shrink=0.8)
+        fig.colorbar(im, ax=ax, label="z-score", shrink=0.8, pad=0.02,
+                     fraction=0.046)
         save_fig(cfg, "03-06-01-unit1-niche-enrichment-celltypes", fig)
     else:
         log_warn("没有解卷积产物 —— 跳过细胞类型层面的邻域分析")
