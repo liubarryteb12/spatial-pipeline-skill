@@ -40,8 +40,8 @@ import scipy.sparse as sp  # noqa: E402
 from scipy.sparse.csgraph import connected_components  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, pkg_version, probe_named_tools,
-                    record_step, save_fig, set_seed,
+                    log_warn, named_tools_note, parse_args, pkg_version,
+                    probe_named_tools, record_step, save_fig, set_seed,
                     spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, mm, PAL,)
 
 
@@ -730,7 +730,11 @@ def run_03_spatial_domains(cfg: dict) -> dict:
             "§3.2 点名的三个方法里，**SpaGCN 已实际运行**（结果见 "
             "domain_methods / method_agreement / spagcn_domains.csv）；"
             "STAGATE 与 BayesSpace 未运行，逐条理由见 domain_methods。"
-            "主方法仍是内置的平滑 + Leiden。"),
+            "主方法仍是内置的平滑 + Leiden。\n"
+            # 逐步骤的说明之外，再带上**整轮**的落地边界 ——
+            # 读者只看 domain_status.json 时也能知道 §3.4 的 SpatialDE 跑了，
+            # 不会以为"整份文档点名的工具一个都没跑"。
+            + named_tools_note()),
         "improvement": {
             "neighbor_same_frac_delta": round(
                 m_spat["neighbor_same_frac"] - m_expr["neighbor_same_frac"], 4),

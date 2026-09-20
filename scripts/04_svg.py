@@ -45,8 +45,9 @@ import scanpy as sc  # noqa: E402
 import scipy.sparse as sp  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_SINGLE, mm, PAL,)
+                    log_warn, parse_args, probe_named_tools, record_step,
+                    save_fig, set_seed, spot_radius_plot_units, write_json,
+                    spatial_xy, W_DOUBLE, W_SINGLE, mm, PAL,)
 
 
 def build_weights(adata, n_neighbors: int = 6, row_standardize: bool = True):
@@ -524,6 +525,14 @@ def run_04_svg(cfg: dict) -> dict:
     }
     status["spatialde"] = sd_info
     status["spatialde_vs_morans_i"] = sd_cmp
+    # §3.4 另外两条点名工具：SPARK-X 与 SpatialDE2。**它们不是"没装"** ——
+    # 一个是 R 包（PyPI 上的 `sparkx` 是另一个东西），一个在 PyPI 上 404。
+    # 之前这一步压根没登记它们 —— 于是"§3.4 点名了三个工具"这件事在产物里
+    # 只体现了一个。`probe_named_tools` 的 `only` 过滤会带上完整理由。
+    status["named_tools"] = probe_named_tools(
+        log=log_warn, only=("SPARK-X", "SpatialDE2"))
+    for _t, _i in status["named_tools"].items():
+        log_info(f"  §3.4 {_t}: 未使用（{_i['kind']}）—— {_i['reason'][:70]}")
     write_json(res_dir / "svg_status.json", status)
     return status
 

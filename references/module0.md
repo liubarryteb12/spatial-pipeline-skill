@@ -137,6 +137,7 @@ inputs_missing_required  只有 required=True 的缺失（供验收判 FAIL）
 | §3.3 | RCTD | R 包（`spacexr`） |
 | §3.4 | **SpatialDE** | **真的跑了**（带 scipy 垫片，见 AGENTS 规则 19） |
 | §3.4 | SPARK-X | R 包；PyPI 上的 `sparkx` 是另一个东西 |
+| §3.4 | SpatialDE2 | PyPI **404** —— 没有独立发行版，只能从 GitHub 源码装 |
 | §3.5 | CellChat | R 包 |
 | §3.6 | StPedf / SpaceFlow / ISORT / Stereopy-TGPI / stLearn | 不在 PyPI / 依赖链跑不动 / 名字被顶 |
 
@@ -159,7 +160,7 @@ inputs_missing_required  只有 required=True 的缺失（供验收判 FAIL）
 | kind | 含义 | 本仓库的例子 |
 |---|---|---|
 | `r_package` | R/Bioconductor 包，CI 无 rpy2 | `BayesSpace` `RCTD` `CellChat` `SPARK-X` |
-| `not_on_pypi` | 真包不在 PyPI | `STAGATE` `StPedf` |
+| `not_on_pypi` | 真包不在 PyPI | `STAGATE` `StPedf` `SpatialDE2` |
 | `deps` | PyPI 有真包，依赖链跑不动 | `SpaceFlow` `Stereopy-TGPI` `stLearn` `Bering` `BOMS` |
 | `needs_reference` | **包装得上，缺的是数据** | `cell2location` |
 | `name_taken` | **PyPI 上那个名字是另一个不相干的包** | `ISORT` |

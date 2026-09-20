@@ -27,8 +27,8 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 from common import (capture_versions, ensure_dirs, init_manifest,  # noqa: E402
                     load_config, log_info, log_warn, manifest_path,
-                    manifest_summary, record_human_review, record_input,
-                    record_params, write_json)
+                    manifest_summary, record_decision, record_human_review,
+                    record_input, record_params, write_json)
 
 STEPS = [
     ("fetch", "00_fetch", "run_00_fetch"),
@@ -302,9 +302,10 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
     # 正好把好事判成坏事。
     tool_registry_files = {
         "domain_status.json": ("§3.2 空间域", ("BayesSpace", "STAGATE", "SpaGCN"),
-                               ("domain_methods",)),
+                               (("domain_methods", None),)),
         "deconvolution_status.json": ("§3.3 解卷积", ("RCTD", "cell2location"),
-                                      ("cell2location",)),
+                                      (("cell2location", "cell2location"),)),
+        "svg_status.json": ("§3.4 SVG", ("SPARK-X", "SpatialDE2"), ()),
         "communication_status.json": ("§3.5 空间通讯", ("CellChat",), ()),
         "spatial_trajectory_status.json": ("§3.6 空间轨迹",
                                            ("StPedf", "SpaceFlow", "ISORT",
@@ -326,20 +327,84 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
                 "读者会以为文档点名的方法已经用上了")
             continue
         registry = dict(nt)
-        for k in extra_keys:
-            if isinstance(d.get(k), dict):
-                registry.update(d[k])
+        for k, as_tool in extra_keys:
+            v = d.get(k)
+            if not isinstance(v, dict) or not v:
+                continue
+            if as_tool is None:
+                # 本身就是 {工具名: 信息} 的表。**只接受值是 dict 的项** ——
+                # 上游改形状时宁可少合并，也不要塞进字符串把验收炸掉
+                registry.update({t: i for t, i in v.items()
+                                 if isinstance(i, dict)})
+            else:
+                registry[as_tool] = v
         missing = [t for t in expect if t not in registry]
         # 未使用必须有 reason；使用了必须有 used=True —— 两者都没有 = 没说清
         unexplained = [t for t, i in registry.items()
-                       if not (i or {}).get("reason") and not (i or {}).get("used")]
-        n_used = sum(1 for i in registry.values() if (i or {}).get("used"))
+                       if isinstance(i, dict)
+                       and not i.get("reason") and not i.get("used")]
+        n_used = sum(1 for i in registry.values()
+                     if isinstance(i, dict) and i.get("used"))
         chk(f"named_tools:{f}", "honesty",
             not missing and not unexplained,
             (f"{section}：{len(registry)} 个点名工具已登记，"
              f"其中 {n_used} 个实际产出了结果"
              if not missing and not unexplained else
              f"缺登记 {missing}；既没说 used 也没写理由 {unexplained}"))
+
+    # ---- §0.4 Agent 决策链：点名工具到底落地了几个 --------------------------
+    #
+    # **决策链不是日志。** 日志会随 CI 滚动消失，而"这一轮文档点名的
+    # §3.2–§3.6 工具，哪些真跑了、哪些是回退"是**结论的适用范围** ——
+    # 半年后拿到 domain_status.json 的人必须能直接看到，
+    # 而不是去翻几十个 JSON 自己数。
+    #
+    # 放在验收里而不是 run_steps 里：只有这里才把 named_tools 与各步的
+    # domain_methods / cell2location / spatialde **合并**过，
+    # 早写会漏掉"实际跑了"的工具。
+    try:
+        _tools, _used = {}, []
+        for f, (_sec, _exp, extra_keys) in tool_registry_files.items():
+            _p = res_dir / f
+            if not _p.exists():
+                continue
+            _d = json.loads(_p.read_text(encoding="utf-8"))
+            _reg = dict(_d.get("named_tools") or {})
+            for _k, _as_tool in extra_keys:
+                _v = _d.get(_k)
+                if not isinstance(_v, dict) or not _v:
+                    continue
+                # 和上面同一条规则：`None` 是"工具名 -> 信息"的表，
+                # 否则是**一个**工具的信息（整个挂到它名下）。混着 update
+                # 会把字段名当成工具名，值还是字符串。
+                if _as_tool is None:
+                    _reg.update({t: i for t, i in _v.items()
+                                 if isinstance(i, dict)})
+                else:
+                    _reg[_as_tool] = _v
+            for _t, _i in _reg.items():
+                if not isinstance(_i, dict):
+                    continue
+                _tools[_t] = _i
+                if _i.get("used"):
+                    _used.append(f"{_t}（{_sec}）")
+        _n = len(_tools)
+        record_decision(
+            cfg, "named_tools",
+            "文档 §3.2–§3.6 点名的空间方法，哪些真的产出了结果？",
+            (f"登记 {_n} 个；实际产出结果的是 {sorted(_used) or '无'}"
+             if _used else
+             f"登记 {_n} 个，**本轮没有一个点名工具产出结果** —— "
+             "全部回退到内置实现"),
+            evidence=("逐条理由写在各步状态 JSON 的 named_tools / "
+                      "domain_methods / cell2location / spatialde 里；"
+                      "SpaGCN 是 §3.2 唯一能真跑的点名工具（init=\"kmeans\"），"
+                      "cell2location 属 needs_reference（缺参考，不是装不上）"))
+        log_info(f"决策链已登记：点名工具 {_n} 个，"
+                 f"实际产出结果的 {len(_used)} 个")
+    except Exception as e:  # noqa: BLE001
+        # 决策链写不进去不该让验收崩 —— 但必须可见
+        log_warn(f"决策链登记失败（不影响其余验收）：{type(e).__name__}: {e}")
 
     # ---- honesty: §3.2 跑了点名工具就必须量化它与主方法的一致性 --------------
     #

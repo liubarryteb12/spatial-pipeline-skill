@@ -293,6 +293,14 @@ NAMED_TOOLS = {
                 "配上 `reference: h5ad` + `celltype_key` 就会走它"),
     ),
     # ---- §3.4 空间可变基因 --------------------------------------------------
+    "SpatialDE2": dict(
+        kind="not_on_pypi", section="§3.4",
+        reason=("PyPI 上 **404**（实测 `https://pypi.org/pypi/SpatialDE2/json`）—— "
+                "它是 SpatialDE 的继任实现，没有独立发行版，"
+                "代码在 GitHub 仓库里（`Teichlab/SpatialDE` 的 `SpatialDE2` 分支/"
+                "包内子模块），只能从源码装。本仓库用的是 **SpatialDE 1.1.3**"
+                "（PyPI 有 wheel），所以 §3.4 的落地工具是前者不是后者"),
+    ),
     "SPARK-X": dict(
         kind="r_package", section="§3.4",
         reason=("SPARK-X 是 R 包（xzhoulab/SPARK），PyPI 上无同名包。"
@@ -385,6 +393,7 @@ def probe_named_tools(log=None, only=None) -> dict:
         "cell2location": "cell2location", "Bering": "Bering", "BOMS": "boms",
         "ISORT": "isort", "STAGATE": "STAGATE", "BayesSpace": None,
         "RCTD": None, "CellChat": None, "StPedf": None, "SPARK-X": None,
+        "SpatialDE2": None,
         "Stereopy-TGPI": "stereopy",
     }
     out = {}
@@ -421,10 +430,13 @@ def named_tools_note() -> str:
             "在当前 CPU CI 上跑不动，要么缺的是数据而不是包"
             "（cell2location 需要带标签的 scRNA 参考），"
             "要么 **PyPI 上那个名字是另一个不相干的包**。"
-            "**例外：SpaGCN 已经真的跑了**（`init=\"kmeans\"` 绕开了 louvain 的"
-            "py3.12 编译链）—— 它的状态在 `domain_status.json` 的 "
-            "`domain_methods` 里，不在缺口登记里。逐条理由见各步状态 JSON 的 "
-            "`named_tools` / `domain_methods` 字段。")
+            "**两个例外，它们真的跑了：**"
+            "SpaGCN（§3.2，`init=\"kmeans\"` 绕开了 louvain 的 py3.12 编译链，"
+            "状态在 `domain_status.json` 的 `domain_methods` 里）和 "
+            "SpatialDE（§3.4，带 scipy `misc.derivative` 垫片，"
+            "状态在 `svg_status.json` 的 `spatialde` 里）—— "
+            "两者都不在缺口登记里，因为缺口登记记的是**用不了**的工具。"
+            "逐条理由见各步状态 JSON 的 `named_tools` / `domain_methods` 字段。")
 
 
 
