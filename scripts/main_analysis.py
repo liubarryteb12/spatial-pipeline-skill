@@ -726,6 +726,16 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         # 要么 `cross_language` 非空，要么决策链里有一条说明为什么空不了。
         # 这样将来真的加了跨语言步骤而忘了记，这条会立刻变红。
         #
+        # **但"有解释"这一半有个洞，这一轮补上了。** 原来的判据是
+        # `_cl > 0 or "cross_language" in _dec_nodes` —— 只要决策链里
+        # 有那条"本轮没有交接"的说明就通过。问题是：**配置成
+        # `deconvolution.reference: h5ad` 时交接真的发生了**
+        # （Part 2 的带标签 h5ad 是跨部分来的），而那条"没有交接"的
+        # 说明如果还在，检查照样绿 —— **解释成了免检牌**。
+        #
+        # 所以先看配置说了什么：**配置要求了跨部分参考，就必须有真实记录**，
+        # 不接受解释。只有没要求时才允许用解释说明"空是设计如此"。
+        #
         # **读全量清单而不是 `msum`** —— `manifest_summary()` 只给
         # `n_decisions` 这个计数，看不到节点名（和 scrna 那边同一个写法）。
         #
@@ -737,14 +747,26 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         _cl = msum.get("n_cross_language", 0)
         _full = read_manifest(cfg)
         _dec_nodes = {d.get("node") for d in (_full.get("decisions") or [])}
-        chk("manifest:cross_language", "honesty",
-            _cl > 0 or "cross_language" in _dec_nodes,
-            (f"{_cl} 条跨语言转换记录"
-             if _cl else
-             ("0 条，**但决策链里已说明本仓库不涉及跨语言转换**"
-              if "cross_language" in _dec_nodes else
-              "**0 条且没有任何解释** —— 读者无法区分"
-              "『本来就没有』和『忘了记』")))
+        _dec_ref = str((cfg.get("deconvolution") or {}).get("reference", "builtin"))
+        # 配置要求了 Part 2 的参考 → 必须有真实记录，解释不算
+        _needs_real = _dec_ref == "h5ad"
+        if _needs_real:
+            _ok = _cl > 0
+            _detail = (f"{_cl} 条交接记录（配置 reference=h5ad，**必须有真实记录**）"
+                       if _ok else
+                       "**配置了 `deconvolution.reference: h5ad` 却一条交接记录"
+                       "都没有** —— Part 2 的参考确实跨了部分边界，"
+                       "**不接受『本轮没有交接』的解释**")
+        else:
+            _ok = _cl > 0 or "cross_language" in _dec_nodes
+            _detail = (f"{_cl} 条跨部分交接记录"
+                       if _cl else
+                       ("0 条，**但决策链里已说明本轮没有跨部分交接**"
+                        f"（`reference: {_dec_ref}` 用的是本仓库的 marker 签名）"
+                        if "cross_language" in _dec_nodes else
+                        "**0 条且没有任何解释** —— 读者无法区分"
+                        "『本来就没有』和『忘了记』"))
+        chk("manifest:cross_language", "honesty", _ok, _detail)
 
     n_req_fail = sum(1 for c in checks
                      if not c["passed"] and c["severity"] == "required")

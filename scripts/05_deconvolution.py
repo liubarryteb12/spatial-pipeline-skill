@@ -44,7 +44,8 @@ from scipy.optimize import nnls  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, pkg_version, probe_named_tools,
-                    record_step, save_fig, set_seed,
+                    record_cross_language, record_decision, record_step,
+                    save_fig, set_seed,
                     spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm,)
 
 
@@ -351,6 +352,15 @@ def run_05_deconvolution(cfg: dict) -> dict:
     }
 
     if mode == "none":
+        # §0.2：`cross_language` 会是空的 —— **必须解释为什么空**，
+        # 否则空数组和"忘了记"长得一模一样（两个 Python 仓库都踩过）。
+        record_decision(
+            cfg, "cross_language",
+            "§0.2 跨部分交接：这一轮有没有 Part 2 → Part 3 的单细胞参考？",
+            "**没有。** 配置里 `deconvolution.reference = none` —— "
+            "本轮不做解卷积，因此也不需要 Part 2 的参考 h5ad",
+            evidence="deconvolution_status.json 的 status=not_done",
+        )
         status.update({"status": "not_done",
                        "cell2location": c2l_info,
                        "reason": "配置 deconvolution.reference=none —— "
@@ -358,6 +368,22 @@ def run_05_deconvolution(cfg: dict) -> dict:
         write_json(res_dir / "deconvolution_status.json", status)
         log_warn(status["reason"])
         return status
+
+    if mode != "h5ad":
+        # `builtin` 走的是本仓库自己的 `assets/reference_signatures.yml`
+        # （marker 签名），**不是另一个部分的产物**。所以这一轮
+        # `cross_language` 为空是设计如此，不是遗漏。
+        record_decision(
+            cfg, "cross_language",
+            "§0.2 跨部分交接：这一轮有没有 Part 2 → Part 3 的单细胞参考？",
+            f"**没有。** 配置里 `deconvolution.reference = '{mode}'` —— "
+            f"参考来自本仓库的 `assets/reference_signatures.yml`"
+            f"（marker 签名），不是 Part 2 导出的 h5ad。"
+            f"**所以 `cross_language` 为空是设计如此，不是遗漏**；"
+            f"真正的解卷积需要 `reference: h5ad` + `celltype_key`",
+            evidence=(f"deconvolution.reference='{mode}'；"
+                      f"参考文件 assets/reference_signatures.yml 在本仓库内"),
+        )
 
     adata = sc.read_h5ad(data_dir / "domains.h5ad")
 
@@ -408,7 +434,33 @@ def run_05_deconvolution(cfg: dict) -> dict:
         ref = sc.read_h5ad(ref_path)
         if ct_key not in ref.obs.columns:
             raise KeyError(f"参考数据的 obs 里没有 '{ct_key}'")
-        R = ref.layers["counts"] if "counts" in ref.layers else ref.X
+
+        # ---- §0.2 跨部分交接：这一份参考是 **Part 2 的产物** ----------------
+        #
+        # `deconvolution.reference: h5ad` 不是"本仓库内的一个文件" ——
+        # 它按约定是 Part 2 导出的带细胞类型标签的单细胞 h5ad
+        # （Part 2 产物 `clustered.h5ad`，落在它的 data_dir 下，
+        # obs 里有细胞类型列）。
+        # 所以这一处**必须**走 `record_cross_language`：
+        # 不记的话，清单里 `cross_language` 是空的，而空数组和
+        # "这一轮没有跨部分交接"长得一模一样。
+        #
+        # `before` 记 Part 2 那边有什么，`after` 记本步骤真正用上了什么，
+        # `lost_fields` 记**没有跟过来**的东西。这三样缺一不可：
+        # 只记 "n_genes" 的话，读者不知道参考里的 embedding、
+        # 其他 obs 列、以及 HVG 限制都丢了。
+        _ref_layers = sorted(ref.layers.keys())
+        _ref_obsm = sorted(ref.obsm.keys())
+        # **计数层是硬要求，不是偏好。** NNLS 解的是线性混合
+        # `spot = Σ 比例 × 签名`，log 变换破坏线性关系（见文件头）。
+        # 所以参考谱必须来自原始计数 —— 拿 log 值平均出来的"签名"
+        # 解出的比例没有意义，**而它看起来仍然像一组比例**。
+        _has_counts = "counts" in ref.layers
+        if not _has_counts:
+            log_warn("参考 h5ad 里没有 layers['counts']，退回用 .X —— "
+                     "如果 .X 是 log 后的值，解出的比例没有意义。"
+                     "Part 2 的 clustered.h5ad 带 counts 层，优先用它")
+        R = ref.layers["counts"] if _has_counts else ref.X
         R = R.toarray() if sp.issparse(R) else np.asarray(R)
         R = R.astype(np.float64)
         common = [g for g in genes if g in set(ref.var_names)]
@@ -428,8 +480,59 @@ def run_05_deconvolution(cfg: dict) -> dict:
                     for t in types}
         ref_desc = {"kind": "scrna_reference", "path": str(ref_path),
                     "celltype_key": ct_key, "n_common_genes": len(common),
-                    "is_deconvolution": True}
-        log_info(f"用 scRNA-seq 参考：{len(types)} 种类型，{len(common)} 个共同基因")
+                    "is_deconvolution": True,
+                    # 记下**用的是计数层还是退回 .X** —— 不记的话，
+                    # "退回 log 值"这个错误前提会一路静默到比例上
+                    "used_counts_layer": _has_counts,
+                    "matrix_source": "layers['counts']" if _has_counts else ".X",
+                    "n_cells_in_reference": int(ref.n_obs),
+                    "n_genes_in_reference": int(ref.n_vars)}
+        log_info(f"用 scRNA-seq 参考：{len(types)} 种类型，{len(common)} 个共同基因"
+                 + ("" if _has_counts else "（**无 counts 层，退回 .X**）"))
+
+        # 交接日志。`record_cross_language` 在 common.py 里定义，
+        # 记的是"数据跨过仓库边界时前后各是什么形状、丢了什么"。
+        record_cross_language(
+            cfg,
+            src=f"Part 2 (Python) {Path(ref_path).name}",
+            dst="05_deconvolution 参考谱 S（类型 × 共同基因）",
+            fmt="h5ad",
+            before={
+                "n_cells": int(ref.n_obs),
+                "n_genes": int(ref.n_vars),
+                "obs_columns": sorted(ref.obs.columns.tolist()),
+                "layers": _ref_layers,
+                "obsm": _ref_obsm,
+            },
+            after={
+                "n_types": len(types),
+                "n_common_genes": len(common),
+                "n_spots_deconvolved": int(C.shape[0]),
+                "celltype_key": ct_key,
+                "used_counts_layer": _has_counts,
+            },
+            lost=(
+                # 参考里没跟过来的东西。**逐条列出来**，不要只说"丢了一些字段"
+                [c for c in sorted(ref.obs.columns.tolist()) if c != ct_key]
+                + [f"layers['{k}']" for k in _ref_layers if k != "counts"]
+                + [f"obsm['{k}']" for k in _ref_obsm]
+                # 基因交集是**交集**，不是全部：参考若是 HVG 子集，
+                # 这里就丢掉了非 HVG 的基因。这一条最容易被忽略，
+                # 而它直接决定参考谱覆盖多少基因
+                + ([f"非共同基因 {int(ref.n_vars) - len(common)} 个"
+                    f"（参考 {int(ref.n_vars)} → 共同 {len(common)}）"]
+                   if int(ref.n_vars) != len(common) else [])
+                + ([] if _has_counts
+                   else ["**参考没有 counts 层，退回 .X** —— "
+                         "若 .X 是 log 值，参考谱不是计数谱"])
+            ),
+            note=("Part 2 → Part 3 的单细胞参考交接。Part 2 侧的产出物是 "
+                  "`clustered.h5ad`（落在它的 data_dir 下，obs 里有"
+                  "细胞类型列、带 `layers['counts']`）。"
+                  "**本仓库只用到计数矩阵与细胞类型标签两样**，"
+                  "参考里的 embedding / 其他 obs 列 / 非 counts 的层"
+                  "都不参与计算 —— 已逐条列进 lost_fields。"),
+        )
 
         scale = C.sum(axis=1, keepdims=True)
         scale[scale == 0] = 1.0
