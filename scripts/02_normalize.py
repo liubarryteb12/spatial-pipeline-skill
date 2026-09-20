@@ -88,7 +88,7 @@ def run_02_normalize(cfg: dict) -> dict:
     sc.pl.highly_variable_genes(adata, show=False)
     fig = plt.gcf()
     fig.suptitle(f"HVG ({hvg_flavor_used}, n={n_hvg})")
-    save_fig(cfg, "hvg_selection", fig)
+    save_fig(cfg, "03-02-01-unit1-hvg-selection", fig)
 
     # ---- 2. PCA -------------------------------------------------------------
     work = adata[:, adata.var["highly_variable"]].copy()
@@ -122,7 +122,7 @@ def run_02_normalize(cfg: dict) -> dict:
     ax.set_xticks(ticks)
     ax.set_xticklabels([f"PC{i}" for i in ticks])
     ax.grid(axis="y", alpha=0.25, linewidth=0.5)
-    save_fig(cfg, "pca_variance_ratio", fig)
+    save_fig(cfg, "03-02-02-unit1-pca-variance-ratio", fig)
     log_info(f"PCA 方差比图: 标出 {len(ticks)} 个刻度（共 {n_pc} 个 PC）")
 
     var_ratio = work.uns["pca"]["variance_ratio"]
@@ -144,7 +144,7 @@ def run_02_normalize(cfg: dict) -> dict:
         fig.colorbar(s, ax=ax, shrink=0.8)
     fig.suptitle("PC scores on tissue — spatial structure means PCs capture "
                  "histology, not just noise")
-    save_fig(cfg, "pca_on_tissue", fig)
+    save_fig(cfg, "03-02-03-unit1-pca-on-tissue", fig)
 
     # ---- 3. 落盘 ------------------------------------------------------------
     out = data_dir / "normalized.h5ad"

@@ -219,7 +219,7 @@ def run_07_spatial_communication(cfg: dict) -> dict:
     ax.set_title(f"Ligand–receptor spatial enrichment\n"
                  f"{len(usable)}/{len(pairs)} pairs usable; "
                  f"|z|>2 dashed")
-    save_fig(cfg, "communication_lr_enrichment", fig)
+    save_fig(cfg, "03-07-01-unit1-communication-lr-enrichment", fig)
 
     # 空间表达图：top 3 对
     sf = float(adata.uns["spatial"][list(adata.uns["spatial"])[0]]
@@ -237,7 +237,7 @@ def run_07_spatial_communication(cfg: dict) -> dict:
         fig.colorbar(s, ax=ax, shrink=0.8)
     fig.suptitle("Top spatially enriched ligand–receptor pairs "
                  "(product of ligand and receptor expression)")
-    save_fig(cfg, "communication_top_pairs_on_tissue", fig)
+    save_fig(cfg, "03-07-02-unit1-communication-top-pairs-on-tissue", fig)
 
     # ---- 6. 落盘 ------------------------------------------------------------
     status = {

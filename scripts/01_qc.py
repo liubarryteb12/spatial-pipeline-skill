@@ -128,7 +128,7 @@ def run_01_qc(cfg: dict) -> dict:
         ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(s, ax=ax, shrink=0.8)
     fig.suptitle(f"QC metrics on tissue (n={n0})")
-    save_fig(cfg, "qc_metrics_on_tissue", fig)
+    save_fig(cfg, "03-01-01-unit1-qc-metrics-on-tissue", fig)
 
     # ---- 3. 过滤 ------------------------------------------------------------
     q = cfg["qc"]
@@ -188,7 +188,7 @@ def run_01_qc(cfg: dict) -> dict:
     for ax in axes:
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
-    save_fig(cfg, "qc_on_tissue_after", fig)
+    save_fig(cfg, "03-01-02-unit1-qc-on-tissue-after", fig)
 
     # ---- 6. 落盘 ------------------------------------------------------------
     out = data_dir / "qc_filtered.h5ad"

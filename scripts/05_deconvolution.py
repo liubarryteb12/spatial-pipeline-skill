@@ -642,7 +642,7 @@ def run_05_deconvolution(cfg: dict) -> dict:
         ax.axis("off")
     fig.suptitle("Deconvolved composition — spatial trends only, "
                  "absolute values are not cell fractions")
-    save_fig(cfg, "deconvolution_spatial", fig)
+    save_fig(cfg, "03-05-01-unit1-deconvolution-spatial", fig)
 
     # 组成堆叠（按某个域聚合，看域之间的组成差异）
     if "domain" in adata.obs.columns:
@@ -660,7 +660,7 @@ def run_05_deconvolution(cfg: dict) -> dict:
         ax.set_xlabel("spatial domain"); ax.set_ylabel("mean relative weight")
         ax.set_title("Composition per spatial domain")
         ax.legend(fontsize=6, ncol=2, loc="center left", bbox_to_anchor=(1.0, 0.5))
-        save_fig(cfg, "deconvolution_by_domain", fig)
+        save_fig(cfg, "03-05-02-unit1-deconvolution-by-domain", fig)
         by_dom.to_csv(res_dir / "deconvolution_by_domain.csv")
 
     # ---- 5. 重建误差的空间分布（只有解卷积才有）----------------------------
@@ -672,7 +672,7 @@ def run_05_deconvolution(cfg: dict) -> dict:
         ax.set_title(f"Reconstruction error (median {np.nanmedian(errors):.3f})\n"
                      f"high = signature set cannot explain this spot")
         fig.colorbar(s, ax=ax, shrink=0.8, label="relative error")
-        save_fig(cfg, "deconvolution_error_map", fig)
+        save_fig(cfg, "03-05-03-unit1-deconvolution-error-map", fig)
 
     # ---- 6. 落盘 ------------------------------------------------------------
     is_deconv = bool(ref_desc.get("is_deconvolution"))

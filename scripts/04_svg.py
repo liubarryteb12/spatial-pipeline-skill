@@ -471,7 +471,7 @@ def run_04_svg(cfg: dict) -> dict:
         ax.axis("off")
     fig.suptitle(f"Top {len(top_genes)} spatially variable genes "
                  f"({stat_name}, BH p<0.05: {n_sig})")
-    save_fig(cfg, "svg_top_genes", fig)
+    save_fig(cfg, "03-04-01-unit1-svg-top-genes", fig)
 
     # 统计量分布
     fig, ax = plt.subplots(figsize=(W_SINGLE, mm(60)))
@@ -481,7 +481,7 @@ def run_04_svg(cfg: dict) -> dict:
     ax.set_xlabel(stat_name); ax.set_ylabel("number of genes")
     ax.set_title(f"{stat_name} distribution across {len(res)} genes")
     ax.legend(fontsize=8)
-    save_fig(cfg, "svg_stat_distribution", fig)
+    save_fig(cfg, "03-04-02-unit1-svg-stat-distribution", fig)
 
     # ---- 7. SpatialDE 交叉验证（文档 §3.4）---------------------------------
     # 用 array 坐标（不缩放）：SpatialDE 估的是长度尺度，坐标等比缩放

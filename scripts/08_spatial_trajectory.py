@@ -263,7 +263,7 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
     for ax in axes:
         ax.set_xlabel("x (fullres px)"); ax.set_ylabel("y (fullres px)")
         ax.set_aspect("equal")
-    save_fig(cfg, "spatial_pseudotime_maps", fig)
+    save_fig(cfg, "03-08-01-unit1-spatial-pseudotime-maps", fig)
 
     fig, axes = plt.subplots(1, 2, figsize=(W_DOUBLE, mm(64)))
     axes[0].hist(expr_pt, bins=40, alpha=0.65, label="expression-only", color="#B2182B")
@@ -275,7 +275,7 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
     axes[1].set_xlabel("expression-only pseudotime")
     axes[1].set_ylabel("spatially-smoothed pseudotime")
     axes[1].set_title(f"Spearman rho = {rho_two:+.3f}")
-    save_fig(cfg, "spatial_pseudotime_compare", fig)
+    save_fig(cfg, "03-08-02-unit1-spatial-pseudotime-compare", fig)
 
     # ---- 9. 状态 -----------------------------------------------------------
     improved = I_spatial > I_expr

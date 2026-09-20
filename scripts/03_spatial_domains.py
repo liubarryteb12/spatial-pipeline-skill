@@ -487,7 +487,7 @@ def run_03_spatial_domains(cfg: dict) -> dict:
     axes[1].set_xlabel("smoothing strength α")
     axes[1].set_ylabel("number of domains")
     axes[1].set_title("Domain count vs smoothing")
-    save_fig(cfg, "smoothing_scan", fig)
+    save_fig(cfg, "03-03-01-unit1-smoothing-scan", fig)
 
     # ---- 3. 分辨率扫描 ------------------------------------------------------
     rscan = []
@@ -529,7 +529,7 @@ def run_03_spatial_domains(cfg: dict) -> dict:
         # 高度 96 mm 是实测值：80 mm 时域标签顶出画布 +4.2%，88 mm 时 +2.6%
         fig.set_size_inches(W_DOUBLE, mm(96))
         fig.suptitle("Top markers per spatial domain")
-        save_fig(cfg, "domain_markers_dotplot", fig)
+        save_fig(cfg, "03-03-02-unit1-domain-markers-dotplot", fig)
 
     # ---- 4b. 域的组织学标签（用 marker 签名打分）----------------------------
     # **这不是"域 = 某一种细胞"。** Visium 的 spot 含 1-10 个细胞，
@@ -693,7 +693,7 @@ def run_03_spatial_domains(cfg: dict) -> dict:
     # 部分直接裁掉。_content_overflow() 就是靠这条抓到的。
     fig.suptitle("Spatial domains overlaid on H&E\n"
                  "(the only way to judge whether domains match real histology)")
-    save_fig(cfg, "domains_on_he", fig)
+    save_fig(cfg, "03-03-03-unit1-domains-on-he", fig)
 
     # ---- 5b. 方法对照图（只在点名方法真的跑了时才画）------------------------
     #
@@ -723,7 +723,7 @@ def run_03_spatial_domains(cfg: dict) -> dict:
         sub = " / ".join(f"{k}: ARI={v['adjusted_rand_index']}"
                          for k, v in method_agree.items())
         fig_c.suptitle("Named §3.2 methods vs builtin domains\n" + sub)
-        save_fig(cfg, "domains_method_compare", fig_c)
+        save_fig(cfg, "03-03-04-unit1-domains-method-compare", fig_c)
 
     # ---- 6. 落盘 ------------------------------------------------------------
     adata.obs[["domain", "domain_expr_only"]].to_csv(res_dir / "spatial_domains.csv")

@@ -184,6 +184,13 @@ jobs:
       - name: 检查图不是空白
         run: node tools/check_figures.mjs results/lymph_node/figures
 
+      # 出图名必须与代码阶段对应：`<阶段>-<模块>-<图>-unit<单元>-<名称>`。
+      # **图名和脚本序号是两处，而"图名里的模块号写错了"没有任何东西能发现** ——
+      # 图照样生成、CI 照样绿、验收照样过，只是读者按图名去 `scripts/` 里找
+      # 对应代码时会找错文件。这正是"两处定义必然分叉"那一类。
+      - name: 检查出图名与代码阶段对应
+        run: node tools/check_fig_names.mjs
+
       # 图幅（毫米）是否符合栏宽约定（规则 15）。
       # 上一步只看"有没有墨"，看不出图**有多宽** ——
       # 实测规则 15 记的那张 370 mm 的 `domain_markers_dotplot`，

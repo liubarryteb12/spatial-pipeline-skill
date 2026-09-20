@@ -208,7 +208,7 @@ def run_06_niche(cfg: dict) -> dict:
         ax.set_title("Neighborhood enrichment z-score (cell types)\n"
                      "red = preferentially adjacent, blue = avoid each other")
         fig.colorbar(im, ax=ax, label="z-score", shrink=0.8)
-        save_fig(cfg, "niche_enrichment_celltypes", fig)
+        save_fig(cfg, "03-06-01-unit1-niche-enrichment-celltypes", fig)
     else:
         log_warn("没有解卷积产物 —— 跳过细胞类型层面的邻域分析")
 
@@ -238,7 +238,7 @@ def run_06_niche(cfg: dict) -> dict:
             ax.set_ylabel("fraction of neighbors")
             ax.set_title(f"around domain {core_t}")
             ax.legend(fontsize=6, ncol=2)
-        save_fig(cfg, "niche_cooccurrence", fig)
+        save_fig(cfg, "03-06-02-unit1-niche-cooccurrence", fig)
 
     # ---- 4. 落盘 ------------------------------------------------------------
     status = {
