@@ -69,7 +69,12 @@
 
 - `neighbor_same_frac`：相邻 spot 同域比例。**必须与
   `random_baseline_same_frac`（Σ 域占比²）比较才有意义。**
-  实测：不平滑 0.536 vs 基线 0.133；平滑后 0.672 vs 0.099。
+  实测：不平滑 11 域 / `0.507` vs 基线 `0.111`；平滑后 13 域 /
+  `0.668` vs `0.099`。
+
+  > **这两个数改过。** 早期版本是"不平滑 9 域 / 0.536 vs 0.133；
+  > 平滑后 0.672"。**文档里写死的数值一定会过时**（见规则 21.3）——
+  > 引用前先看 `domain_status.json`，不要从文档抄。
 
 **`fragmented_domains` 高不等于聚类失败。** 淋巴结的滤泡、肿瘤的癌巢
 本身就是散布的多个斑块 —— 同一个域出现在多个不相邻位置是生物学事实。
@@ -338,3 +343,102 @@ ARI 是主判据（对域编号置换免疫）；`same_label_frac` 只作参考 
 **把 `named_tools` 与 `domain_methods` 合并**再比对点名的工具名单 ——
 只认 `named_tools` 会把"已经跑了的工具"报成"缺登记"，
 **正好把好事判成坏事**。
+
+### 按步检查查不出"整段没登记"——要再做一次全局清点
+
+上面那条是**按步**查的：每个状态文件声明自己负责哪几个工具，检查它们在不在。
+它查不出"**没有任何一步声明过某个工具**"。
+
+实测踩到：`Bering` 与 `BOMS` 的 `section` 是 **§3.1**，而 §3.1 对应的步骤
+（`01_qc` / `02_normalize`）**没有 `named_tools` 字段** —— 于是这两个工具
+只活在 `common.NAMED_TOOLS` 这个 Python 常量里，**任何产物里都看不到它们**。
+按步检查全部通过。
+
+**这是"缺口没登记"最隐蔽的形态：不是登记错了，是根本没登记，
+而验收看起来是绿的。**
+
+所以 `main_analysis.py` 另有三条：
+
+| 检查 | 判据 |
+|---|---|
+| `honesty:named_tools_registry` | `NAMED_TOOLS` 每条都有 `kind` 与 `reason` |
+| `honesty:named_tools_never_probed` | 清点哪些工具**没有任何一步探测过**（可见，不判失败）|
+| （落盘） | 全表探测结果写进清单 `params.named_tools_probe` |
+
+第三条不能省：前两条只是 CI 日志里的两行，**日志会滚掉，清单不会**。
+不加 `only=` 过滤 —— 全局清点过滤掉谁都会漏。
+
+---
+
+## 21. `set_seed()` 不 seed torch，而第三方工具的随机性可能在 torch 里
+
+姊妹项目 `scrna-pipeline-skill/AGENTS.md` 规则 20 记了同一类问题的另一面
+（那边是 `pynndescent` 的 Numba 并行）。空间这边实测踩到的是 **torch**。
+
+**证据（四轮 CI，同一份代码、同一批包版本，只改并行度设置）：**
+
+| run | 并行度设置 | SpaGCN vs 内置 ARI | NMI |
+|---|---|---|---|
+| 35488906157 | 无钉 | 0.3734 | 0.5535 |
+| 35489064432 | +OMP/OPENBLAS/MKL + CORETYPE | 0.3784 | 0.5557 |
+| 35489172104 | 同上 | 0.3639 | 0.5310 |
+| 35489534090 | +`NUMBA_NUM_THREADS=1` | 0.4216 | 0.5762 |
+
+**四轮四个值，钉 BLAS 和钉 Numba 都没用 —— 因为变量根本不在这里。**
+
+而同一四轮里，**主方法的数全部逐位相同**：Moran's I（空间平滑后）
+`0.7670`、域数 `13`、不平滑邻居同域率 `0.507`、平滑后 `0.668`。
+
+**"某个量在变"不等于"所有量都在变"** —— 先看哪些**没**变，
+范围一下就缩小了。这一步比"设了种子"有用得多。
+
+### 21.1 根因：`set_seed()` 少 seed 了一个 RNG
+
+```python
+def set_seed(cfg):
+    random.seed(seed)
+    np.random.seed(seed)      # <-- 没有 torch.manual_seed(seed)
+    apply_style(cfg)
+```
+
+而 SpaGCN 1.2.7 的两处随机源：
+
+1. `models.py:55` `KMeans(self.n_clusters, n_init=20)` —— **没有
+   `random_state`**，走全局 numpy 遗留 RNG；
+2. `train()` 训练 GCN 走 **torch**（权重初始化 + dropout）——
+   `set_seed()` 从来没 seed 过它。
+
+**SpaGCN 自己知道要 seed。** `util.search_res()` 与
+`ez_mode.detect_spatial_domains_ez_mode()` 开头都有
+
+```python
+random.seed(r_seed); torch.manual_seed(t_seed); np.random.seed(n_seed)
+```
+
+**但本仓库走的是 `init="kmeans"` + 外部给定 `n_clusters` 那条路**
+（规则 20 为了绕开 louvain 的 py3.12 编译链选的），两个函数都不经过 ——
+**它的 seeding 全部被跳过。**
+
+### 21.2 处理
+
+在 `clf.train()` 之前**照抄 SpaGCN 自己的做法**把三个全局 RNG 钉死：
+
+```python
+random.seed(seed); np.random.seed(seed)
+torch.manual_seed(seed); torch.set_num_threads(1)
+```
+
+并把结果记进 `domain_methods.SpaGCN.seeded_before_train` ——
+**没有 torch 时要如实记 `torch_seeded: False`，不能假装 seed 成功。**
+
+**效果待下一轮 CI 确认**（这次不提前声称已修复）。
+
+### 21.3 报数
+
+**ARI 是范围，不是定值。** `domain_status.json` 的 `reproducibility`
+字段写明哪些量能按定值报（Moran's I、域数、邻居同域率）、
+哪些必须带范围报（`SpaGCN_vs_builtin` 的 ARI）。
+
+**别把数值写死在 README 里。** 实测 README 里"不平滑 9 域、同域率 0.536、
+基线 0.133"早就对不上了（现在是 11 域 / 0.507 / 0.111）——
+**文档里写死的数一定会过时**，而读者不会知道它过时了。
