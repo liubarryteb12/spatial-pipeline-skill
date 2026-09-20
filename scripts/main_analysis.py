@@ -27,8 +27,9 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 from common import (capture_versions, ensure_dirs, init_manifest,  # noqa: E402
                     load_config, log_info, log_warn, manifest_path,
-                    manifest_summary, record_decision, record_human_review,
-                    record_input, record_params, write_json)
+                    manifest_summary, read_json, record_decision,
+                    record_human_review, record_input, record_params,
+                    write_json)
 
 STEPS = [
     ("fetch", "00_fetch", "run_00_fetch"),
@@ -420,6 +421,30 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         # 决策链写不进去不该让验收崩 —— 但必须可见
         log_warn(f"决策链登记失败（不影响其余验收）：{type(e).__name__}: {e}")
 
+    # ---- §0.2 跨语言转换：本仓库没有，但要**说出来** ------------------------
+    #
+    # 姊妹项目 geo 是 R，它把 Part 1→Part 2 的 CSV 交接记进 `cross_language`
+    # （`09_export_targets.R`）；scrna 也记了它读 Part 1 交接表那一段。
+    #
+    # **空间这边真的没有跨语言转换**：输入是 10x Cell Ranger 产出的
+    # `filtered_feature_bc_matrix.h5` + `spatial.tar.gz`（Cell Ranger 是
+    # 独立的 C++/Python 工具链，不是 R），Part 2 交接的参考也是 h5ad。
+    #
+    # 但"没有记录"和"忘了记"在清单里长得一样 —— 所以这里显式登记一条
+    # 决策，把空数组解释掉。验收里 `manifest:cross_language` 会检查这一点：
+    # **要么有记录，要么有解释。**
+    record_decision(
+        cfg, "cross_language",
+        "§0.2 跨语言转换：本仓库有没有 R↔Python 的交接？",
+        "**没有。** 全流程 Python，`cross_language` 为空是设计如此，不是遗漏",
+        evidence=("输入是 10x Cell Ranger 的 `filtered_feature_bc_matrix.h5` "
+                  "+ `spatial.tar.gz`（Cell Ranger 是独立工具链，不是 R）；"
+                  "Part 2 交接的 scRNA 参考也是 `.h5ad`（同为 Python 生态）。"
+                  "对比：geo 用 `record_cross_language()` 记 R→CSV→Python 的"
+                  "靶基因表，scrna 记它读那张表 —— 两边都真有转换。"
+                  "**所以这条不是「没做」，是「没有可做的」** —— "
+                  "将来若加入 R 侧分析（如 BayesSpace），这条必须变成真记录"))
+
     # ---- honesty: §3.2 跑了点名工具就必须量化它与主方法的一致性 --------------
     #
     # **"跑通了"不是结论。** 一个点名工具跑出 13 个域，如果不说它和主方法
@@ -610,6 +635,30 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         chk("manifest:human_review", "honesty", True,
             f"{len(pend)} 个人工复核节点待确认（不阻断 job）："
             + (", ".join(pend) if pend else "全部已确认"))
+        # ---- §0.2 跨语言转换：**空数组必须被解释** ------------------------
+        #
+        # 本仓库全程 Python（输入是 10x Cell Ranger 的 h5，Part 2 交接的
+        # 参考也是 h5ad），**确实没有 R↔Python 转换**。但 `cross_language: []`
+        # 和"这一步忘了做"长得一模一样 —— 这正是本仓库反复踩的坑
+        # （规则 16 的旧状态文件、规则 20 的 `record_decision()` 没调用点）。
+        #
+        # 所以判据不是"必须有记录"，而是"**空的话必须有解释**"：
+        # 要么 `cross_language` 非空，要么决策链里有一条说明为什么空不了。
+        # 这样将来真的加了跨语言步骤而忘了记，这条会立刻变红。
+        #
+        # **读全量清单而不是 `msum`** —— `manifest_summary()` 只给
+        # `n_decisions` 这个计数，看不到节点名（和 scrna 那边同一个写法）。
+        _cl = msum.get("n_cross_language", 0)
+        _full = read_json(res_dir / "run_manifest.json")
+        _dec_nodes = {d.get("node") for d in (_full.get("decisions") or [])}
+        chk("manifest:cross_language", "honesty",
+            _cl > 0 or "cross_language" in _dec_nodes,
+            (f"{_cl} 条跨语言转换记录"
+             if _cl else
+             ("0 条，**但决策链里已说明本仓库不涉及跨语言转换**"
+              if "cross_language" in _dec_nodes else
+              "**0 条且没有任何解释** —— 读者无法区分"
+              "『本来就没有』和『忘了记』")))
 
     n_req_fail = sum(1 for c in checks
                      if not c["passed"] and c["severity"] == "required")

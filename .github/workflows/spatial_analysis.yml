@@ -80,6 +80,14 @@ jobs:
       #    这一层线程数管不到；GitHub 托管 runner 的 CPU 型号在同一
       #    Azure 区域内也不单一。钉住内核类型后不再取决于宿主 CPU。
       OPENBLAS_CORETYPE: Haswell
+      # 3) Numba 的线程池。**和上面两组是三个独立的旋钮** ——
+      #    Numba 的 `prange` 线程数由 `NUMBA_NUM_THREADS` 控制，
+      #    不走 OMP/MKL。姊妹项目 scrna 实测：scanpy 默认的近似 kNN
+      #    （`pynndescent`）走的就是这条，而它的候选堆更新顺序依赖
+      #    线程调度 —— **给了 `random_state` 也不保证逐位可复现**
+      #    （scrna AGENTS 规则 20 有完整的三轮 CI 证据）。
+      #    空间这边 `sc.pp.neighbors` 同样经过它。
+      NUMBA_NUM_THREADS: 1
 
     steps:
       - uses: actions/checkout@v4
