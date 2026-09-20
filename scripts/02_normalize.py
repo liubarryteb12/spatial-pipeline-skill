@@ -25,7 +25,8 @@ import numpy as np  # noqa: E402
 import scanpy as sc  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, record_step, save_fig, set_seed, write_json, spatial_xy, W_DOUBLE, mm,)
+                    log_warn, parse_args, record_step, save_fig, set_seed, write_json,
+                    spatial_xy, PAL, W_DOUBLE, W_ONE_HALF, mm,)
 
 
 def run_02_normalize(cfg: dict) -> dict:
@@ -95,10 +96,34 @@ def run_02_normalize(cfg: dict) -> dict:
         sc.pp.scale(work, max_value=10)
     sc.tl.pca(work, svd_solver="arpack", random_state=cfg["analysis"]["seed"])
 
-    sc.pl.pca_variance_ratio(work, log=True, show=False)
-    fig = plt.gcf()
-    fig.suptitle("PCA variance ratio (elbow)")
+    # **不用 `sc.pl.pca_variance_ratio`。** 实测它出的图有三个问题：
+    #
+    #   1. **它给每一个 PC 都打一个标注**，而 `sc.tl.pca` 默认算 50 个 PC ——
+    #      在窄画布上 PC13 之后完全叠成一团，PC10/11/12 也挤在一起。
+    #      标注沿着曲线排，看起来像刻度但不是刻度，改不了。
+    #   2. **PC1 的标注顶到标题上**，把 "PCA variance ratio (elbow)" 横穿。
+    #   3. **不给 y 轴标题**，读者只看到 -2.5 ~ -6.0 的数字，
+    #      不知道那是 log10(方差解释比)。
+    #
+    # 姊妹项目 scrna-pipeline-skill 的 `02_integrate.py` 是同一处改动。
+    # 自己画还顺带**去掉一个版本依赖** —— 仓库规则 6：绘图 API 会随版本变。
+    var_ratio = work.uns["pca"]["variance_ratio"]
+    n_pc = len(var_ratio)
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(66)))
+    xs = np.arange(1, n_pc + 1)
+    ax.plot(xs, np.log10(var_ratio), marker="o", ms=2.5, lw=0.9,
+            color=PAL["primary"], markeredgewidth=0)
+    ax.set_xlabel("Principal component (rank)")
+    ax.set_ylabel("log10(variance ratio)")
+    ax.set_title("PCA variance ratio (elbow)")
+    # **刻度每 5 个 PC 一个。** 逐个标就是上面那个叠字问题。
+    step = 5 if n_pc > 12 else 1
+    ticks = list(range(1, n_pc + 1, step))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([f"PC{i}" for i in ticks])
+    ax.grid(axis="y", alpha=0.25, linewidth=0.5)
     save_fig(cfg, "pca_variance_ratio", fig)
+    log_info(f"PCA 方差比图: 标出 {len(ticks)} 个刻度（共 {n_pc} 个 PC）")
 
     var_ratio = work.uns["pca"]["variance_ratio"]
     log_info(f"PC1-10 方差解释: {', '.join(f'{v:.3f}' for v in var_ratio[:10])}")
