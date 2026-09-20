@@ -1,7 +1,7 @@
 # 空间转录组流水线的工程规则
 
 姊妹项目 `scrna-pipeline-skill/AGENTS.md` 与
-`geo-brca-microarray-skill/AGENTS.md` 的规则在这里同样适用。
+`geo-normal-pipeline-skill/AGENTS.md` 的规则在这里同样适用。
 本文只写**空间数据特有的**部分。
 
 ---

@@ -1,7 +1,7 @@
 """
 lib/common.py — 空间转录组流水线公共库
 
-与 `scrna-pipeline-skill` / `geo-brca-microarray-skill` 同一套约定。
+与 `scrna-pipeline-skill` / `geo-normal-pipeline-skill` 同一套约定。
 本文只写空间特有的部分，其余见那两个仓库的 AGENTS.md。
 """
 

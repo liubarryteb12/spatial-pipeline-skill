@@ -3,7 +3,7 @@ name: spatial analysis
 # ============================================================================
 # 空间转录组（Visium）流水线 CI
 # ============================================================================
-# 设计原则与 geo-brca-microarray-skill / scrna-pipeline-skill 一致：
+# 设计原则与 geo-normal-pipeline-skill / scrna-pipeline-skill 一致：
 #
 #   1. **静态检查在前，装依赖在后。** 语法错误 1 秒能发现，
 #      不该等 3 分钟装完 scanpy 才知道。
