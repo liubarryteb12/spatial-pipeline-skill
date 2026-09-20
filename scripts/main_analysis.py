@@ -25,11 +25,11 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts" / "lib"))
 sys.path.insert(0, str(REPO / "scripts"))
 
-from common import (capture_versions, ensure_dirs, init_manifest,  # noqa: E402
-                    load_config, log_info, log_warn, manifest_path,
-                    manifest_summary, read_json, record_decision,
-                    record_human_review, record_input, record_params,
-                    write_json)
+from common import (NAMED_TOOLS, capture_versions, ensure_dirs,  # noqa: E402
+                    init_manifest, load_config, log_info, log_warn,
+                    manifest_path, manifest_summary, probe_named_tools,
+                    read_json, record_decision, record_human_review,
+                    record_input, record_params, write_json)
 
 STEPS = [
     ("fetch", "00_fetch", "run_00_fetch"),
@@ -353,6 +353,85 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
              f"其中 {n_used} 个实际产出了结果"
              if not missing and not unexplained else
              f"缺登记 {missing}；既没说 used 也没写理由 {unexplained}"))
+
+    # ---- 全局：`NAMED_TOOLS` 里每一个都必须有交代 ---------------------------
+    #
+    # **上面那条是按步查的，查不出"整段没登记"。** 实测踩到：
+    # `Bering` 与 `BOMS` 的 `section` 是 §3.1，而 §3.1 的两个步骤
+    # （`01_qc` / `02_normalize`）**没有 `named_tools` 字段** ——
+    # 于是这两个工具只存在于 `common.NAMED_TOOLS` 这个 Python 常量里，
+    # **任何产物里都看不到它们**。按步检查全都通过，因为没有任何一步
+    # "声明"过它们。
+    #
+    # 这正是"缺口没登记"最隐蔽的形态：不是登记错了，是**根本没登记**，
+    # 而验收看起来是绿的。所以这里做一次全局清点。
+    #
+    # 判据：`NAMED_TOOLS` 的每个键，要么出现在某一步的 `named_tools` /
+    # 方法表里（说明该步真的探测过），要么在下面的全局探测里有 `kind`
+    # 和 `reason`（说明它是"文档点名但本环境用不了"，理由齐全）。
+    try:
+        _all_nt = dict(NAMED_TOOLS)
+        _seen = set()
+        for f, (_sec, _exp, extra_keys) in tool_registry_files.items():
+            _p = res_dir / f
+            if not _p.exists():
+                continue
+            _d = json.loads(_p.read_text(encoding="utf-8"))
+            _seen.update((_d.get("named_tools") or {}).keys())
+            for _k, _as_tool in extra_keys:
+                _v = _d.get(_k)
+                if not isinstance(_v, dict) or not _v:
+                    continue
+                if _as_tool is None:
+                    _seen.update(t for t, i in _v.items()
+                                 if isinstance(i, dict))
+                else:
+                    _seen.add(_as_tool)
+        # `NAMED_TOOLS` 自己就是"文档点名 + 逐条理由"的登记表 ——
+        # 所以缺的是"有没有被任何一步碰到过"这件事的可见性。
+        _never_probed = sorted(t for t in _all_nt if t not in _seen)
+        # 理由齐全性：`NAMED_TOOLS` 里每条都必须有 reason，且 kind 非空
+        _no_reason = sorted(t for t, i in _all_nt.items()
+                            if not (i or {}).get("reason"))
+        _no_kind = sorted(t for t, i in _all_nt.items()
+                          if not (i or {}).get("kind"))
+        chk("honesty:named_tools_registry", "honesty",
+            not _no_reason and not _no_kind,
+            (f"`NAMED_TOOLS` 共 {len(_all_nt)} 条，全部有 kind 与 reason"
+             if not _no_reason and not _no_kind else
+             f"无理由 {_no_reason}；无 kind {_no_kind}"))
+        # 没被任何一步探测过的：**可见但不判失败** ——
+        # 它们是"文档点名、本环境用不了"，理由在 `NAMED_TOOLS` 里，
+        # 只是没有哪一步负责把它们写进产物。判失败会让 job 红，
+        # 但那不是分析错了。**必须可见**，否则下次又忘了。
+        chk("honesty:named_tools_never_probed", "honesty", True,
+            (f"全部 {len(_all_nt)} 个点名工具都至少被一步探测过"
+             if not _never_probed else
+             f"**{len(_never_probed)} 个点名工具没有任何一步探测过**"
+             f"（只存在于 `common.NAMED_TOOLS` 常量里，产物中看不到）："
+             f"{_never_probed} —— 逐条理由见清单 `named_tools` 决策"))
+        # **把全表探测结果写进清单。** 上面那条只报"哪些没被步骤碰到"，
+        # 而这里把**全部 14 条连同 kind / section / reason** 落进
+        # `run_manifest.json` —— 这样 §3.1 那种"没有任何步骤负责"的
+        # 工具也有一条可查的理由，而不是只活在 Python 常量里。
+        #
+        # 不加 `only=` 过滤：这条就是全局清点，过滤掉谁都会漏。
+        _probe_all = probe_named_tools(log=log_warn)
+        record_params(cfg, {
+            "named_tools_registry": {
+                "n": len(_all_nt),
+                "never_probed_by_any_step": _never_probed,
+                "sections": sorted({(i or {}).get("section") or "?"
+                                    for i in _all_nt.values()}),
+            },
+            "named_tools_probe": _probe_all,
+        })
+        log_info(f"点名工具全局清点：{len(_all_nt)} 条，"
+                 f"其中 {len(_never_probed)} 条没有任何步骤探测过"
+                 f"（理由已随清单落盘）")
+    except Exception as e:  # noqa: BLE001
+        log_warn(f"点名工具全局清点失败（不影响其余验收）："
+                 f"{type(e).__name__}: {e}")
 
     # ---- §0.4 Agent 决策链：点名工具到底落地了几个 --------------------------
     #
