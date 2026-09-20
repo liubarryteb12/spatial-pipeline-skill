@@ -60,6 +60,27 @@ jobs:
     # 实测全流程约 3-5 分钟，给 45 分钟留足余量（含装依赖）。
     timeout-minutes: 45
 
+    # 把浮点结果钉死。**这是"设了种子也没用"的那一类随机源** ——
+    # 和 UMAP/leiden 那些"没设种子"的不是一回事，只有限制并行度才能消除。
+    # 姊妹项目 `geo-normal-pipeline-skill` 的 AGENTS 规则 12 有完整实测记录。
+    #
+    # 空间这边有两处对末位差异特别敏感：
+    #   1. **SpaGCN** 的 GCN 训练（torch CPU）—— 多线程归约顺序会改变
+    #      梯度累加，进而改变聚类结果。域划分是**离散**的，末位差异
+    #      直接体现为几个 spot 换域，而不是数值上的一点点偏移。
+    #   2. **SpatialDE** 的高斯过程拟合与 `eigsh` 迭代。
+    # 钉住之后 `spagcn_domains.csv` / `svg_results.csv` 才谈得上可复现。
+    env:
+      # 1) 线程数：多线程归约的求和顺序取决于线程调度，每次运行都不同。
+      OMP_NUM_THREADS: 1
+      OPENBLAS_NUM_THREADS: 1
+      MKL_NUM_THREADS: 1
+      # 2) 内核选择：OpenBLAS 在**运行期**按检测到的 CPU 型号分发 SIMD 内核
+      #    （SSE/AVX2/AVX512 向量宽度不同 → 归约顺序不同 → 末位不同）。
+      #    这一层线程数管不到；GitHub 托管 runner 的 CPU 型号在同一
+      #    Azure 区域内也不单一。钉住内核类型后不再取决于宿主 CPU。
+      OPENBLAS_CORETYPE: Haswell
+
     steps:
       - uses: actions/checkout@v4
 
