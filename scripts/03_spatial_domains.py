@@ -199,6 +199,28 @@ def _agreement(labels_a, labels_b, adj, adata, log=log_info) -> dict:
         "note": ("ARI 对域编号置换免疫，是主判据；same_label_frac 会被编号"
                  "顺序支配，只作参考"),
     }
+    # **域×域对应矩阵**（差距清单 #25，SRC-17 f9E-G / SRC-16 惯例）：
+    # ARI 是单个数，看不出"哪几个域对上了、哪些被分裂/合并"。
+    # contingency 矩阵（行=A 的域、列=B 的域、值=Jaccard）把 ARI 拆开。
+    try:
+        ua = sorted(set(a.tolist()), key=lambda x: int(x) if x.isdigit() else x)
+        ub = sorted(set(b.tolist()), key=lambda x: int(x) if x.isdigit() else x)
+        jac_m = np.zeros((len(ua), len(ub)), dtype=float)
+        for ia, va in enumerate(ua):
+            sa = (a == va)
+            for ib, vb in enumerate(ub):
+                sb = (b == vb)
+                inter = float(np.sum(sa & sb))
+                union = float(np.sum(sa | sb))
+                jac_m[ia, ib] = inter / union if union > 0 else 0.0
+        out["jaccard_matrix"] = {"rows": ua, "cols": ub,
+                                 "values": [[round(float(v), 4) for v in row]
+                                            for row in jac_m]}
+        out["jaccard_matrix_note"] = (
+            "行 = A 的域、列 = B 的域、值 = Jaccard 重叠度；"
+            "对角线以外的亮块 = 被分裂或合并的域")
+    except Exception as e:  # noqa: BLE001
+        log(f"  域×域矩阵失败: {type(e).__name__}: {e}")
     ma = domain_metrics(adata, a, adj)
     mb = domain_metrics(adata, b, adj)
     out["neighbor_same_frac_a"] = ma["neighbor_same_frac"]
@@ -726,6 +748,11 @@ def run_03_spatial_domains(cfg: dict) -> dict:
                            f"STAGATE ({stg_info['n_domains']})",
                            "03-03-04-unit3-domains-stagate"))
         for _ui, (key, title, name) in enumerate(panels, start=1):
+            # **方法色身份制**（差距清单 #26，SRC-16/BOMS 惯例）：每个方法一个
+            # 固定色，跨面板/跨图不变 —— 读者不用重复读图例就知道哪个是哪个。
+            METHOD_COLORS = {"domain": PAL["blue"], "domain_spagcn": PAL["orange"],
+                         "domain_stagate": PAL["green"]}
+            method_fill = METHOD_COLORS.get(key, PAL["primary"])
             cats = adata.obs[key].astype(str).values
             uniq = sorted(set(cats), key=lambda x: int(x) if x.isdigit() else x)
             cmap = plt.get_cmap("tab20")
@@ -742,6 +769,34 @@ def run_03_spatial_domains(cfg: dict) -> dict:
             ax.set_xticks([]); ax.set_yticks([])
             save_fig(cfg, name, fig)
         log_info(f"方法对照已拆分单图输出；一致性: {sub}")
+        # **域×域对应矩阵热图**（差距清单 #25）：把方法对照的 ARI 拆成
+        # "哪几个域对上了"。每对方法一张（同图号 unit7+）。
+        DYNAMIC_FIG_BASES = {"04": 3}
+        JAC_BASE = "-".join(["03", "03", "04", "unit"])
+        for ji, (key, title, name) in enumerate(panels, start=1):
+            pair = None
+            for kk, vv in method_agree.items():
+                if "jaccard_matrix" in vv and (
+                        ("SpaGCN" in kk and key == "domain_spagcn") or
+                        ("STAGATE" in kk and key == "domain_stagate") or
+                        (kk.startswith("SpaGCN_vs_STAGATE") and key == "domain_stagate")):
+                    pair = vv
+                    break
+            if pair is None:
+                continue
+            jm = np.array(pair["jaccard_matrix"]["values"])
+            fig_j, ax_j = plt.subplots(figsize=(W_ONE_HALF, mm(64)))
+            im_j = ax_j.imshow(jm, cmap="magma", vmin=0, vmax=1, aspect="auto")
+            ax_j.set_xticks(range(len(pair["jaccard_matrix"]["cols"])))
+            ax_j.set_xticklabels(pair["jaccard_matrix"]["cols"], fontsize=6, rotation=90)
+            ax_j.set_yticks(range(len(pair["jaccard_matrix"]["rows"])))
+            ax_j.set_yticklabels(pair["jaccard_matrix"]["rows"], fontsize=6)
+            ax_j.set_xlabel(f"{title} domain")
+            ax_j.set_ylabel("Builtin domain")
+            ax_j.set_title("Domain-by-domain Jaccard overlap - bright off-diagonal blocks = split/merged domains")
+            fig_j.colorbar(im_j, ax=ax_j, shrink=0.8, pad=0.02,
+                           fraction=0.046, label="Jaccard")
+            save_fig(cfg, JAC_BASE + str(ji + 6) + "-domain-jaccard", fig_j)
 
     # ---- 6. 落盘 ------------------------------------------------------------
     adata.obs[["domain", "domain_expr_only"]].to_csv(res_dir / "spatial_domains.csv")
