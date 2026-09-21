@@ -639,8 +639,8 @@ def run_05_deconvolution(cfg: dict) -> dict:
         fig, ax = plt.subplots(figsize=(W_SINGLE, mm(58)))
         s = ax.scatter(xy[:, 0], xy[:, 1], c=prop_df[ct].values, s=4,
                        cmap="magma", vmin=0, vmax=vmax_shared)
-        ax.set_title(f"{ct}  mean={mean_prop[ct]:.3f}\\n"
-                     f"scale 0-{vmax_shared:.2f} (trend, not fraction)", fontsize=8)
+        ax.set_title(f"{ct}  mean={mean_prop[ct]:.3f}\n" +
+                     f"scale 0-{vmax_shared:.2f} (trend)", fontsize=8)
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(s, ax=ax, shrink=0.75, pad=0.02, fraction=0.046)
