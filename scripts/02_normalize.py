@@ -131,24 +131,25 @@ def run_02_normalize(cfg: dict) -> dict:
     # PCA 空间投影 —— 看主成分是否有空间结构
     # **这是空间数据特有的诊断**：如果 PC1 在组织上是随机斑点，
     # 说明主要变异是技术噪声而不是空间结构。
-    fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(58)))
+    # **单图原则拆分（D-006）**：三 PC 面板 -> 3 张独立单图（P2 PC 空间
+    # 结构分解链）。每张回答"这个 PC 有没有空间结构"。
+    # 共享对称色标（±_v）**保留** —— 拆图不拆可比性，量程写在各图 title。
     xy = spatial_xy(work)
-    # **色标是发散色，必须对称共享零点**（评审 3.5：原先每个 PC 各自按
-    # max|x| 定 vmax，三个面板的"红/蓝"深浅不可比）。统一 v = 三个 PC
-    # 联合 max|x|，label 写明这是 PC 得分。
     _v = float(max(np.abs(work.obsm["X_pca"][:, i]).max() for i in range(3)))
-    for ax, i in zip(axes, range(3)):
+    PC_NAMES = {"PC1": "03-02-03-unit1-pc1-on-tissue",
+                "PC2": "03-02-03-unit2-pc2-on-tissue",
+                "PC3": "03-02-03-unit3-pc3-on-tissue"}
+    for i in range(3):
+        fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(58)))
         s = ax.scatter(xy[:, 0], xy[:, 1], c=work.obsm["X_pca"][:, i],
                        s=4, cmap="RdBu_r", vmin=-_v, vmax=_v)
-        ax.set_title(f"PC{i+1} ({var_ratio[i]*100:.1f}%)")
+        ax.set_title(f"PC{i+1} ({var_ratio[i]*100:.1f}%) — "
+                     f"symmetric scale ±{_v:.1f}")
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(s, ax=ax, shrink=0.8, pad=0.02, fraction=0.046,
                      label=f"PC{i+1} score")
-    fig.suptitle("PC scores on tissue — spatial structure means PCs capture "
-                 "histology, not just noise\n"
-                 f"all panels share one symmetric colour scale (±{_v:.1f})")
-    save_fig(cfg, "03-02-03-unit1-pca-on-tissue", fig)
+        save_fig(cfg, PC_NAMES[f"PC{i+1}"], fig)
 
     # ---- 3. 落盘 ------------------------------------------------------------
     out = data_dir / "normalized.h5ad"

@@ -36,7 +36,7 @@ import scipy.sparse as sp  # noqa: E402
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, probe_named_tools, record_step, save_fig,
                     set_seed,
-                    spatial_xy, write_json, W_DOUBLE, mm,)
+                    spatial_xy, write_json, W_DOUBLE, W_ONE_HALF, mm,)
 
 # 复用 03 的空间平滑与 04 的 Moran's I —— 不重复实现。
 # 目录名以数字开头，不能直接 import，所以按文件路径加载。
@@ -247,41 +247,52 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
         out["domain"] = adata.obs["domain"].astype(str).values
     out.to_csv(res_dir / "spatial_pseudotime.csv", index=False)
 
-    # ---- 8. 出图 -----------------------------------------------------------
-    # **colorbar 会挤压面板标题**：constrained layout 给每个 colorbar 分出的
-    # 空间把 183 mm 宽的三个面板压得很窄，长标题被劈开/截断（实测 panel 2 的
-    # "(alpha=0.5)" 断成两行、panel 3 只剩 "[difference] between the"）。
-    # 对策：标题压成短行（统计量进第二行），colorbar 显式收窄（fraction/pad）。
-    fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(60)))
-    s0 = axes[0].scatter(xy[:, 0], xy[:, 1], c=expr_pt, s=7, cmap="viridis")
-    axes[0].set_title(f"Expression only\nMoran's I = {I_expr:.3f}")
-    fig.colorbar(s0, ax=axes[0], label="pseudotime",
+    # **单图原则拆分（D-006）**：两个组合图 -> 5 张独立单图（P8 空间拟时序
+    # 方法对照链）。unit1/2/3 = A/|A-B| 对照结构（unit3 依赖前两张，
+    # 组内阅读顺序 1->2->3）；unit4/5 = 分布对照 + 相关散点（证据链）。
+    # Moran's I 各写进各图标题。
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(60)))
+    s0 = ax.scatter(xy[:, 0], xy[:, 1], c=expr_pt, s=7, cmap="viridis")
+    ax.set_title(f"Expression-only pseudotime\nMoran's I = {I_expr:.3f}")
+    fig.colorbar(s0, ax=ax, label="pseudotime",
                  fraction=0.046, pad=0.02, shrink=0.8)
-    s1 = axes[1].scatter(xy[:, 0], xy[:, 1], c=spatial_pt, s=7, cmap="viridis")
-    axes[1].set_title(f"Spatially smoothed (alpha={alpha})\nMoran's I = {I_spatial:.3f}")
-    fig.colorbar(s1, ax=axes[1], label="pseudotime",
-                 fraction=0.046, pad=0.02, shrink=0.8)
-    s2 = axes[2].scatter(xy[:, 0], xy[:, 1],
-                         c=np.abs(expr_pt - spatial_pt), s=7, cmap="magma")
-    axes[2].set_title("|difference| of the two")
-    fig.colorbar(s2, ax=axes[2], label="|delta pseudotime|",
-                 fraction=0.046, pad=0.02, shrink=0.8)
-    for ax in axes:
-        ax.set_xlabel("x (fullres px)"); ax.set_ylabel("y (fullres px)")
-        ax.set_aspect("equal")
-    save_fig(cfg, "03-08-01-unit1-spatial-pseudotime-maps", fig)
+    ax.set_xlabel("x (fullres px)"); ax.set_ylabel("y (fullres px)")
+    ax.set_aspect("equal")
+    save_fig(cfg, "03-08-01-unit1-pseudotime-expr-only", fig)
 
-    fig, axes = plt.subplots(1, 2, figsize=(W_DOUBLE, mm(64)))
-    axes[0].hist(expr_pt, bins=40, alpha=0.65, label="expression-only", color="#B2182B")
-    axes[0].hist(spatial_pt, bins=40, alpha=0.65, label="spatially-smoothed", color="#2166AC")
-    axes[0].set_xlabel("pseudotime"); axes[0].set_ylabel("n spots")
-    axes[0].set_title("Pseudotime distributions")
-    axes[0].legend(fontsize=8)
-    axes[1].scatter(expr_pt, spatial_pt, s=5, alpha=0.4, color="#444444")
-    axes[1].set_xlabel("expression-only pseudotime")
-    axes[1].set_ylabel("spatially-smoothed pseudotime")
-    axes[1].set_title(f"Spearman rho = {rho_two:+.3f}")
-    save_fig(cfg, "03-08-02-unit1-spatial-pseudotime-compare", fig)
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(60)))
+    s1 = ax.scatter(xy[:, 0], xy[:, 1], c=spatial_pt, s=7, cmap="viridis")
+    ax.set_title(f"Spatially smoothed pseudotime (alpha={alpha})\nMoran's I = {I_spatial:.3f}")
+    fig.colorbar(s1, ax=ax, label="pseudotime",
+                 fraction=0.046, pad=0.02, shrink=0.8)
+    ax.set_xlabel("x (fullres px)"); ax.set_ylabel("y (fullres px)")
+    ax.set_aspect("equal")
+    save_fig(cfg, "03-08-01-unit2-pseudotime-smoothed", fig)
+
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(60)))
+    s2 = ax.scatter(xy[:, 0], xy[:, 1],
+                    c=np.abs(expr_pt - spatial_pt), s=7, cmap="magma")
+    ax.set_title("|difference| expression-only vs smoothed")
+    fig.colorbar(s2, ax=ax, label="|delta pseudotime|",
+                 fraction=0.046, pad=0.02, shrink=0.8)
+    ax.set_xlabel("x (fullres px)"); ax.set_ylabel("y (fullres px)")
+    ax.set_aspect("equal")
+    save_fig(cfg, "03-08-01-unit3-pseudotime-difference", fig)
+
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(64)))
+    ax.hist(expr_pt, bins=40, alpha=0.65, label="expression-only", color="#B2182B")
+    ax.hist(spatial_pt, bins=40, alpha=0.65, label="spatially-smoothed", color="#2166AC")
+    ax.set_xlabel("pseudotime"); ax.set_ylabel("n spots")
+    ax.set_title("Pseudotime distributions")
+    ax.legend(fontsize=8)
+    save_fig(cfg, "03-08-02-unit1-pseudotime-distributions", fig)
+
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(64)))
+    ax.scatter(expr_pt, spatial_pt, s=5, alpha=0.4, color="#444444")
+    ax.set_xlabel("expression-only pseudotime")
+    ax.set_ylabel("spatially-smoothed pseudotime")
+    ax.set_title(f"Spearman rho = {rho_two:+.3f}")
+    save_fig(cfg, "03-08-02-unit2-pseudotime-scatter", fig)
 
     # ---- 9. 状态 -----------------------------------------------------------
     improved = I_spatial > I_expr

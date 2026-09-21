@@ -175,12 +175,12 @@ Visium 的数据是**两半**：表达矩阵 + `spatial.tar.gz`（坐标/缩放/
 ```
 results/lymph_node/
   figures/                     20 张 PNG（图名格式见 AGENTS 规则 23）
-    03-03-03-unit1-domains-on-he.png          空间域叠在 H&E 上（判断域是否对应组织学）
-    03-02-03-unit1-pca-on-tissue.png          PC 的空间投影
+    03-03-03-unit1..3-domains-{expr-only,spatial,he-reference}.png（P3 组 3 张）          空间域叠在 H&E 上（判断域是否对应组织学）
+    03-02-03-unit1..3-pc{1,2,3}-on-tissue.png（P2 组 3 张）          PC 的空间投影
     03-03-01-unit1-smoothing-scan.png         平滑强度 vs 空间连贯性
-    03-04-01-unit1-svg-top-genes.png          top 空间高变基因
+    03-04-01-unit1..30-<gene>.png（P4 组 30 张）          top 空间高变基因
     03-06-01-unit1-niche-enrichment-celltypes.png  邻域富集 z-score 热图
-    03-05-01-unit1-deconvolution-spatial.png  各类型相对权重的空间分布
+    03-05-01-unit1..12-<celltype>.png（P5 组 12 张）  各类型相对权重的空间分布
   acceptance_report.json       26 项验收检查
   *_status.json                每步的 method + limitations
 data/lymph_node/

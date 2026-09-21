@@ -623,36 +623,29 @@ def run_05_deconvolution(cfg: dict) -> dict:
             res_dir / "deconvolution_errors.csv")
 
     # ---- 4. 空间分布 --------------------------------------------------------
+    # **单图原则拆分（D-006，裁决 1）**：12 面板 -> 12 张独立单图
+    # （P5 去卷积组成图谱分解链）。每类型一张、独立达标图幅；
+    # 共享量程 0->p99 保留（拆图不拆可比性），量程写进各图 title；
+    # 免责声明 "spatial trends only" 一并写入 title。
+    # slug=类型名（运行时数据），用 DYNAMIC_FIG_BASES 声明豁免。
+    DYNAMIC_FIG_BASES = {"01": 12}
     show = mean_prop.head(12).index.tolist()
-    ncol = 4
-    nrow = int(np.ceil(len(show) / ncol))
     sf = float(adata.uns["spatial"][list(adata.uns["spatial"])[0]]
                ["scalefactors"]["tissue_hires_scalef"])
     xy = spatial_xy(adata, sf)
-    fig, axes = plt.subplots(nrow, ncol, figsize=(W_DOUBLE, W_DOUBLE * 3.1 * nrow / (3.0 * ncol)))
-    axes = np.atleast_1d(axes).ravel()
-    # **12 个 colorbar 必须共享量程**（评审 3.5：原先各自 vmin=0 + 自动 vmax，
-    # 实测量程 0–0.3 / 0–0.6 / 0–0.15 / 0–0.20 四种，面板之间深浅不可比 ——
-    # 同一个"偏黄"在两张图里是两倍差异）。统一 vmax = 全部展示类型
-    # 联合 p99，并给每个 colorbar 一个说明性 label。
     vmax_shared = float(np.quantile(
         np.concatenate([prop_df[ct].values for ct in show]), 0.99))
-    for ax, ct in zip(axes, show):
+    for ui, ct in enumerate(show, start=1):
+        fig, ax = plt.subplots(figsize=(W_SINGLE, mm(58)))
         s = ax.scatter(xy[:, 0], xy[:, 1], c=prop_df[ct].values, s=4,
                        cmap="magma", vmin=0, vmax=vmax_shared)
-        ax.set_title(f"{ct}\nmean={mean_prop[ct]:.3f}", fontsize=8)
+        ax.set_title(f"{ct}  mean={mean_prop[ct]:.3f}\n"
+                     f"shared scale 0 - {vmax_shared:.2f} "
+                     "(spatial trends only, not cell fractions)", fontsize=8)
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
-        # **colorbar 不加长 label**：12 个面板各挂一条竖排文字会互相重叠
-        # （实测第一版把 "Fibroblastic_reticular_cell (shared scale)" 挤进
-        # 相邻面板）。共享量程这件事由 suptitle 统一说明，刻度数字足够。
         fig.colorbar(s, ax=ax, shrink=0.75, pad=0.02, fraction=0.046)
-    for ax in axes[len(show):]:
-        ax.axis("off")
-    fig.suptitle("Deconvolved composition — spatial trends only, "
-                 "absolute values are not cell fractions\n"
-                 f"all panels share one colour scale (0 – {vmax_shared:.2f})")
-    save_fig(cfg, "03-05-01-unit1-deconvolution-spatial", fig)
+        save_fig(cfg, f"03-05-01-unit{ui}-{ct.lower()}", fig)
 
     # 组成堆叠（按某个域聚合，看域之间的组成差异）
     if "domain" in adata.obs.columns:

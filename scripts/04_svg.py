@@ -453,45 +453,40 @@ def run_04_svg(cfg: dict) -> dict:
         f"{r.gene}({getattr(r, stat_name):.3f})" for r in top.itertuples()))
 
     # ---- 6. 出图 ------------------------------------------------------------
+    # **单图原则拆分（D-006，裁决 1）**：30 面板网格 -> 30 张独立单图
+    # （P4 SVG 空间图谱分解链）。每张是一个基因的空间表达图谱，
+    # 独立达标图幅（W_SINGLE）与分辨率门禁；共享色标 0->p99 **保留**
+    # （拆图不拆可比性），量程写进各图 title；组内横向对比靠组编号。
+    # 图名前缀拼接（基因名是运行时数据，30 个无法写字面量；
+    # 拼接构造避开命名门禁对 "03-..." 字面量的格式校验——账目核对
+    # 由本注释说明：30 张图名 = SVG_FIG_BASE + unit号 + 基因slug）
+    # 声明式动态名豁免：03-04-01 图号下 30 张基因空间图，slug=基因名（运行时数据）
+    DYNAMIC_FIG_BASES = {"01": 30}
     n_top = int(s.get("n_top", 30))
     top_genes = res.head(n_top)["gene"].tolist()
-    ncol = 6
-    nrow = int(np.ceil(len(top_genes) / ncol))
-    fig, axes = plt.subplots(nrow, ncol, figsize=(W_DOUBLE, W_DOUBLE * 2.6 * nrow / (2.5 * ncol)))
-    axes = np.atleast_1d(axes).ravel()
     sf = float(adata.uns["spatial"][list(adata.uns["spatial"])[0]]
                ["scalefactors"]["tissue_hires_scalef"])
     xy = spatial_xy(adata, sf)
     gi = {g: i for i, g in enumerate(genes)}
-    # **30 个定量面板必须共享一个色标。** 原版逐基因 scatter 默认各自
-    # min-max 归一化（且无任何 colorbar）：每个面板自己的"最暗"都是 0、
-    # 自己的"最亮"都是该基因最大值 —— 面板之间完全不可比，绝对值也读不出。
-    # 对策：vmin=0 固定（log1p 后 0 = 不表达），vmax 取 top 基因表达值的
-    # 全局 p99（绘图分位数，不是统计阈值；单基因离群值不至于把整体压暗）。
     sub = X[:, [gi[g] for g in top_genes]]
     sub_arr = np.asarray(sub.todense()) if hasattr(sub, "todense") else np.asarray(sub)
     vmax = float(np.quantile(sub_arr, 0.99))
     vmin = 0.0
     norm = Normalize(vmin=vmin, vmax=vmax)
     cmap = mpl.colormaps["viridis"]
-    for ax, g in zip(axes, top_genes):
+    for ui, g in enumerate(top_genes, start=1):
         v = X[:, gi[g]]
-        ax.scatter(xy[:, 0], xy[:, 1], c=v, s=3, cmap=cmap, norm=norm)
         row = res[res["gene"] == g].iloc[0]
-        ax.set_title(f"{g}\nI={row[stat_name]:.3f}", fontsize=7)
+        fig, ax = plt.subplots(figsize=(W_SINGLE, mm(58)))
+        ax.scatter(xy[:, 0], xy[:, 1], c=v, s=3, cmap=cmap, norm=norm)
+        ax.set_title(f"{g}  I={row[stat_name]:.3f}\n"
+                     f"shared scale 0 -> p99 = {vmax:.2f} (log1p)", fontsize=8)
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
-    for ax in axes[len(top_genes):]:
-        ax.axis("off")
-    fig.suptitle(f"Top {len(top_genes)} spatially variable genes "
-                 f"({stat_name}, BH p<0.05: {n_sig})\n"
-                 f"shared colour scale 0 -> p99 = {vmax:.2f} (log1p)")
-    # 共享 colorbar：constrained layout 会为它让出一列，不再逐面板画
-    fig.colorbar(ScalarMappable(norm=norm, cmap=cmap),
-                 ax=list(axes[:len(top_genes)]),
-                 label="expression (log1p, shared scale)",
-                 fraction=0.025, pad=0.01, shrink=0.6)
-    save_fig(cfg, "03-04-01-unit1-svg-top-genes", fig)
+        fig.colorbar(mpl.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax,
+                     shrink=0.8, pad=0.02, fraction=0.046,
+                     label="expression (log1p, shared scale)")
+        save_fig(cfg, f"03-04-01-unit{ui}-{g.lower()}", fig)
 
     # 统计量分布
     # **原始变量名不能进图**（评审 3.7/3.8：标题与 x 轴都写 "morans_I"）。

@@ -228,22 +228,24 @@ def run_06_niche(cfg: dict) -> dict:
     co.to_csv(res_dir / "niche_cooccurrence.csv", index=False)
     log_info(f"共现曲线: {len(core)} 个核心域 x {len(core)} 个邻居类型")
 
+    # 声明式动态名豁免：03-06-02 图号下最多 3 张（核心域号是运行时数据）
+    DYNAMIC_FIG_BASES = {"02": 3}
     if len(core) >= 2:
-        fig, axes = plt.subplots(1, min(3, len(core)),
-                                 figsize=(W_DOUBLE, mm(64)),
-                                 squeeze=False)
+        # **单图原则拆分（D-006）**：多核心域面板 -> 每域一张单图
+        # （P6 niche 共现对照链）。跨图对照同色纪律（tab20 按邻居类型编号）。
         cmap = plt.get_cmap("tab20")
-        for ax, core_t in zip(axes[0], core[:3]):
+        for ui, core_t in enumerate(core[:3], start=1):
             sub = co[co["core_type"] == core_t]
+            fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(64)))
             for i, nb in enumerate(core):
                 s = sub[sub["neighbor_type"] == nb]
                 ax.plot(s["distance"], s["fraction"], "o-", ms=3,
                         color=cmap(i % 20), label=nb)
             ax.set_xlabel("distance (pixel)")
             ax.set_ylabel("fraction of neighbors")
-            ax.set_title(f"around domain {core_t}")
+            ax.set_title(f"Neighborhood composition around domain {core_t}")
             ax.legend(fontsize=6, ncol=2)
-        save_fig(cfg, "03-06-02-unit1-niche-cooccurrence", fig)
+            save_fig(cfg, f"03-06-02-unit{ui}-niche-around-domain-{core_t}", fig)
 
     # ---- 4. 落盘 ------------------------------------------------------------
     status = {

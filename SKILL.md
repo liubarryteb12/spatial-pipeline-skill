@@ -103,14 +103,14 @@ python scripts/main_analysis.py --config assets/config.lymph_node.yml
 
 **20 张图**（`results/<dataset_id>/figures/`，图名格式见 AGENTS 规则 23），关键的几张：
 
-- `03-03-03-unit1-domains-on-he.png` —— 空间域叠在 H&E 上。**这是判断域划分是否
+- `03-03-03-unit1..3-domains-{expr-only,spatial,he-reference}.png（P3 组 3 张）` —— 空间域叠在 H&E 上。**这是判断域划分是否
   对应真实组织学结构的唯一方法。**
-- `03-02-03-unit1-pca-on-tissue.png` —— PC 的空间投影。有空间结构才说明主成分
+- `03-02-03-unit1..3-pc{1,2,3}-on-tissue.png（P2 组 3 张）` —— PC 的空间投影。有空间结构才说明主成分
   抓到了组织学差异而不是技术噪声。
 - `03-03-01-unit1-smoothing-scan.png` —— 平滑强度 vs 空间连贯性。让"选 α=0.5"有依据。
-- `03-04-01-unit1-svg-top-genes.png` —— top 空间高变基因的空间分布。
+- `03-04-01-unit1..30-<gene>.png（P4 组 30 张）` —— top 空间高变基因的空间分布。
 - `03-06-01-unit1-niche-enrichment-celltypes.png` —— 邻域富集 z-score 热图。
-- `03-05-01-unit1-deconvolution-spatial.png` —— 各细胞类型的相对权重空间分布。
+- `03-05-01-unit1..12-<celltype>.png（P5 组 12 张）` —— 各细胞类型的相对权重空间分布。
 
 **24 个结果文件**（JSON/CSV），每个都带 `method` 与 `limitations`。
 

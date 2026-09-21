@@ -43,7 +43,7 @@ from scipy.sparse.csgraph import connected_components  # noqa: E402
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, named_tools_note, parse_args, pkg_version,
                     probe_named_tools, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, mm, PAL,)
+                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm, PAL,)
 
 
 def spatial_neighbor_graph(adata, n_neighbors: int = 6):
@@ -673,72 +673,75 @@ def run_03_spatial_domains(cfg: dict) -> dict:
     r_plot = spot_radius_plot_units(entry["scalefactors"], "hires")
     xy = spatial_xy(adata, sf)
 
-    fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(56)))
-    for ax, key, title in zip(
-            axes,
-            ["domain_expr_only", "domain", None],
-            [f"Expression-only clustering ({m_expr['n_domains']} clusters)",
-             f"Spatial domains, α={alpha_used} ({m_spat['n_domains']} domains)",
-             "H&E reference"]):
-        ax.imshow(img, alpha=1.0 if key is None else 0.55)
-        if key is not None:
-            cats = adata.obs[key].astype(str).values
-            uniq = sorted(set(cats), key=lambda x: int(x) if x.isdigit() else x)
-            cmap = plt.get_cmap("tab20")
-            for i, u in enumerate(uniq):
-                m = cats == u
-                ax.scatter(xy[m, 0], xy[m, 1], s=8, color=cmap(i % 20),
-                           label=u, linewidths=0)
-            ax.legend(fontsize=6, markerscale=2.2, loc="upper right",
-                      ncol=2, framealpha=0.8)
+    # **单图原则拆分（D-006）**：三面板 -> 3 张独立单图（P3 域划分对照链）：
+    #   unit1 = 表达-only 聚类（证明"不平滑的聚类不知道空间"）
+    #   unit2 = 空间域（平滑后贴合组织）
+    #   unit3 = H&E 参考（生物学裁决依据）
+    # 三张图共享 xy 与 tab20 域色（同色纪律，跨图可对照）。
+    PANEL_SPECS = [("domain_expr_only", f"Expression-only clustering ({m_expr['n_domains']} clusters)",
+                    "03-03-03-unit1-domains-expr-only"),
+                   ("domain", f"Spatial domains, α={alpha_used} ({m_spat['n_domains']} domains)",
+                    "03-03-03-unit2-domains-spatial")]
+    for key, title, name in PANEL_SPECS:
+        cats = adata.obs[key].astype(str).values
+        uniq = sorted(set(cats), key=lambda x: int(x) if x.isdigit() else x)
+        cmap = plt.get_cmap("tab20")
+        fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(56)))
+        ax.imshow(img, alpha=0.55)
+        for i, u in enumerate(uniq):
+            m = cats == u
+            ax.scatter(xy[m, 0], xy[m, 1], s=8, color=cmap(i % 20),
+                       label=u, linewidths=0)
+        ax.legend(fontsize=6, markerscale=2.2, loc="upper right",
+                  ncol=2, framealpha=0.8)
         ax.set_title(title)
         ax.set_xticks([]); ax.set_yticks([])
-    # **suptitle 要折行。** constrained layout 不会给文字换行 —— 一行长标题
-    # 会把整张图撑得比 183 mm 宽，而 savefig.bbox="standard" 下多出来的
-    # 部分直接裁掉。_content_overflow() 就是靠这条抓到的。
-    fig.suptitle("Spatial domains overlaid on H&E\n"
-                 "(the only way to judge whether domains match real histology)")
-    save_fig(cfg, "03-03-03-unit1-domains-on-he", fig)
+        save_fig(cfg, name, fig)
+    # unit3：H&E 参考（无散点，纯组织学底图）
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(56)))
+    ax.imshow(img, alpha=1.0)
+    ax.set_title("H&E reference")
+    ax.set_xticks([]); ax.set_yticks([])
+    save_fig(cfg, "03-03-03-unit3-he-reference", fig)
 
     # ---- 5b. 方法对照图（只在点名方法真的跑了时才画）------------------------
     #
     # **"跑通了"不是结论，两套划分是否一致才是。** 所以图和方法名放在一起，
     # 让读者一眼看到 ARI 之外的东西：哪一块组织两套方法分歧最大。
     if spg_labels is not None or stg_labels is not None:
-        panels = [("domain", f"Builtin smooth+Leiden ({m_spat['n_domains']})")]
+        # **单图原则拆分（D-006）**：方法对照 -> 每方法一张独立单图
+        # （P3 组，unit4 起编号）。"哪一块组织两套方法分歧最大"由
+        # 读者跨图对照（同 tab20 域色 + 同一 H&E 底图保证可比）；
+        # ARI 汇总写在每张图副标题里（拆图后 suptitle 不存在了）。
+        sub = " / ".join(f"{k}: ARI={v['adjusted_rand_index']}"
+                         for k, v in method_agree.items())
+        panels = [("domain", f"Builtin smooth+Leiden ({m_spat['n_domains']})",
+                   "03-03-04-unit1-domains-builtin")]
         if spg_labels is not None:
             panels.append(("domain_spagcn",
-                           f"SpaGCN, kmeans init ({spg_info['n_domains']})"))
+                           f"SpaGCN, kmeans init ({spg_info['n_domains']})",
+                           "03-03-04-unit2-domains-spagcn"))
         if stg_labels is not None:
             panels.append(("domain_stagate",
-                           f"STAGATE ({stg_info['n_domains']})"))
-        fig_c, axes_c = plt.subplots(1, len(panels), figsize=(W_DOUBLE, mm(52)))
-        axes_c = np.atleast_1d(axes_c)
-        for ax, (key, title) in zip(axes_c, panels):
-            ax.imshow(img, alpha=0.55)
+                           f"STAGATE ({stg_info['n_domains']})",
+                           "03-03-04-unit3-domains-stagate"))
+        for _ui, (key, title, name) in enumerate(panels, start=1):
             cats = adata.obs[key].astype(str).values
             uniq = sorted(set(cats), key=lambda x: int(x) if x.isdigit() else x)
             cmap = plt.get_cmap("tab20")
+            fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(52)))
+            ax.imshow(img, alpha=0.55)
             for i, u in enumerate(uniq):
                 m = cats == u
                 ax.scatter(xy[m, 0], xy[m, 1], s=8, color=cmap(i % 20),
                            label=u, linewidths=0)
-            # **每个面板都要有 domain ID 图例**（评审 3.6：原先两个面板都
-            # 没有颜色→域编号的对照，读者只能看色块猜）。两套方法的域数不同，
-            # 所以各自给一份；域多时两列排。
             ax.legend(fontsize=5, markerscale=2.0, loc="upper right",
                       ncol=2 if len(uniq) > 8 else 1, framealpha=0.8,
                       title="domain", title_fontsize=6)
             ax.set_title(title)
             ax.set_xticks([]); ax.set_yticks([])
-        sub = " / ".join(f"{k}: ARI={v['adjusted_rand_index']}"
-                         for k, v in method_agree.items())
-        # **不要在图面上引用正文小节号，也不要用内部命名**（评审 3.8：
-        # "Named §3.2 methods vs builtin domains" 里的 §3.2 是正文编号、
-        # "builtin" 是代码内部叫法，读者都无从对应）。
-        fig_c.suptitle("Spatial domain methods compared on the same section\n"
-                       "each panel's legend gives its own domain IDs. " + sub)
-        save_fig(cfg, "03-03-04-unit1-domains-method-compare", fig_c)
+            save_fig(cfg, name, fig)
+        log_info(f"方法对照已拆分单图输出；一致性: {sub}")
 
     # ---- 6. 落盘 ------------------------------------------------------------
     adata.obs[["domain", "domain_expr_only"]].to_csv(res_dir / "spatial_domains.csv")

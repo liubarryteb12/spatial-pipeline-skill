@@ -29,7 +29,7 @@ import scanpy as sc  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, mm,)
+                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm,)
 
 HB_PREFIXES = ("HBA", "HBB", "HBD", "HBE", "HBG", "HBM", "HBQ", "HBZ")
 
@@ -123,20 +123,24 @@ def run_01_qc(cfg: dict) -> dict:
         "n_genes_by_counts": "Genes detected per spot",
         "pct_counts_mt": "Mitochondrial fraction (%)",
     }
-    fig, axes = plt.subplots(1, 3, figsize=(W_DOUBLE, mm(58)))
+    # **单图原则拆分（D-006）**：三联空间 QC 图拆为 3 张独立单图
+    # （P1 过滤前 QC 流程链-空间）。每个指标一张、独立达标图幅；
+    # "低质量 spot 是否聚在组织边缘"这类空间模式判断只需单指标图。
     xy = spatial_xy(adata)
-    for ax, key, cmap in zip(axes,
-                             ("total_counts", "n_genes_by_counts", "pct_counts_mt"),
-                             ("viridis", "viridis", "magma")):
+    for key, cmap in zip(("total_counts", "n_genes_by_counts", "pct_counts_mt"),
+                         ("viridis", "viridis", "magma")):
+        fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(58)))
         s = ax.scatter(xy[:, 0], xy[:, 1], c=adata.obs[key].astype(float),
                        s=4, cmap=cmap)
-        ax.set_title(QC_LABELS[key])
+        ax.set_title(f"{QC_LABELS[key]} (n={n0})")
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(s, ax=ax, shrink=0.8, pad=0.02, fraction=0.046,
                      label=QC_LABELS[key])
-    fig.suptitle(f"QC metrics on tissue (n={n0})")
-    save_fig(cfg, "03-01-01-unit1-qc-metrics-on-tissue", fig)
+        FIG_NAMES = {"total_counts": "03-01-01-unit1-counts-on-tissue",
+                      "n_genes_by_counts": "03-01-01-unit2-genes-on-tissue",
+                      "pct_counts_mt": "03-01-01-unit3-mito-on-tissue"}
+        save_fig(cfg, FIG_NAMES[key], fig)
 
     # ---- 3. 过滤 ------------------------------------------------------------
     q = cfg["qc"]
@@ -186,22 +190,20 @@ def run_01_qc(cfg: dict) -> dict:
     # **两个面板都要写清"哪个指标 + 已过滤"**（评审 3.8：左面板标题只有
     # "After filtering (n=4025)" 不含指标名；右面板未标 after，无法与
     # 过滤前 n=4035 直接对照）。
-    fig, axes = plt.subplots(1, 2, figsize=(W_DOUBLE, mm(72)))
+    # **单图原则拆分（D-006）**：过滤后两面板 -> 2 张独立单图（P1 组）。
+    # "哪个指标 + 已过滤 + n=" 的验收要求保留在各自标题里。
     xy = spatial_xy(adata)
-    s0 = axes[0].scatter(xy[:, 0], xy[:, 1], c=adata.obs["total_counts"].astype(float),
-                         s=5, cmap="viridis")
-    axes[0].set_title(f"Total counts per spot, after filtering (n={adata.n_obs})")
-    fig.colorbar(s0, ax=axes[0], shrink=0.8, pad=0.02, fraction=0.046,
-                 label="Total counts per spot")
-    s1 = axes[1].scatter(xy[:, 0], xy[:, 1], c=adata.obs["pct_counts_mt"].astype(float),
-                         s=5, cmap="magma")
-    axes[1].set_title(f"Mitochondrial fraction (%), after filtering (n={adata.n_obs})")
-    fig.colorbar(s1, ax=axes[1], shrink=0.8, pad=0.02, fraction=0.046,
-                 label="Mitochondrial fraction (%)")
-    for ax in axes:
+    AFTER_SPECS = {"03-01-02-unit1-counts-on-tissue-after": ("total_counts", "viridis", "Total counts per spot"),
+                   "03-01-02-unit2-mito-on-tissue-after": ("pct_counts_mt", "magma", "Mitochondrial fraction (%)")}
+    for _name, (_key, _cmap, _lab) in AFTER_SPECS.items():
+        fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(72)))
+        s = ax.scatter(xy[:, 0], xy[:, 1], c=adata.obs[_key].astype(float),
+                       s=5, cmap=_cmap)
+        ax.set_title(f"{_lab}, after filtering (n={adata.n_obs})")
+        fig.colorbar(s, ax=ax, shrink=0.8, pad=0.02, fraction=0.046, label=_lab)
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
-    save_fig(cfg, "03-01-02-unit1-qc-on-tissue-after", fig)
+        save_fig(cfg, _name, fig)
 
     # ---- 6. 落盘 ------------------------------------------------------------
     out = data_dir / "qc_filtered.h5ad"
