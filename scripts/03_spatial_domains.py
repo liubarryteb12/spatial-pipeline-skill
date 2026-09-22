@@ -714,7 +714,7 @@ def run_03_spatial_domains(cfg: dict) -> dict:
             m = cats == u
             ax.scatter(xy[m, 0], xy[m, 1], s=8, color=cmap(i % 20),
                        label=u, linewidths=0)
-        ax.legend(fontsize=6, markerscale=2.2, loc="outside upper right",
+        fig.legend(fontsize=6, markerscale=2.2, loc="outside upper right",
                   ncol=2, framealpha=0.8)
         ax.set_title(title)
         ax.set_xticks([]); ax.set_yticks([])
@@ -762,7 +762,7 @@ def run_03_spatial_domains(cfg: dict) -> dict:
                 m = cats == u
                 ax.scatter(xy[m, 0], xy[m, 1], s=8, color=cmap(i % 20),
                            label=u, linewidths=0)
-            ax.legend(fontsize=5, markerscale=2.0, loc="outside upper right",
+            fig.legend(fontsize=5, markerscale=2.0, loc="outside upper right",
                       ncol=2 if len(uniq) > 8 else 1, framealpha=0.8,
                       title="domain", title_fontsize=6)
             ax.set_title(title)

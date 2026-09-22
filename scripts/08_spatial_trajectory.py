@@ -284,7 +284,7 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
     ax.hist(spatial_pt, bins=40, alpha=0.65, label="spatially-smoothed", color="#2166AC")
     ax.set_xlabel("pseudotime"); ax.set_ylabel("n spots")
     ax.set_title("Pseudotime distributions")
-    ax.legend(fontsize=8)
+    fig.legend(fontsize=8, loc="outside upper right")
     save_fig(cfg, "03-08-02-unit1-pseudotime-distributions", fig)
 
     fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(64)))

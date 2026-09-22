@@ -244,7 +244,7 @@ def run_06_niche(cfg: dict) -> dict:
             ax.set_xlabel("distance (pixel)")
             ax.set_ylabel("fraction of neighbors")
             ax.set_title(f"Neighborhood composition around domain {core_t}")
-            ax.legend(fontsize=6, ncol=2)
+            fig.legend(fontsize=6, ncol=2, loc="outside upper right")
             save_fig(cfg, f"03-06-02-unit{ui}-niche-around-domain-{core_t}", fig)
 
     # ---- 4. 落盘 ------------------------------------------------------------
