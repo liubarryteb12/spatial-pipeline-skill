@@ -674,7 +674,7 @@ def run_05_deconvolution(cfg: dict) -> dict:
                       "NOT deconvolved cell fractions)")
         ax.set_title("Marker-score composition per spatial domain\n"
                      "(no reference available: scores, not real deconvolution)")
-        ax.legend(fontsize=6, ncol=2, loc="center left", bbox_to_anchor=(1.0, 0.5))
+        ax.legend(fontsize=6, ncol=2, loc="outside upper right")
         save_fig(cfg, "03-05-02-unit1-deconvolution-by-domain", fig)
         by_dom.to_csv(res_dir / "deconvolution_by_domain.csv")
 
