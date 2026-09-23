@@ -221,7 +221,7 @@ def run_07_spatial_communication(cfg: dict) -> dict:
         Line2D([0], [0], color="#B2182B", ls="--", lw=0.8, label="z = +2"),
         Line2D([0], [0], color="#2166AC", ls="--", lw=0.8, label="z = -2"),
     ]
-    fig.legend(handles=handles, fontsize=5.5, loc="outside upper right", frameon=True)
+    fig.legend(handles=handles, fontsize=5.5, loc="outside right center", frameon=True)
     colors = ["#B2182B" if z > 2 else ("#2166AC" if z < -2 else "#999999")
               for z in top["z_score"]]
     ax.barh(range(len(top)), top["z_score"], color=colors)
