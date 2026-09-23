@@ -609,3 +609,17 @@ Patch/Line2D 显式图例（含两条阈值线），title 里不再用 "`|z|>2 d
 长类型名（Fibroblastic_reticular_cell）的竖排文字挤进相邻面板 ——
 修共享量程却引入新重叠。共享量程由 suptitle 统一说明，刻度数字足够。
 
+
+## 26. 图例一律图框外右侧、纵向排列（用户约定 v2，2026-09-23）
+
+**图例不能画在图框（panel）里面，也不能放在顶部** —— 框内会压住数据点，
+顶部会把主图压扁变形（实测校准图 / UMAP / 去卷积条形图被压得很扁）。
+
+- **matplotlib**：`fig.legend(loc="outside right center", ncol=1)`。
+  `loc="outside ..."` **只对 `fig.legend()` 有效**，传给 `ax.legend()` 会报
+  `ValueError: 'outside' option ... only works for figure legends`（实测
+  run 35749568552 因此崩了整个 job）。
+  所有 axes 级图例必须改成 `fig.legend(...)`。
+- **`ncol=1` 强制纵向单列** —— 多图例时默认可能横排，必须显式指定。
+- constrained layout 会自动为框外图例让出空间；**改完要亲读**确认没被裁掉
+  （`savefig.bbox: standard` 下溢出是静默裁，见规则 13 同类问题）。
