@@ -510,7 +510,7 @@ def run_04_svg(cfg: dict) -> dict:
     ax.set_ylabel("number of genes")
     ax.set_title(f"{stat_label} distribution across {len(res)} genes\n"
                  f"BH-adjusted p<0.05: {n_sig} genes ({n_sig / max(len(res), 1):.1%})")
-    fig.legend(fontsize=8, loc="outside right center")
+    fig.legend(fontsize=8, ncol=1, loc="outside right center")
     save_fig(cfg, "03-04-02-unit1-svg-stat-distribution", fig)
 
     # ---- 7. SpatialDE 交叉验证（文档 §3.4）---------------------------------
