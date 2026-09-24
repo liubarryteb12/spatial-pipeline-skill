@@ -43,7 +43,7 @@ from scipy.sparse.csgraph import connected_components  # noqa: E402
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, named_tools_note, parse_args, pkg_version,
                     probe_named_tools, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm, fix_dotplot_legends, PAL,)
+                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm, plot_marker_dotplot, PAL,)
 
 
 def spatial_neighbor_graph(adata, n_neighbors: int = 6):
@@ -544,26 +544,59 @@ def run_03_spatial_domains(cfg: dict) -> dict:
     # 期刊的一页。
     top3 = [g for g in top3 if g in adata.raw.var_names][:24]
     if top3:
-        sc.pl.dotplot(adata, top3, groupby="domain", use_raw=True, show=False,
-                      standard_scale="var")
-        fig = plt.gcf()
-        # scanpy 自己按基因数定尺寸，这里拉回标准双栏宽。
-        # 高度 96 mm 是实测值：80 mm 时域标签顶出画布 +4.2%，88 mm 时 +2.6%
-        fig.set_size_inches(W_DOUBLE, mm(96))
-        # **图例列整列整理**（约定 v2 + 用户第三轮反馈）：点大小图例与色标
-        # 都转纵排、上下排列互不重叠。scanpy 的 `_plot_colorbar` 硬编码
-        # orientation="horizontal"，无参数可改，只能后处理。
-        # 必须在 set_size_inches 之后调用（position 换算依赖最终画幅）。
-        fix_dotplot_legends(fig,
-                            size_title="Fraction of spots in domain (%)",
-                            cbar_title="Mean expression in group")
-        # **轴语义与归一化口径写在图上**（评审 3.8），且 **suptitle 必须自己
-        # 折行** —— constrained layout 不折行长标题（规则 15，实测两侧被裁）。
-        fig.suptitle("Top markers per spatial domain\n"
-                     "rows = spatial domains; dot size = fraction of spots "
-                     "expressing the gene\n"
-                     "colour = mean expression (z-scored per gene, "
-                     "standard_scale = var)")
+        # **手工画 dotplot，不用 `sc.pl.dotplot`。** 用户 2026-09-24 第五轮
+        # 指出的四个问题与 scrna 侧同源（详见那边注释）：
+        # ① 标度矛盾 —— `standard_scale="var"` 实为逐基因 min-max（0-1），
+        #    不是 z-score。改为真 z-score + RdBu_r 对称色标。
+        # ② 基因名左缘裁切（MS4A4X/UBA1B 是 10x 参考自带的符号，保留原名；
+        #    裁切问题由自绘布局解决）。
+        # ③ 副标题截断、Y 轴没标 Spatial domain → 自绘 + 显式 ylabel。
+        # ④ 图例圆点粘连 → 大小图例单独轴、间距显式。
+        # 用 **log 化的全基因集**（adata.raw，规则 9）：marker 多为低表达
+        raw = adata.raw.to_adata() if adata.raw is not None else adata
+        sub = raw[:, top3]
+        X = np.asarray(sub.X.todense()) if hasattr(sub.X, "todense") else np.asarray(sub.X)
+        groups = adata.obs["domain"].astype(str).values
+        ud = sorted(set(groups), key=lambda v: int(v))
+        frac = np.zeros((len(ud), len(top3)))
+        mean_expr = np.zeros((len(ud), len(top3)))
+        for ri in range(len(ud)):
+            blk = X[groups == ud[ri]]
+            frac[ri] = (blk > 0).mean(axis=0)
+            mean_expr[ri] = blk.mean(axis=0)
+        sd = mean_expr.std(axis=0, ddof=0)
+        sd[sd == 0] = 1.0
+        zmat = (mean_expr - mean_expr.mean(axis=0)) / sd
+
+        frac_df = pd.DataFrame(frac, index=ud, columns=top3)
+        z_df = pd.DataFrame(zmat, index=ud, columns=top3)
+
+        fig = plt.figure(figsize=(W_DOUBLE, mm(133)))
+        gspec = fig.add_gridspec(1, 2, width_ratios=[5.2, 1.0], wspace=0.06)
+        ax = fig.add_subplot(gspec[0, 0])
+        sm, size_handles = plot_marker_dotplot(ax, frac_df, z_df)
+        ax.set_xlabel("gene")
+        ax.set_ylabel("Spatial domain")
+        fig.suptitle("Top markers per spatial domain", fontsize=11)
+        ax.set_title(
+            "rows = spatial domains (histology labels: domain_labels.csv)"
+            "\ndot size = fraction of spots expressing the gene",
+            fontsize=8, pad=8, loc="left")
+
+        lax = fig.add_subplot(gspec[0, 1])
+        lax.set_xlim(0, 1); lax.set_ylim(0, 1)
+        lax.axis("off")
+        lax.set_title("Dot size (%)", fontsize=7.5, pad=6, loc="left")
+        for k, (f_, s_) in enumerate(size_handles):
+            yy = 0.80 - k * 0.11
+            lax.scatter([0.34], [yy], s=s_, color="gray",
+                        edgecolor="black", linewidth=0.3)
+            lax.text(0.52, yy, f"{int(f_ * 100)}", va="center", fontsize=7.5)
+        cax = fig.add_axes([0.900, 0.18, 0.020, 0.22])
+        cb = fig.colorbar(sm, cax=cax, orientation="vertical")
+        cb.set_label("mean expression\nz-scored per gene", fontsize=7)
+        cb.ax.tick_params(labelsize=7)
+
         save_fig(cfg, "03-03-02-unit1-domain-markers-dotplot", fig)
 
     # ---- 4b. 域的组织学标签（用 marker 签名打分）----------------------------
