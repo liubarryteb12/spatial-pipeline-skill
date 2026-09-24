@@ -50,7 +50,7 @@ import scipy.sparse as sp  # noqa: E402
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, probe_named_tools, record_step,
                     save_fig, set_seed, spot_radius_plot_units, write_json,
-                    spatial_xy, W_DOUBLE, W_SINGLE, mm, PAL,)
+                    spatial_xy, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, PAL,)
 
 
 def build_weights(adata, n_neighbors: int = 6, row_standardize: bool = True):
@@ -492,10 +492,18 @@ def run_04_svg(cfg: dict) -> dict:
     # **原始变量名不能进图**（评审 3.7/3.8：标题与 x 轴都写 "morans_I"）。
     STAT_LABEL = {"morans_I": "Moran's I", "gearys_C": "Geary's C"}
     stat_label = STAT_LABEL.get(stat_name, stat_name)
-    fig, ax = plt.subplots(figsize=(W_SINGLE, mm(60)))
+    # **图幅放宽到 W_ONE_HALF + 图例标签必须短。**
+    # 实测 bug（2026-09-24）：原 W_SINGLE(89mm) 配 `loc="outside right center"`
+    # 的**长图例**（60/63 字符），constrained layout 把坐标轴**挤到只剩约 100px**
+    # —— 1051px 宽的画布里 axes 仅占 10%，直方图柱子被压得完全看不见，
+    # 图看起来"只有两条参考线"。而且**不报错**：CI 全绿、status ok、
+    # check_figures 也报"有墨迹"（图例文字就是墨）。只有打开图才发现是空的。
+    #
+    # 两处一起改：① 图幅 89→136mm；② 图例标签压到 ~28 字符以内，数值移进副标题。
+    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(60)))
     ax.hist(res[stat_name], bins=60, color=PAL["primary"], alpha=0.85)
     ax.axvline(expected, color=PAL["highlight"], ls="--", lw=1.2,
-               label=f"expected under no autocorrelation = {expected:.4f}")
+               label="expected (no autocorr.)")
     # **显著性用标题报数 + 一条真实可算的参考线。** 临界值不能画成"BH 阈值
     # 竖线"—— BH 临界值是逐基因 p 的函数、不是统计量的固定值。能画的是
     # **显著基因集合的边界值**：Moran's I 越大越有结构，取 min；Geary's C
@@ -505,11 +513,15 @@ def run_04_svg(cfg: dict) -> dict:
         edge = (float(sig[stat_name].min()) if method == "moran"
                 else float(sig[stat_name].max()))
         ax.axvline(edge, color=PAL["highlight"], ls=":", lw=1.2,
-                   label=f"{stat_label} at the significant-set edge = {edge:.3f}")
+                   label="significant-set edge")
     ax.set_xlabel(stat_label)
     ax.set_ylabel("number of genes")
+    # 数值移进副标题（图例只留短标签，避免重新挤压坐标轴）
+    _sig_line = (f"dashed = expected {expected:.4f}; dotted = sig-set edge {edge:.3f}"
+                 if len(sig) else f"dashed = expected {expected:.4f}")
     ax.set_title(f"{stat_label} distribution across {len(res)} genes\n"
-                 f"BH-adjusted p<0.05: {n_sig} genes ({n_sig / max(len(res), 1):.1%})")
+                 f"BH-adjusted p<0.05: {n_sig} genes ({n_sig / max(len(res), 1):.1%})\n"
+                 f"{_sig_line}")
     fig.legend(fontsize=8, ncol=1, loc="outside right center")
     save_fig(cfg, "03-04-02-unit1-svg-stat-distribution", fig)
 

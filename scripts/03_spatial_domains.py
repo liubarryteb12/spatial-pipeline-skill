@@ -43,7 +43,7 @@ from scipy.sparse.csgraph import connected_components  # noqa: E402
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, named_tools_note, parse_args, pkg_version,
                     probe_named_tools, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm, PAL,)
+                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm, verticalize_dotplot_size_legend, PAL,)
 
 
 def spatial_neighbor_graph(adata, n_neighbors: int = 6):
@@ -547,6 +547,10 @@ def run_03_spatial_domains(cfg: dict) -> dict:
         sc.pl.dotplot(adata, top3, groupby="domain", use_raw=True, show=False,
                       standard_scale="var")
         fig = plt.gcf()
+        # **点大小图例必须转成纵排**（约定 v2）。scanpy 的 `DotPlot` 没有控制
+        # 图例方向的参数，内部把示例点画在 x 轴上（横排）—— 用户 2026-09-24
+        # 反馈的"图例横着排布、示例横向"就是这里。后处理成纵排。
+        verticalize_dotplot_size_legend(fig, title="Fraction of spots in domain (%)")
         # scanpy 自己按基因数定尺寸，这里拉回标准双栏宽。
         # 高度 96 mm 是实测值：80 mm 时域标签顶出画布 +4.2%，88 mm 时 +2.6%
         fig.set_size_inches(W_DOUBLE, mm(96))

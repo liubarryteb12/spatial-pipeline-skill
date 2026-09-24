@@ -85,10 +85,55 @@ def run_02_normalize(cfg: dict) -> dict:
     log_info(f"高变基因: {n_hvg}")
     adata.raw = adata
 
-    sc.pl.highly_variable_genes(adata, show=False)
-    fig = plt.gcf()
-    fig.suptitle(f"HVG ({hvg_flavor_used}, n={n_hvg})")
-    save_fig(cfg, "03-02-01-unit1-hvg-selection", fig)
+    # **不用 `sc.pl.highly_variable_genes`。** 实测它出的图有三个问题
+    # （用户 2026-09-24 反馈"未满足单图准则，点颜色和图例布局/颜色有问题"）：
+    #
+    #   1. **它是双面板图**（normalized variance 一栏 + not-normalized 一栏），
+    #      违反单图原则（D-006：一个功能单元一张单图）；
+    #   2. **图例是框内横排**的 scanpy 默认样式（"highly variable genes" /
+    #      "other genes" 横着铺在图中间），压住数据点，且违反约定 v2；
+    #   3. **点色是 scanpy 默认的深灰/浅灰**，白底对比度低，"哪些是 HVG"
+    #      不能一目了然。
+    #
+    # 改为自己画两张单图：`sc.pp.highly_variable_genes` 已经把
+    # `means` / `variances` / `variances_norm` / `highly_variable` 写进
+    # `adata.var`，直接用那些列画即可（不重算，口径与 scanpy 一致）。
+    hv = adata.var["highly_variable"].to_numpy()
+    means = adata.var["means"].to_numpy()
+    variances = adata.var["variances"].to_numpy()
+    # 用 PAL 的两个语义色：HVG 用 highlight（醒目），其余用 muted（次要参照）。
+    # 两者色相距离远超 15°，白底对比度也达标（check_palette 已校验）。
+    colors = np.where(hv, PAL["highlight"], PAL["muted"])
+
+    # unit1：标准化后的方差 vs 平均表达（scanpy 用来选 HVG 的那张）
+    fig1, ax1 = plt.subplots(figsize=(W_ONE_HALF, mm(70)))
+    ax1.scatter(means, adata.var["variances_norm"].to_numpy(),
+                c=colors, s=3, linewidths=0, alpha=0.7)
+    ax1.set_xlabel("mean expression of genes")
+    ax1.set_ylabel("variances of genes (normalized)")
+    ax1.set_title(f"HVG selection ({hvg_flavor_used}, n={n_hvg})\n"
+                  "orange = highly variable; grey = other genes")
+    # **图例用显式 Patch**（颜色编码了类别就必须有图例，规则 24.2），
+    # 且走 `fig.legend` + `ncol=1`（约定 v2：框外右侧、纵向单列）。
+    fig1.legend(handles=[
+        matplotlib.patches.Patch(color=PAL["highlight"], label="highly variable genes"),
+        matplotlib.patches.Patch(color=PAL["muted"], label="other genes"),
+    ], fontsize=7, ncol=1, loc="outside right center")
+    save_fig(cfg, "03-02-01-unit1-hvg-selection", fig1)
+
+    # unit2：未标准化的方差（原始尺度）—— 与 unit1 同图号不同单元，
+    # 保留"这两张原本是一张双面板图"的来源信息（单图原则的 unit 约定）。
+    fig2, ax2 = plt.subplots(figsize=(W_ONE_HALF, mm(70)))
+    ax2.scatter(means, variances, c=colors, s=3, linewidths=0, alpha=0.7)
+    ax2.set_xlabel("mean expression of genes")
+    ax2.set_ylabel("variances of genes (not normalized)")
+    ax2.set_title("Raw variance vs mean expression\n"
+                  "orange = highly variable; grey = other genes")
+    fig2.legend(handles=[
+        matplotlib.patches.Patch(color=PAL["highlight"], label="highly variable genes"),
+        matplotlib.patches.Patch(color=PAL["muted"], label="other genes"),
+    ], fontsize=7, ncol=1, loc="outside right center")
+    save_fig(cfg, "03-02-01-unit2-hvg-raw-variance", fig2)
 
     # ---- 2. PCA -------------------------------------------------------------
     work = adata[:, adata.var["highly_variable"]].copy()

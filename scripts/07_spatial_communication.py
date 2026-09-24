@@ -40,7 +40,8 @@ import yaml  # noqa: E402
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, probe_named_tools, record_step, save_fig,
                     set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm,)
+                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm,
+                    PAL,)
 
 
 def load_lr_pairs(cfg: dict):
@@ -212,25 +213,38 @@ def run_07_spatial_communication(cfg: dict) -> dict:
     fig, ax = plt.subplots(figsize=(W_ONE_HALF, fig_h))
     # **条形颜色有含义就必须有图例。** 红灰蓝三色此前没有任何说明，
     # 蓝色 z=-2 虚线更是画在"通常没有数据"的左侧空白处，读者无从知道它是什么。
+    #
+    # **颜色一律走 PAL，不写裸字面量**（AGENTS 规则 13）。原写法就地写了
+    # `#B2182B` / `#999999` / `#2166AC` —— 与 PAL 的语义色**不一致**
+    # （PAL["highlight"] 是 #D55E00 橙，不是红），于是同一张图里"阈值线"
+    # 和别处的"阈值线"不同色，读者要重新学一遍配色。用户反馈的
+    # "图例布局有问题"正是这套自造配色 + 框内长图例叠加的结果。
     from matplotlib.patches import Patch
     from matplotlib.lines import Line2D
+    # 用本仓库 PAL 的语义键（不是 geo 侧的 up/down —— 那套名字这里没有）。
+    # 富集=highlight（橙）、耗竭=blue、中性=muted（灰）；三者色相与对比度
+    # 已由 check_palette.mjs 校验。
+    c_up, c_dn, c_ns = PAL["highlight"], PAL["blue"], PAL["muted"]
     handles = [
-        Patch(facecolor="#B2182B", label="z > +2 (enriched near)"),
-        Patch(facecolor="#999999", label="-2 <= z <= +2"),
-        Patch(facecolor="#2166AC", label="z < -2 (depleted near)"),
-        Line2D([0], [0], color="#B2182B", ls="--", lw=0.8, label="z = +2"),
-        Line2D([0], [0], color="#2166AC", ls="--", lw=0.8, label="z = -2"),
+        Patch(facecolor=c_up, label="z > +2 (enriched near)"),
+        Patch(facecolor=c_ns, label="-2 <= z <= +2"),
+        Patch(facecolor=c_dn, label="z < -2 (depleted near)"),
+        Line2D([0], [0], color=c_up, ls="--", lw=0.8, label="z = +2"),
+        Line2D([0], [0], color=c_dn, ls="--", lw=0.8, label="z = -2"),
     ]
-    fig.legend(handles=handles, fontsize=5.5, ncol=1, loc="outside right center", frameon=True)
-    colors = ["#B2182B" if z > 2 else ("#2166AC" if z < -2 else "#999999")
+    # **图例放框外右侧、纵向单列**（约定 v2）。原 `frameon=True` 的框内图例
+    # 压在条形上（20 条时图例正好盖住中段数据）。
+    fig.legend(handles=handles, fontsize=5.5, ncol=1,
+               loc="outside right center", frameon=False)
+    colors = [c_up if z > 2 else (c_dn if z < -2 else c_ns)
               for z in top["z_score"]]
     ax.barh(range(len(top)), top["z_score"], color=colors)
     ax.set_yticks(range(len(top)))
     ax.set_yticklabels([f"{r.ligand}–{r.receptor}" for r in top.itertuples()],
                        fontsize=7)
-    ax.axvline(0, color="k", lw=0.6)
-    ax.axvline(2, color="#B2182B", ls="--", lw=0.8)
-    ax.axvline(-2, color="#2166AC", ls="--", lw=0.8)
+    ax.axvline(0, color=PAL["black"], lw=0.6)
+    ax.axvline(2, color=c_up, ls="--", lw=0.8)
+    ax.axvline(-2, color=c_dn, ls="--", lw=0.8)
     ax.set_xlabel("spatial enrichment z-score (near vs random)")
     ax.set_title(f"Ligand–receptor spatial enrichment\n"
                  f"{len(usable)}/{len(pairs)} pairs usable")
