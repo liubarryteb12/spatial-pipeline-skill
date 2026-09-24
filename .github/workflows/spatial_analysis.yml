@@ -103,6 +103,10 @@ jobs:
         run: |
           node tools/check_py_syntax.mjs
           node tools/check_artifact_paths.mjs
+          # 图例必须在图框外右侧、纵向排列（规则 26，用户约定 v2）。
+          # 既有检查器全都看不见图例位置 —— 图例压在数据点上的图，
+          # 在"文件存在 / 有墨迹 / 图名合规 / 配色合规 / 图幅合规"眼里都是合格的。
+          node tools/check_legend_convention.mjs
           # 「汇总产物」那段打印逻辑的自检：喂合成 JSON，确认诊断字段
           # （seeded_before_train / adjusted_rand_index / ari_observed_range）
           # **不再被 [:500] 截断掉**。这段逻辑写错了不会有任何报错 ——

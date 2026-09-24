@@ -623,3 +623,13 @@ Patch/Line2D 显式图例（含两条阈值线），title 里不再用 "`|z|>2 d
 - **`ncol=1` 强制纵向单列** —— 多图例时默认可能横排，必须显式指定。
 - constrained layout 会自动为框外图例让出空间；**改完要亲读**确认没被裁掉
   （`savefig.bbox: standard` 下溢出是静默裁，见规则 13 同类问题）。
+
+**门禁**：`node tools/check_legend_convention.mjs`
+（三仓同一份，静态扫源码；CI 在"静态检查（不装依赖）"那一步跑）。
+它抓两类**确定错**：`fig.legend` 缺 `loc="outside..."` 或缺 `ncol=1`、
+`ax.legend` 用了 `loc="outside..."`。
+
+> **为什么需要门禁而不是靠记：** `check_py_syntax.mjs` 只查未定义名字，
+> 看不见图例位置。一张图例压在数据点上的图，在
+> "文件存在 / 有墨迹 / 图名合规 / 配色合规 / 图幅合规"眼里**全都是合格的** ——
+> 这正是工作区治理层错误台账（`governance/15_ERROR_LEDGER.md`，**不在本仓库内**）E-06「门禁本身有盲区」的又一例。
