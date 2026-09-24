@@ -43,7 +43,7 @@ from scipy.sparse.csgraph import connected_components  # noqa: E402
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, named_tools_note, parse_args, pkg_version,
                     probe_named_tools, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm, verticalize_dotplot_size_legend, PAL,)
+                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm, fix_dotplot_legends, PAL,)
 
 
 def spatial_neighbor_graph(adata, n_neighbors: int = 6):
@@ -547,19 +547,23 @@ def run_03_spatial_domains(cfg: dict) -> dict:
         sc.pl.dotplot(adata, top3, groupby="domain", use_raw=True, show=False,
                       standard_scale="var")
         fig = plt.gcf()
-        # **点大小图例必须转成纵排**（约定 v2）。scanpy 的 `DotPlot` 没有控制
-        # 图例方向的参数，内部把示例点画在 x 轴上（横排）—— 用户 2026-09-24
-        # 反馈的"图例横着排布、示例横向"就是这里。后处理成纵排。
-        verticalize_dotplot_size_legend(fig, title="Fraction of spots in domain (%)")
         # scanpy 自己按基因数定尺寸，这里拉回标准双栏宽。
         # 高度 96 mm 是实测值：80 mm 时域标签顶出画布 +4.2%，88 mm 时 +2.6%
         fig.set_size_inches(W_DOUBLE, mm(96))
-        # **轴语义与归一化口径写在图上**（评审 3.8：y 轴 0–12 无轴标题；
-        # "Mean expression in group" 是否 z-score 未说明）。
+        # **图例列整列整理**（约定 v2 + 用户第三轮反馈）：点大小图例与色标
+        # 都转纵排、上下排列互不重叠。scanpy 的 `_plot_colorbar` 硬编码
+        # orientation="horizontal"，无参数可改，只能后处理。
+        # 必须在 set_size_inches 之后调用（position 换算依赖最终画幅）。
+        fix_dotplot_legends(fig,
+                            size_title="Fraction of spots in domain (%)",
+                            cbar_title="Mean expression in group")
+        # **轴语义与归一化口径写在图上**（评审 3.8），且 **suptitle 必须自己
+        # 折行** —— constrained layout 不折行长标题（规则 15，实测两侧被裁）。
         fig.suptitle("Top markers per spatial domain\n"
                      "rows = spatial domains; dot size = fraction of spots "
-                     "expressing the gene; colour = mean expression "
-                     "(z-scored per gene)")
+                     "expressing the gene\n"
+                     "colour = mean expression (z-scored per gene, "
+                     "standard_scale = var)")
         save_fig(cfg, "03-03-02-unit1-domain-markers-dotplot", fig)
 
     # ---- 4b. 域的组织学标签（用 marker 签名打分）----------------------------
