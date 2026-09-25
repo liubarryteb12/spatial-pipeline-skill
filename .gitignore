@@ -1,8 +1,9 @@
 # 数据与产物：**不入库**
 # 单细胞数据动辄几百 MB 到几十 GB，入库会让 clone 变得不可用。
 # CI 每次都重新下载（内置数据集只有 7 MB）。
-data/
-results/
+# **前导 **/ 递归匹配** —— 只写 data/ 不覆盖 scripts/lib/data/（scrna 侧实测漏了 24 MB 缓存）
+**/data/
+**/results/
 
 # 缓存
 __pycache__/
