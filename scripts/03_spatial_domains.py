@@ -43,7 +43,7 @@ from scipy.sparse.csgraph import connected_components  # noqa: E402
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, named_tools_note, parse_args, pkg_version,
                     probe_named_tools, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm, plot_marker_dotplot, PAL,)
+                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm, plot_marker_dotplot, build_marker_dotplot_figure, PAL,)
 
 
 def spatial_neighbor_graph(adata, n_neighbors: int = 6):
@@ -572,44 +572,14 @@ def run_03_spatial_domains(cfg: dict) -> dict:
         z_df = pd.DataFrame(zmat, index=ud, columns=top3)
 
         # **图例放主图下方的横带（Seurat do_DotPlot 范式，用户第七/八轮反馈）。**
-        # 前七轮把两块图例竖着塞在右侧窄列里，标题与点列的相对位置调了四轮仍会
-        # 相撞 —— 改成主图下方横带后与点列物理分离（详见 scrna 侧同款注释）。
-        fig = plt.figure(figsize=(W_DOUBLE, mm(138)))
-        gspec = fig.add_gridspec(
-            2, 2, height_ratios=[4.0, 1.0], width_ratios=[1.0, 1.0],
-            hspace=0.04, wspace=0.10)
-        ax = fig.add_subplot(gspec[0, :])
-        sm, size_handles = plot_marker_dotplot(ax, frac_df, z_df)
-        ax.set_xlabel("gene")
-        ax.set_ylabel("Spatial domain")
-        fig.suptitle("Top markers per spatial domain", fontsize=11)
-        ax.set_title(
-            "rows = spatial domains (histology labels: domain_labels.csv)"
-            "\ndot size = fraction of spots expressing the gene",
-            fontsize=8, pad=8, loc="left")
-
-        # ---- 底部横带 · 左半：Percent Expressed (%)（4 点横排）-----------
-        lax = fig.add_subplot(gspec[1, 0])
-        lax.set_xlim(0, 1); lax.set_ylim(0, 1)
-        lax.axis("off")
-        lax.text(0.16, 0.92, "Percent Expressed (%)", ha="left",
-                 va="top", fontsize=7.5)
-        for k, (f_, s_) in enumerate(size_handles):
-            xx = 0.16 + k * 0.17
-            lax.scatter([xx], [0.45], s=s_, color="gray",
-                        edgecolor="black", linewidth=0.3)
-            lax.text(xx, 0.06, f"{int(f_ * 100)}", ha="center",
-                     va="top", fontsize=7.5)
-
-        # ---- 底部横带 · 右半：Mean Expression（横向色标）----------------
-        cax = fig.add_axes([0.665, 0.035, 0.150, 0.045])
-        cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
-        cax.text(0.0, 1.90, "Mean Expression", transform=cax.transAxes,
-                 ha="left", va="bottom", fontsize=7.5)
-        cb.set_ticks([-1, 0, 1])
-        cb.set_ticklabels(["Low", "Mid", "High"])
-        cb.ax.tick_params(labelsize=7, top=False, bottom=True,
-                          labeltop=False, labelbottom=True)
+        # 整图构建抽在 `common.build_marker_dotplot_figure` —— 前七轮把这段
+        # 内联在脚本里、验证脚本又照抄一份，三份镜像不同步，导致"改了没效果"
+        # 与七轮返工（详见该函数 docstring）。
+        fig, size_handles = build_marker_dotplot_figure(
+            frac_df, z_df,
+            group_label="Spatial domain",
+            title="Top markers per spatial domain",
+            subtitle="rows = spatial domains (histology labels: domain_labels.csv)\ndot size = fraction of spots expressing the gene")
 
         save_fig(cfg, "03-03-02-unit1-domain-markers-dotplot", fig)
 
