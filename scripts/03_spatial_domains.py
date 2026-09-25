@@ -586,13 +586,13 @@ def run_03_spatial_domains(cfg: dict) -> dict:
         lax = fig.add_subplot(gspec[0, 1])
         lax.set_xlim(0, 1); lax.set_ylim(0, 1)
         lax.axis("off")
-        lax.set_title("Dot size (%)", fontsize=7.5, pad=6, loc="left")
+        lax.set_title("Dot size (%)", fontsize=7.5, pad=2, loc="left")
         for k, (f_, s_) in enumerate(size_handles):
-            yy = 0.80 - k * 0.11
+            yy = 0.68 - k * 0.08
             lax.scatter([0.34], [yy], s=s_, color="gray",
                         edgecolor="black", linewidth=0.3)
             lax.text(0.52, yy, f"{int(f_ * 100)}", va="center", fontsize=7.5)
-        cax = fig.add_axes([0.900, 0.18, 0.020, 0.22])
+        cax = fig.add_axes([0.900, 0.10, 0.020, 0.20])
         cb = fig.colorbar(sm, cax=cax, orientation="vertical")
         cb.set_label("mean expression\nz-scored per gene", fontsize=7)
         cb.ax.tick_params(labelsize=7)
