@@ -571,9 +571,14 @@ def run_03_spatial_domains(cfg: dict) -> dict:
         frac_df = pd.DataFrame(frac, index=ud, columns=top3)
         z_df = pd.DataFrame(zmat, index=ud, columns=top3)
 
-        fig = plt.figure(figsize=(W_DOUBLE, mm(133)))
-        gspec = fig.add_gridspec(1, 2, width_ratios=[5.4, 1.0], wspace=0.03)
-        ax = fig.add_subplot(gspec[0, 0])
+        # **图例放主图下方的横带（Seurat do_DotPlot 范式，用户第七/八轮反馈）。**
+        # 前七轮把两块图例竖着塞在右侧窄列里，标题与点列的相对位置调了四轮仍会
+        # 相撞 —— 改成主图下方横带后与点列物理分离（详见 scrna 侧同款注释）。
+        fig = plt.figure(figsize=(W_DOUBLE, mm(138)))
+        gspec = fig.add_gridspec(
+            2, 2, height_ratios=[4.0, 1.0], width_ratios=[1.0, 1.0],
+            hspace=0.04, wspace=0.10)
+        ax = fig.add_subplot(gspec[0, :])
         sm, size_handles = plot_marker_dotplot(ax, frac_df, z_df)
         ax.set_xlabel("gene")
         ax.set_ylabel("Spatial domain")
@@ -583,25 +588,28 @@ def run_03_spatial_domains(cfg: dict) -> dict:
             "\ndot size = fraction of spots expressing the gene",
             fontsize=8, pad=8, loc="left")
 
-        lax = fig.add_subplot(gspec[0, 1])
+        # ---- 底部横带 · 左半：Percent Expressed (%)（4 点横排）-----------
+        lax = fig.add_subplot(gspec[1, 0])
         lax.set_xlim(0, 1); lax.set_ylim(0, 1)
         lax.axis("off")
-        fig.text(0.995, 0.78, "Percent Expressed (%)", ha="right",
-                  va="bottom", fontsize=7.5)
+        lax.text(0.16, 0.92, "Percent Expressed (%)", ha="left",
+                 va="top", fontsize=7.5)
         for k, (f_, s_) in enumerate(size_handles):
-            yy = 0.60 - k * 0.09
-            lax.scatter([0.38], [yy], s=s_, color="gray",
+            xx = 0.16 + k * 0.17
+            lax.scatter([xx], [0.45], s=s_, color="gray",
                         edgecolor="black", linewidth=0.3)
-            lax.text(0.56, yy, f"{int(f_ * 100)}", va="center", fontsize=7.5)
-        # 色标：**高度与大小图例一致**（0.34），水平标题在上方（不旋转）
-        cax = fig.add_axes([0.905, 0.08, 0.026, 0.32])
-        cb = fig.colorbar(sm, cax=cax, orientation="vertical")
-        cax.text(0.995, 0.45, "Mean Expression", transform=fig.transFigure,
-                 ha="right", va="bottom", fontsize=7)
+            lax.text(xx, 0.06, f"{int(f_ * 100)}", ha="center",
+                     va="top", fontsize=7.5)
+
+        # ---- 底部横带 · 右半：Mean Expression（横向色标）----------------
+        cax = fig.add_axes([0.665, 0.035, 0.150, 0.045])
+        cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
+        cax.text(0.0, 1.90, "Mean Expression", transform=cax.transAxes,
+                 ha="left", va="bottom", fontsize=7.5)
         cb.set_ticks([-1, 0, 1])
         cb.set_ticklabels(["Low", "Mid", "High"])
-        cb.ax.tick_params(labelsize=7, left=False, right=True,
-                          labelleft=False, labelright=True)
+        cb.ax.tick_params(labelsize=7, top=False, bottom=True,
+                          labeltop=False, labelbottom=True)
 
         save_fig(cfg, "03-03-02-unit1-domain-markers-dotplot", fig)
 
