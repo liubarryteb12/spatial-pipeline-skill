@@ -193,11 +193,10 @@ matplotlib 用 DejaVu Sans，**没有 CJK 字形** —— 图上显示成一个�
   无上限增长会画出装不进任何期刊一页的图 —— 实测修之前最宽的
   `domain_markers_dotplot` 是 370 mm。
 - `save_fig()` 默认**不再用 tight bbox**。`bbox_inches="tight"` 会**改变物理
-  输出尺寸**，让上面的毫米约定失效。溢出改由 `_content_overflow()` 检测并告警
-  —— **本仓库目前仍只告警**：姊妹项目 scrna 已把它升级成落盘
-  `figure_overflow.json` + 验收判红（见其 AGENTS 规则 25.3），
-  **本仓库尚未同步这一步**（缺口登记在 `governance/02_TASKLIST.md` 的 Q-26）。
-  门禁层的那一半已经同步：`check_figures.mjs` 现在会查内容贴边（规则 27）。
+  输出尺寸**，让上面的毫米约定失效。溢出改由 `_content_overflow()` 检测并
+  **落盘成 `figure_overflow.json`**（供验收判红，见规则 28.3）。
+  门禁层的另一半是 `check_figures.mjs` 的内容贴边检查（规则 27）——
+  **两者不能互相替代**：贴边是**事后**发现，落盘 + 验收判红是**当轮**发现。
 - **`set_seed()` 末尾会 `apply_style()`** —— rcParams 在**图创建时**就被读取，
   在 `save_fig()` 里设样式已经太晚。
 - 图上文字一律英文（见规则 11）。
@@ -676,8 +675,119 @@ const edgeBad = !darkBg && margins &&
 
 > **本文件与 `scrna-pipeline-skill/tools/check_figures.mjs` 必须逐字相同**
 > （两仓同一份，见该文件头注释）；改一侧必须同步另一侧并比对哈希。
+> 当前两侧 SHA256 已比对一致。
 >
-> **另一半尚未同步**：scrna 把溢出从"告警"升级成"落盘
-> `figure_overflow.json` + 验收判红"，**本仓库还没有这一步**（规则 15
-> 已如实标注）。贴边门禁是**事后**发现，落盘 + 验收判红是**当轮**发现，
-> 两者不能互相替代 —— 缺口登记在 `governance/02_TASKLIST.md` 的 Q-26。
+> **另一半是验收层的落盘 + 判红**（规则 28.3）。贴边门禁是**事后**发现，
+> 落盘 + 验收判红是**当轮**发现，两者不能互相替代 —— 一张在 CI 上被
+> 静默裁掉的图，要等 artifact 下载下来跑一遍门禁才被发现，而那时
+> 这一轮早就判绿了。
+
+
+## 28. 验收层四条补强（Q-27，2026-09-25）
+
+姊妹项目 `scrna-pipeline-skill/AGENTS.md` 规则 25 是同一批补强的另一半。
+**本仓库的口径与它不同**（规则 23：本仓库的图检查是 glob 数张数、
+不引用具体文件名），所以**没有照抄**，而是按空间侧的结构重新设计。
+
+### 28.1 步骤函数自己返回的 `status` 必须有人读（验收层）
+
+`run_steps` 把 `fn(cfg)` 的返回值记进了 `results[name]["result_status"]`，
+**而全仓没有一个消费者** —— 于是 `08_spatial_trajectory.py` 返回
+`bad_root` / `not_applicable` / `missing_pca` 时，验收照样记 `status="ok"`。
+
+**这不是"步骤崩了"，而是"步骤跑完了、但结果是『没做成』"** ——
+恰恰是最容易读成成功的一种。现在 `step_result:<sid>` 消费它，
+判据仍只把 `failed`/`error`/`fail` 判红；`bad_root` 之类的取值是
+**设计如此地没做成**，只可见（`honesty`）、不阻断。
+
+> **实现踩到的坑：** `chk(cid, kind, ok, detail, severity="required")` 的
+> **第二个位置参数是 `kind`（归类），不是 severity**。第一版把
+> `"required" if bad else "honesty"` 传在第二个位置，于是
+> `bad_root` 这些**本该只可见**的取值全被记成 required —— 注入测试里
+> 7 类 `result_status` 只有 `failed` 该红，实测却红了一片。
+> **`kind` 与 `severity` 同名同型同位置数相邻，传错不报错。**
+
+### 28.2 嵌套 `status` 的 `failed` 必须判红（验收层）
+
+`status` 不只在顶层。`domain_status.json` 的
+`domain_methods.STAGATE.status`、`deconvolution_status.json` 的
+`cell2location.status`、`svg_status.json` 的 `spatialde.status` 都是
+**嵌套**的，而旧验收层只看顶层 —— **里面崩了、顶层还是 `ok`**。
+
+姊妹仓库实测（E-48）：顶层分布 `{ok: 7, not_configured: 1}`，
+嵌套分布里躺着唯一一条 `failed`（`figsize` 三元素元组让整段抛异常），
+而它所属文件的顶层 `status` 是 `ok`。**顶层全绿、里面已经崩了。**
+
+实现是 `_iter_nested_status(obj, path=())` 递归产出
+`(路径, 值, 同级 reason)`，扫**全部** `*status.json`（不只可选步骤那几个）。
+判据只把 `failed`/`error`/`fail` 判红 —— 把 `needs_reference` /
+`package_missing` / `not_done` / `not_applicable` / `disabled` /
+`missing_domains` / `bad_root` 判红会让每个 job 都红，反而没人看。
+
+**本仓库实测嵌套分布 `{ok: 11, needs_reference: 1, package_missing: 1}` ——
+零命中、零误伤。**
+
+### 28.3 溢出检测必须落盘，不能只打 WARN（产物级）
+
+E-49 的形态：`_content_overflow()` **正确检测到了**
+`width_overflow_frac=0.3523`、**正确打了 WARN**，然后**没有任何人读**。
+
+**"检测到了"不等于"有人会知道"。** 现在 `save_fig()` 里的
+`_record_figure_overflow(cfg, name, bad)` 把溢出**落盘**到
+`results/<dataset_id>/figure_overflow.json`，验收层读它并**判红（required）**。
+
+三条配套约束：
+
+1. **与状态文件同理，跑前必须删旧文件** —— 否则图修好了旧记录还在，
+   验收把已修好的图判红（规则 16 的同一条道理）。
+2. **只累积、不覆盖** —— 同一次运行多张图溢出要全部记下。
+3. **记录可被修复** —— 标题改短后不应再新增记录。
+
+### 28.4 图验收从"数张数"换成"声明过的每张在不在"（验收层）
+
+旧判据是 `len(figs) >= 8` —— **纯计数**，于是"该有的图没有"这一整类
+问题没有任何检查看得见：姊妹仓库实测 5 张图因 `figsize` 三元素元组
+从未产出过，而验收 70 项全绿（E-48）。
+
+声明**从源码扫出来**（`declared_figures()`），不手抄表 —— 手抄的表会漂移，
+漂移方向恰好是"新加的图不在表里"，等于把盲区原样再造一遍。
+扫的时候要**排除 `main_analysis.py` 自己**（它的检查项里也有图名字符串，
+不排除会把"检查项的名字"当成"声明的图"）。
+
+三条判据分工：
+
+| 检查 | 判据 |
+|---|---|
+| `figures:declared` | 逐名核存在性；条件图不适用时进合法豁免 |
+| `figures:dynamic` | 声明了槽位的**动态图名**每组**至少产出 1 张** |
+| `figures:count` | `>= 8`，**保留为下限兜底**（声明扫描本身失效时还能拦住） |
+
+**动态图名为什么要单独一条**：名字运行期才拼得出来（`DYNAMIC_FIG_BASES`
+声明槽位数），不能逐名检查；但**整组 0 张**说明那段循环整段没跑 ——
+槽位是上限不是精确值，少出合法。
+
+> **这里有一个"判据因为输入域重叠而永远为真"的坑，正向标定看不出来：**
+> `03-03-04` 这个前缀**同时**有静态图（unit1/unit2/unit3）和动态图
+> （unit8 的 Jaccard 矩阵）。按前缀计数而不扣掉静态声明图的话，
+> 动态循环整段没跑时计数仍是 2（全是静态的），**判据永远不会响**。
+> 只有注入"整组动态图消失"才会暴露 —— 见规则 29。
+
+### 28.5 双向标定：正向零误报 + 反向逐类注入
+
+**这两半缺一不可。** 正向（拿真实 artifact 干跑）只能说明"没误报"；
+**一个永远返回 True 的判据在干净 artifact 上也是零命中**。
+所以逐类注入，确认每一类缺陷都真的会让**它自己那条**判据变红：
+
+| 注入 | 应红的判据 | 实测 |
+|---|---|---|
+| 删 1 张静态声明图 | `figures:declared` | ✅ 只它红 |
+| 删整组动态图（30 张） | `figures:dynamic` | ✅ 只它红 |
+| 写 `figure_overflow.json` | `figures:overflow` | ✅ 只它红 |
+| 嵌套 `STAGATE.status = failed` | `status:nested` | ✅ 只它红 |
+| 删全部图 | `count` + `declared` + `dynamic` | ✅ 三条都红 |
+
+正向：真实 artifact（`lymph_node`，76 张图）干跑 —— 新增 4 条检查
+**全部 PASS**，`n_checks` 59 → 63，**没有一条既有检查消失**。
+（干跑只调 `run_acceptance()` 并把所有写盘函数 patch 成 no-op ——
+否则会重写 artifact 里的 `acceptance_report.json`，那就变成
+"自己改自己的证据"了。）

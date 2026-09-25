@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import re
 import sys
 import time
 import traceback
@@ -80,10 +81,176 @@ INPUT_FILES = [
     ("domains.h5ad",      "最终态矩阵",    True),
 ]
 
+# 嵌套 status 里，哪些取值算"崩了"。其余（`needs_reference` /
+# `package_missing` / `not_done` / `not_applicable` / `disabled` /
+# `missing_domains` / `bad_root` …）都是**设计如此地没做**，只可见、不阻断。
+NESTED_FAILED_VALUES = ("failed", "error", "fail")
+
+# 本仓库的阶段号（geo=01 / scrna=02 / spatial=03）。
+PART = "03"
+
+
+def _strip_comments(src: str) -> str:
+    """逐行剥注释，**引号内不剥** —— 与 `tools/check_fig_names.mjs` 的
+    `stripComments` 同义。
+
+    口径必须一致：门禁层用 JS 那份扫"声明了哪些图"，验收层用这份扫，
+    两边算法不同就会对同一份源码给出不同的图名集合，而**没有任何东西
+    能发现它们不一致**（门禁绿、验收也绿）。
+    """
+    out = []
+    for line in src.split("\n"):
+        q, cut = None, None
+        for i, c in enumerate(line):
+            if q:
+                if c == q:
+                    q = None
+            elif c in "\"'":
+                q = c
+            elif c == "#":
+                cut = i
+                break
+        out.append(line if cut is None else line[:cut])
+    return "\n".join(out)
+
+
+def _script_sources():
+    for f in sorted((REPO / "scripts").glob("[0-9][0-9]_*.py")):
+        # **必须排除 main_analysis.py**：本文件的验收层会引用图名，
+        # 那是"检查对象"不是"出图声明"。不排除的话验收会要求自己
+        # 引用过的每张图都存在，把口径搞反。
+        if f.name == "main_analysis.py":
+            continue
+        yield f, _strip_comments(f.read_text(encoding="utf-8"))
+
+
+_FIG_NAME_RE = re.compile(
+    rf"^{PART}-\d{{2}}-\d{{2}}-unit\d+-[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def declared_figures() -> list:
+    """扫出**声明要出**的静态图名（字符串字面量）。
+
+    Q-27 / E-48：原来图验收是 `len(figs) >= 8` —— 一个纯计数。**"该有的
+    图没有"这一整类问题没有任何检查看得见**：姊妹仓库实测 5 张图因
+    `figsize` 三元素元组从未产出过，而验收 70 项全绿。
+
+    所以判据从"数量够不够"换成"**声明过的每张图在不在**"。声明从源码扫出来
+    而不是手抄一张表 —— 手抄的表会漂移，而漂移的方向恰好是"新加的图
+    不在表里"，也就是把 E-48 那个盲区原样再造一遍。
+
+    含 `{ }` 的模板串跳过（运行时拼名，由 `DYNAMIC_FIG_BASES` 声明豁免）。
+    """
+    out = []
+    pat = re.compile(rf'"{PART}-[^"]*"')
+    for _f, src in _script_sources():
+        for m in pat.finditer(src):
+            nm = re.sub(r"\.(pdf|png)$", "", m.group(0)[1:-1])
+            if "{" in nm or "}" in nm:
+                continue
+            if _FIG_NAME_RE.match(nm):
+                out.append(nm)
+    return sorted(set(out))
+
+
+def dynamic_fig_bases() -> dict:
+    """扫出 `DYNAMIC_FIG_BASES = {"<图号>": <张数>}` 声明。
+
+    键补全成完整前缀 `03-<模块号>-<图号>`。这是**槽位上限**，不是精确值：
+    实测 `03-03-04` 声明 3、实际只出 1（三对方法里只有一对算出了
+    Jaccard 矩阵），少出是合法的，多出才说明有未声明的名字。
+    """
+    out = {}
+    pat = re.compile(r"DYNAMIC_FIG_BASES\s*=\s*\{([^}]*)\}")
+    for f, src in _script_sources():
+        m = pat.search(src)
+        if not m:
+            continue
+        for pair in m.group(1).split(","):
+            if ":" not in pair:
+                continue
+            k, v = pair.split(":", 1)
+            key = k.strip().strip("\"'")
+            try:
+                out[f"{PART}-{f.name[:2]}-{key}"] = int(v.strip())
+            except ValueError:
+                continue
+    return out
+
+
+# 条件产出的图：**图名 -> (状态文件, 判据路径, 能力就位时的取值, 说明)**。
+#
+# 为什么需要这张表：有些图**本来就可以合法地不存在**，因为它的代码路径
+# 挂在一个能力探针后面。判据不能是"这张图必须在"，也不能是"把它从
+# 声明里删掉"（删掉就等于永远不再检查它）。
+#
+# 语义：判据路径取到的值 == "能力就位"的值时，这张图**变成必需**；
+# 否则允许缺失，但必须**可见**。
+#
+# **这不是"已知缺陷白名单"** —— 它写的是"为什么可以没有"，并且是
+# **自愈**的：STAGATE 哪天装上了、`status` 变成 `ok`，这张图立刻
+# 自动变成必需。白名单会把缺陷永久合法化，这张表不会。
+CONDITIONAL_FIGURES = {
+    "03-03-04-unit3-domains-stagate": (
+        "domain_status.json", ("domain_methods", "STAGATE", "status"), "ok",
+        "STAGATE_pyG 装不上时（`package_missing`）本就不该有这张图"),
+    "03-05-03-unit1-deconvolution-error-map": (
+        "deconvolution_status.json", ("is_deconvolution",), True,
+        "没有带细胞类型标签的参考时走 marker 打分法，没有重建误差可画"),
+}
+
+
+def _dig(obj, path):
+    """按路径取值；任一层缺失返回 `None`（**不抛异常**）。
+
+    判据路径写错时必须表现为"探针读不到"而不是把验收整个炸掉 ——
+    读不到时走的是"允许缺失、可见"分支，不会静默判成通过。
+    """
+    cur = obj
+    for k in path:
+        if isinstance(cur, dict):
+            cur = cur.get(k)
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
+
+
+def _iter_nested_status(obj, path=()):
+    """递归产出所有名为 `status` 的字段：`(路径, 值, 同级 reason)`。
+
+    Q-27 / E-48：`status` 不只在顶层。`domain_status.json` 的
+    `domain_methods.STAGATE.status`、`deconvolution_status.json` 的
+    `cell2location.status`、`svg_status.json` 的 `spatialde.status` 都是
+    **嵌套**的，而旧验收层只看顶层 —— 里面崩了、顶层还是 `ok`。
+
+    结构上这和"`_content_overflow()` 打了 WARN 没人读"是同一个错误：
+    `except` 把异常降级成了一个**没人读的字段**。这里把它读出来。
+    """
+    if isinstance(obj, dict):
+        if "status" in obj:
+            reason = obj.get("reason") or obj.get("message") or ""
+            yield path, obj["status"], reason
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                yield from _iter_nested_status(v, path + (str(k),))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            if isinstance(v, (dict, list)):
+                yield from _iter_nested_status(v, path + (str(i),))
+
 
 def run_steps(cfg: dict, only: list = None) -> dict:
     ensure_dirs(cfg)
     res_dir = Path(cfg["output"]["results_dir"])
+
+    # **溢出记录也要先清掉。** 和状态文件同理（规则 14）：图标题改短之后
+    # 旧记录还在，验收会把**已经修好的**图判红 —— 那比没有检查更糟，
+    # 因为它会训练人忽略红字。
+    ovf_stale = res_dir / "figure_overflow.json"
+    if ovf_stale.exists():
+        ovf_stale.unlink()
 
     # ---- 模块零：建立本轮运行清单（§0.3 / §0.4）-----------------------------
     # **必须在任何步骤之前建，且先清掉上一轮** —— 清单描述的是本轮。
@@ -173,6 +340,63 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         chk(f"step:{sid}", "required", ok,
             "成功" if ok else f"**失败**: {str(res.get('error'))[:140]}")
 
+    # ---- required: 步骤函数自己返回的 status 也要看（Q-27）------------------
+    #
+    # `run_steps` 把 `fn(cfg)` 的返回值记进了 `result_status`，但**全仓零
+    # 消费者** —— 于是 `08_spatial_trajectory.py` 返回 `bad_root` /
+    # `not_applicable` / `missing_pca` 时，验收照样记 `status="ok"`。
+    #
+    # **这不是"步骤崩了"，而是"步骤跑完了、但结果是『没做成』"** ——
+    # 恰恰是最容易读成成功的一种。判据仍只把 `failed`/`error`/`fail` 判红：
+    # `bad_root` 之类的取值是设计如此地没做成，只可见、不阻断。
+    for sid, res in step_results.items():
+        rs = res.get("result_status")
+        if rs is None or rs == "ok":
+            continue
+        bad = str(rs).lower() in NESTED_FAILED_VALUES
+        # 注意 `chk` 的第二个位置参数是 **kind**（归类），severity 是关键字参数 ——
+        # 把 kind 当 severity 传会让"设计如此地没做成"也按 required 记账。
+        chk(f"step_result:{sid}", "step_result", not bad,
+            f"步骤 {sid} 返回 status={rs!r}"
+            + ("—— **步骤跑完了但结果是失败**" if bad
+               else "（设计如此地没做成，可见不阻断）"),
+            severity="required" if bad else "honesty")
+
+    # ---- required: 嵌套 status 的 failed 必须判红（Q-27 / E-48）-------------
+    #
+    # `status` 不只在顶层。`domain_status.json` 的
+    # `domain_methods.STAGATE.status`、`deconvolution_status.json` 的
+    # `cell2location.status`、`svg_status.json` 的 `spatialde.status` 都是
+    # **嵌套**的，而旧验收层只看顶层 —— **里面崩了、顶层还是 `ok`**。
+    #
+    # 姊妹仓库实测（E-48）：顶层分布 `{ok: 7, not_configured: 1}`，
+    # 嵌套分布里躺着唯一一条 `failed`（`figsize` 三元素元组让整段抛异常），
+    # 而它所属文件的顶层 `status` 是 `ok`。**顶层全绿、里面已经崩了。**
+    #
+    # 判据必须**只**把 `failed`/`error`/`fail` 判红 —— 把
+    # `needs_reference` / `package_missing` / `not_done` / `not_applicable`
+    # / `disabled` / `missing_domains` / `bad_root` 判红会让每个 job 都红，
+    # 反而没人看（规则 4 的同一条理由）。
+    nested_bad, nested_seen = [], {}
+    for sp in sorted(res_dir.glob("*status.json")):
+        try:
+            obj = json.loads(sp.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            nested_bad.append(f"{sp.name}: 读取失败 {e}")
+            continue
+        for path, val, reason in _iter_nested_status(obj):
+            key = ".".join(path) + ".status" if path else "status"
+            nested_seen[str(val)] = nested_seen.get(str(val), 0) + 1
+            if str(val).lower() in NESTED_FAILED_VALUES:
+                where = f"{sp.name} → {key}"
+                nested_bad.append(f"{where} = {val!r}"
+                                  + (f"（{reason[:120]}）" if reason else ""))
+    chk("status:nested", "required", not nested_bad,
+        (f"全部 status 字段（含嵌套）无 failed，分布 {nested_seen}"
+         if not nested_bad else
+         f"**嵌套 status 里有失败**（顶层可能是 ok）：{nested_bad}；"
+         f"全部取值分布 {nested_seen}"))
+
     # ---- required: 数据文件 ----
     for f in ("raw.h5ad", "qc_filtered.h5ad", "normalized.h5ad", "domains.h5ad"):
         p = data_dir / f
@@ -187,10 +411,95 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         p = res_dir / f
         chk(f"result:{f}", "required", p.exists(), f"{f} {'存在' if p.exists() else '缺失'}")
 
-    # ---- required: 图 ----
+    # ---- required: 图 -------------------------------------------------------
+    #
+    # **从"数量够不够"换成"声明过的每张图在不在"。** 旧判据是
+    # `len(figs) >= 8` —— 纯计数，于是"该有的图没有"这一整类问题没有任何
+    # 检查看得见：姊妹仓库实测 5 张图因 `figsize` 三元素元组从未产出过，
+    # 而验收 70 项全绿（E-48）。
+    #
+    # 声明从源码扫出来（`declared_figures()`），不手抄表 —— 手抄的表会漂移，
+    # 漂移方向恰好是"新加的图不在表里"，等于把盲区原样再造一遍。
     figs = sorted(fig_dir.glob("*.png")) if fig_dir.exists() else []
+    fig_names = {p.stem for p in figs}
+    declared = declared_figures()
+    dyn = dynamic_fig_bases()
+    dyn_slots = sum(dyn.values())
+
+    # 动态图名（`DYNAMIC_FIG_BASES` 声明的槽位）不逐名检查 —— 名字运行期才
+    # 拼得出来。但它们**必须至少产出 1 张**：声明了槽位却一张都没有，
+    # 说明那段循环整段没跑（E-48 的形态正是"整段没跑而验收不知道"）。
+    #
+    # **必须扣掉该前缀下的静态声明图。** `03-03-04` 这个前缀同时有静态图
+    # （unit1/unit2/unit3）和动态图（unit8 的 Jaccard 矩阵）—— 不扣的话，
+    # 动态循环整段没跑时计数仍是 2（全是静态的），判据**永远不会响**。
+    # 这类"判据因为输入域重叠而永远为真"的错误在正向标定里看不出来，
+    # 只有注入"整组动态图消失"才会暴露。
+    declared_set = set(declared)
+    dyn_missing = []
+    for base, n_slots in dyn.items():
+        got = [nm for nm in fig_names
+               if nm.startswith(base + "-") and nm not in declared_set]
+        if not got:
+            dyn_missing.append(f"{base}（声明 {n_slots} 个槽位，实际 0 张）")
+
+    # 条件产出的图（`CONDITIONAL_FIGURES`）：能力探针就位时变必需，
+    # 否则允许缺失但**必须可见**。
+    missing, waived = [], []
+    for nm in declared:
+        if nm in fig_names:
+            continue
+        cond = CONDITIONAL_FIGURES.get(nm)
+        if cond:
+            st_file, path, ready_val, why = cond
+            p = res_dir / st_file
+            got = None
+            if p.exists():
+                try:
+                    got = _dig(json.loads(p.read_text(encoding="utf-8")), path)
+                except Exception:  # noqa: BLE001
+                    got = None
+            if got != ready_val:
+                waived.append(f"{nm}（{why}；{st_file} "
+                              f"{'.'.join(str(x) for x in path)}={got!r}）")
+                continue
+        missing.append(nm)
+
+    chk("figures:declared", "required", not missing,
+        (f"声明 {len(declared)} 张静态图，全部产出"
+         + (f"；另有 {len(waived)} 张条件图本轮不适用" if waived else "")
+         if not missing else
+         f"**声明了但没产出** {missing}"
+         + (f"（条件图本轮不适用：{waived}）" if waived else "")
+         + f" —— 实际产出 {len(figs)} 张"),)
+    chk("figures:dynamic", "required", not dyn_missing,
+        (f"{len(dyn)} 组动态图名共 {dyn_slots} 个槽位，各自至少产出 1 张"
+         if not dyn_missing else
+         f"**动态图名整组没产出** {dyn_missing} —— 槽位是上限不是精确值，"
+         f"少出合法，但**一张都没有说明那段循环整段没跑**"),)
+    # 保留计数作为**下限兜底**：声明扫描本身失效时（如源码结构大改导致
+    # 一条字面量都扫不到）这条还能拦住"一张图都没有"。
     chk("figures:count", "required", len(figs) >= 8,
         f"{len(figs)} 张图（要求 >=8）")
+
+    # ---- required: 溢出记录（E-49 的形态）------------------------------------
+    #
+    # `_content_overflow()` **正确检测到了**超宽、**正确打了 WARN**，
+    # 然后**没有任何人读** —— 标题超宽 35%，在 `savefig.bbox: standard` 下
+    # 被静默裁掉，图照样生成、门禁照样绿。
+    #
+    # **"检测到了"不等于"有人会知道"。** 所以溢出落盘成
+    # `figure_overflow.json`，这里读它并判红。
+    ovf_p = res_dir / "figure_overflow.json"
+    ovf = {}
+    if ovf_p.exists():
+        try:
+            ovf = json.loads(ovf_p.read_text(encoding="utf-8")).get("figures") or {}
+        except Exception as e:  # noqa: BLE001
+            ovf = {"<读取失败>": str(e)}
+    chk("figures:overflow", "required", not ovf,
+        "没有图内容超出画布" if not ovf else
+        f"**{len(ovf)} 张图内容超出画布，会被静默裁掉**：{ovf}")
 
     # ---- content: 图不是空白 ----
     # 用像素标准差判断：全白/全黑的图标准差接近 0。
