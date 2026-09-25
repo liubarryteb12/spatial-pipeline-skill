@@ -572,7 +572,7 @@ def run_03_spatial_domains(cfg: dict) -> dict:
         z_df = pd.DataFrame(zmat, index=ud, columns=top3)
 
         fig = plt.figure(figsize=(W_DOUBLE, mm(133)))
-        gspec = fig.add_gridspec(1, 2, width_ratios=[5.2, 1.0], wspace=0.06)
+        gspec = fig.add_gridspec(1, 2, width_ratios=[5.4, 1.0], wspace=0.03)
         ax = fig.add_subplot(gspec[0, 0])
         sm, size_handles = plot_marker_dotplot(ax, frac_df, z_df)
         ax.set_xlabel("gene")
@@ -586,16 +586,22 @@ def run_03_spatial_domains(cfg: dict) -> dict:
         lax = fig.add_subplot(gspec[0, 1])
         lax.set_xlim(0, 1); lax.set_ylim(0, 1)
         lax.axis("off")
-        lax.set_title("Dot size (%)", fontsize=7.5, pad=2, loc="left")
+        lax.set_title("Percent Expressed (%)", fontsize=7.5,
+                      pad=2, loc="left")
         for k, (f_, s_) in enumerate(size_handles):
-            yy = 0.68 - k * 0.08
-            lax.scatter([0.34], [yy], s=s_, color="gray",
+            yy = 0.62 - k * 0.09
+            lax.scatter([0.38], [yy], s=s_, color="gray",
                         edgecolor="black", linewidth=0.3)
-            lax.text(0.52, yy, f"{int(f_ * 100)}", va="center", fontsize=7.5)
-        cax = fig.add_axes([0.900, 0.10, 0.020, 0.20])
+            lax.text(0.56, yy, f"{int(f_ * 100)}", va="center", fontsize=7.5)
+        # 色标：**高度与大小图例一致**（0.34），水平标题在上方（不旋转）
+        cax = fig.add_axes([0.905, 0.08, 0.026, 0.32])
         cb = fig.colorbar(sm, cax=cax, orientation="vertical")
-        cb.set_label("mean expression\nz-scored per gene", fontsize=7)
-        cb.ax.tick_params(labelsize=7)
+        cax.text(0.995, 0.42, "Mean Expression", transform=fig.transFigure,
+                 ha="right", va="bottom", fontsize=7)
+        cb.set_ticks([-1, 0, 1])
+        cb.set_ticklabels(["Low", "Mid", "High"])
+        cb.ax.tick_params(labelsize=7, left=False, right=True,
+                          labelleft=False, labelright=True)
 
         save_fig(cfg, "03-03-02-unit1-domain-markers-dotplot", fig)
 
