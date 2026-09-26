@@ -34,7 +34,7 @@ import scipy.sparse as sp  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm,)
+                    write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm,)
 
 
 def build_adj(adata, n_neighbors: int = 6):
@@ -105,12 +105,24 @@ def neighborhood_enrichment(labels: np.ndarray, A: sp.spmatrix,
 
 
 def cooccurrence(labels: np.ndarray, xy: np.ndarray, types: list,
-                 max_dist: float, n_bins: int = 8) -> pd.DataFrame:
+                 max_dist: float, n_bins: int = 8, k_neighbors: int = 60) -> pd.DataFrame:
     """
     共现：随距离增大，类型 a 周围出现类型 b 的比例。
 
     **只对"核心类型"（占比 >=2%）做**，否则稀有类型的分母太小，
     曲线全是噪声。
+
+    ---
+    ## T8：分母是被截断的，必须把它报出来
+
+    每个 spot 只取**最近 `k_neighbors` 个邻居**，而距离环是**固定宽度**的
+    （`max_dist / n_bins`）。于是远处的环里落进的邻居数天然少，而且
+    **被 k 截断** —— 一个 spot 的"邻居"里根本没包含它真正的第 100 个邻居，
+    所以远处环的 `fraction` 分母是"碰巧落进这个环的、且属于前 60 近的邻居数"。
+
+    **这不是算错了，是分辨率随距离衰减。** 但原来的产物里只有 `fraction`，
+    读者会以为每个距离环都是同等的估计。现在每个环**同时报分母**
+    （`n_neighbors`）与 `truncated` 标志：分母小于 `min_n` 的环不该被当结论。
     """
     from scipy.spatial import cKDTree
 
@@ -118,13 +130,13 @@ def cooccurrence(labels: np.ndarray, xy: np.ndarray, types: list,
     bins = np.linspace(0, max_dist, n_bins + 1)
     centers = (bins[:-1] + bins[1:]) / 2
     tree = cKDTree(xy)
+    k = min(k_neighbors, len(xy))
     rows = []
     for a in types:
         ma = labels == a
         if ma.sum() < 20:
             continue
         # a 的每个 spot 的邻居
-        k = min(60, len(xy))
         d, idx = tree.query(xy[ma], k=k)
         nb_lab = labels[idx[:, 1:]].ravel()
         nb_d = d[:, 1:].ravel()
@@ -133,10 +145,18 @@ def cooccurrence(labels: np.ndarray, xy: np.ndarray, types: list,
             for lo, hi in zip(bins[:-1], bins[1:]):
                 m = (nb_d >= lo) & (nb_d < hi)
                 frac.append(float((nb_lab[m] == b).mean()) if m.sum() > 0 else np.nan)
-            for c, f in zip(centers, frac):
+            for c, f, lo, hi in zip(centers, frac, bins[:-1], bins[1:]):
+                m = (nb_d >= lo) & (nb_d < hi)
+                n_in_ring = int(m.sum())
                 rows.append({"core_type": a, "neighbor_type": b,
                              "distance": round(float(c), 1),
-                             "fraction": None if np.isnan(f) else round(f, 5)})
+                             "fraction": None if np.isnan(f) else round(f, 5),
+                             # **分母与截断标志**（T8）：没有这两列，
+                             # 远处环的小分母看起来和近处环一样可信。
+                             "n_neighbors": n_in_ring,
+                             "n_spots_core": int(ma.sum()),
+                             "k_neighbors_cap": int(k),
+                             "truncated": n_in_ring < max(10, k // 10)})
     return pd.DataFrame(rows)
 
 
@@ -183,12 +203,38 @@ def run_06_niche(cfg: dict) -> dict:
     # ---- 2. 邻域富集（细胞类型层面，用解卷积的 argmax）---------------------
     prop_file = res_dir / "deconvolution_proportions.csv"
     ct_lab = None
+    ct_align = None
     if prop_file.exists():
-        props = pd.read_csv(prop_file, index_col=0).loc[adata.obs_names]
+        # **M4：`.loc[adata.obs_names]` 无保护会抛 KeyError。**
+        # 05 与 06 读的是同一份 `domains.h5ad`，正常情况下 spot 集合一致；
+        # 但"正常情况下"不是保证 —— 只要 05 因为任何原因漏掉/多出 spot，
+        # 这里就是一个**裸 KeyError**，`06` 整步崩掉，
+        # 而产物里只会看到"06 失败"，看不到"是因为 spot 对不上"。
+        # 现在：显式取交集、报出差异、并对齐顺序。
+        props_all = pd.read_csv(prop_file, index_col=0)
+        _wanted = list(adata.obs_names.astype(str))
+        _have = list(props_all.index.astype(str))
+        _missing = [s for s in _wanted if s not in set(_have)]
+        _extra = [s for s in _have if s not in set(_wanted)]
+        ct_align = {
+            "n_spots_expected": len(_wanted),
+            "n_spots_in_proportions": len(_have),
+            "n_missing": len(_missing),
+            "n_extra": len(_extra),
+            "missing_examples": _missing[:5],
+            "extra_examples": _extra[:5],
+        }
+        if _missing:
+            log_warn(f"解卷积比例表缺 {len(_missing)} 个 spot（例：{_missing[:3]}）"
+                     f"—— 细胞类型层面的邻域富集只能用**交集**的 spot，"
+                     f"这与域层面的结果不是同一批 spot")
+        props = props_all.loc[[s for s in _wanted if s in set(_have)]]
         ct_lab = props.idxmax(axis=1).values
+        ct_align["n_spots_used"] = int(len(ct_lab))
+        ct_align["same_spot_set"] = bool(not _missing and not _extra)
         # **argmax 是硬分配，丢掉了混合信息。** 它只能给出"这个 spot 里
         # 相对权重最高的类型"，不能说明这个 spot 里没有别的类型。
-        adata.obs["ct_argmax"] = ct_lab
+        adata.obs["ct_argmax"] = pd.Series(ct_lab, index=props.index)
         log_info("细胞类型层面：用解卷积权重的 argmax（**硬分配，丢失混合信息**）")
         ne_ct = neighborhood_enrichment(ct_lab, A, n_perms, cfg["analysis"]["seed"])
         ne_ct.to_csv(res_dir / "niche_enrichment_celltypes.csv", index=False)
@@ -219,14 +265,36 @@ def run_06_niche(cfg: dict) -> dict:
 
     # ---- 3. 共现 ------------------------------------------------------------
     max_dist = float(n_cfg.get("max_distance_um", 400))
-    # Visium spot 中心间距约 100 μm；用像素坐标时换算成"邻居距离的倍数"
     xy = spatial_xy(adata)
-    max_px = med * max(2, int(max_dist / 100))
+    # **M13：不要用"假定 100 μm"去反推像素比例。**
+    # 原写法是 `max_px = med * max(2, int(max_dist / 100))` —— 它把
+    # `max_dist/100` 取整成邻居间距的整数倍。两个问题：
+    #   ① `100 μm` 是硬编码的假定值，而 `med`（最近邻距离中位数）
+    #      **本身就是比例尺的观测量** —— 应该由它算出 μm/px，
+    #      而不是反过来用一个假定的 100 μm 去凑倍数；
+    #   ② `int()` 截断：`max_dist=400` → 恰好 4；但 `max_dist=350`
+    #      也会给 4（=400 μm 的范围），配置项形同虚设。
+    # Visium 的 spot 中心间距**名义上是 100 μm**（这是芯片规格，不是估计），
+    # 所以用它把像素换成 μm 是合理的 —— 但必须**显式写明这是假定**，
+    # 并把换算结果与"按 100 μm 反推的邻居间距"一起报出来，让读者能判断。
+    um_per_px = 100.0 / med if med > 0 else 1.0
+    max_px = max_dist / um_per_px
+    co_scale = {
+        "um_per_px_assumed": round(float(um_per_px), 5),
+        "assumption": "Visium spot 中心间距名义 100 μm（芯片规格）",
+        "median_nn_distance_px": round(float(med), 3),
+        "max_distance_um": round(float(max_dist), 1),
+        "max_distance_px": round(float(max_px), 2),
+        "note": ("像素→μm 用的是**名义规格 100 μm**；`median_nn_distance_px` "
+                 "是观测值，若它与 100/um_per_px 相差大，说明该切片不是标准"
+                 "Visium 网格或坐标被缩放过"),
+    }
     dom_counts = adata.obs["domain"].value_counts()
     core = [str(d) for d in dom_counts[dom_counts >= 20].index]
     co = cooccurrence(dom_lab, xy, core, max_px)
     co.to_csv(res_dir / "niche_cooccurrence.csv", index=False)
-    log_info(f"共现曲线: {len(core)} 个核心域 x {len(core)} 个邻居类型")
+    log_info(f"共现曲线: {len(core)} 个核心域 x {len(core)} 个邻居类型"
+             f"（{max_dist:.0f} μm = {max_px:.1f} px，假定 100 μm/spot 间距）")
 
     # 声明式动态名豁免：03-06-02 图号下最多 3 张（核心域号是运行时数据）
     DYNAMIC_FIG_BASES = {"02": 3}
@@ -253,10 +321,26 @@ def run_06_niche(cfg: dict) -> dict:
         "status": "ok",
         "n_neighbors": n_neigh,
         "median_nn_distance_px": round(med, 2),
+        "cooccurrence_scale": co_scale,
+        "cooccurrence_denominator_note": (
+            "`niche_cooccurrence.csv` 每个距离环都带 `n_neighbors`（该环的"
+            "实际分母）与 `truncated`（分母过小）两列 —— **远处环的邻居数"
+            "被 k 上限截断，分辨率随距离衰减**，只看 `fraction` 会把它们"
+            "当同等可信的估计"),
+        "celltype_spot_alignment": ct_align or {"status": "not_available"},
         "n_permutations": n_perms,
         "domain_enrichment": {
             "n_pairs": int(len(ne_dom)),
             "n_enriched_z_gt2": n_enr,
+            # **M5：固定阈值 |z|>2 的期望假阳性要报出来。**
+            # 类型对数是 O(k²)：k=12 时 78 对，|z|>2 在纯零假设下
+            # 期望约 78 × 0.0455 ≈ 3.5 对"显著" —— 那只是噪声。
+            # 没有这一条，读者会把 `n_enriched_z_gt2` 当真实富集数。
+            "expected_false_positives_at_z2": round(0.0455 * len(ne_dom), 2),
+            "multiple_testing_note": (
+                "**没有做多重检验校正。** `|z|>2` 在零假设下每对约有 4.55% "
+                "概率越界，所以上表里的『显著』对数要减去上面那个期望值"
+                "才接近真实富集"),
             "top": df_to_records(ne_dom[~ne_dom["self"]]
                                  .sort_values("z_score", ascending=False).head(10)),
             "most_depleted": df_to_records(ne_dom[~ne_dom["self"]]

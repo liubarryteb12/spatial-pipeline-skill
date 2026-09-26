@@ -40,7 +40,7 @@ import yaml  # noqa: E402
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, probe_named_tools, record_step, save_fig,
                     set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm,
+                    write_json, spatial_xy, W_ONE_HALF, mm,
                     PAL,)
 
 
@@ -150,8 +150,28 @@ def run_07_spatial_communication(cfg: dict) -> dict:
     log_info(f"阈值内的 spot 对: {n_near}（平均每 spot {near.sum(1).mean():.1f} 个）")
 
     # ---- 3. 每对 LR 的空间富集 ---------------------------------------------
-    # 统计量：近邻对上的 LR 共表达均值，减去全部对的均值，再标准化。
+    # 统计量：近邻对上的 LR 共表达均值，减去随机邻居对的均值，再标准化。
     # **这个量是描述性的，不是假设检验。**
+    #
+    # **M6：两个缺陷都在这一段的零模型里。**
+    #
+    # ① `rng` 原先写在 `for pr in usable:` **循环体内** —— 每对 LR 都用
+    #    同一条随机数流。50 个组合、每个组合的零分布**是同一批随机数**，
+    #    于是不同 LR 对的 `null_mean`/`null_sd` 之间不是独立的，
+    #    `z_score` 的排序里混进了"谁的 prod 分布恰好对上第一串随机数"。
+    #    修法：`rng` 提到循环外，用 `rng.spawn()` 给每对一条独立的流
+    #    （同时保持"同一个 seed 可复现"）。
+    #
+    # ② 零分布原先抽的是**单个 spot 的 `prod` 值**（`prod[rng.integers(...)]`），
+    #    而 `near_mean` 是**邻居位置上的均值**。这两个量不是一回事：
+    #    邻居位置上的 `prod` 之间存在空间自相关（相邻 spot 表达相似），
+    #    所以"n_near 个独立抽样"的方差**小于**真实零分布 ——
+    #    `null_sd` 偏小 → `z` 系统性偏大。修法：零分布改成从
+    #    **全部邻居对**（`nb_vals`，即 kNN 的 30 个邻居，不受距离阈值限制）
+    #    里随机抽同样多个，这样零分布保留 `prod` 的空间自相关结构，
+    #    检验变成"近邻对比随机邻居"，这才是 `near_mean` 对应的零假设。
+    rng = np.random.default_rng(cfg["analysis"]["seed"])
+    n_perm = int(c.get("n_permutations", 50))
     lr_scores = []
     for pr in usable:
         L = X[:, pr["ligand_idx"]]
@@ -161,22 +181,24 @@ def run_07_spatial_communication(cfg: dict) -> dict:
         # 近邻对上的平均（用邻居索引取值）
         nb_vals = prod[idx[:, 1:]]
         near_mean = float(nb_vals[near].mean()) if n_near else np.nan
-        # 零模型：随机抽同样多的 spot，看它们的 prod 均值分布。
-        # **随机抽 spot（不是抽 spot 对）** —— 因为 near_mean 是
-        # "邻居位置上 prod 的均值"，对应的零假设是"prod 与位置无关"，
-        # 所以零分布应该是"在全部 spot 上随机取同样多个值"。
-        rng = np.random.default_rng(cfg["analysis"]["seed"])
-        n_perm = int(c.get("n_permutations", 50))
-        perm_means = [float(prod[rng.integers(0, len(xy), n_near)].mean())
-                      for _ in range(n_perm)]
-        null_mu = float(np.mean(perm_means))
-        null_sd = float(np.std(perm_means)) or 1e-9
+        # 零模型：**在全部邻居对里随机抽同样多个**（见上面 M6 ② 的理由）。
+        # 抽的是邻居对而不是单 spot —— 零分布必须与被检验统计量同构。
+        child = rng.spawn(1)[0]
+        flat = nb_vals.ravel()
+        if flat.size:
+            draw = child.integers(0, flat.size, size=(n_perm, int(n_near)))
+            perm_means = [float(flat[d].mean()) for d in draw]
+        else:
+            perm_means = [float("nan")] * n_perm
+        null_mu = float(np.nanmean(perm_means))
+        null_sd = float(np.nanstd(perm_means)) or 1e-9
         z = (near_mean - null_mu) / null_sd
         lr_scores.append({
             "ligand": pr["ligand"], "receptor": pr["receptor"],
             "pathway": pr.get("pathway", ""),
             "near_mean": round(near_mean, 5),
             "null_mean": round(null_mu, 5),
+            "null_sd": round(null_sd, 5),
             "z_score": round(float(z), 3),
             "frac_ligand": pr["frac_ligand"], "frac_receptor": pr["frac_receptor"],
         })
@@ -293,6 +315,21 @@ def run_07_spatial_communication(cfg: dict) -> dict:
         "max_distance_um": max_um,
         "max_distance_px": round(max_px, 2),
         "median_spot_spacing_px": round(med, 2),
+        "distance_scale": {
+            "um_per_px_assumed": round(float(um_per_px), 5),
+            "assumption": ("Visium spot 中心间距名义 100 μm（芯片规格）—— "
+                           "**这是假定值，不是从本切片估计出来的**；"
+                           "`median_spot_spacing_px` 才是观测值"),
+            "implied_um_per_px_from_observation": (
+                round(float(100.0 / med), 5) if med > 0 else None),
+        },
+        "null_model": {
+            "description": ("零分布 = 从**全部 kNN 邻居对**里随机抽同样多个"
+                            "（不是从单个 spot 抽）—— 保留 prod 的空间"
+                            "自相关结构"),
+            "rng": "每对 LR 独立 spawn（原先每对重用同一条随机流）",
+            "n_permutations": n_perm,
+        },
         "n_spot_pairs_within_threshold": n_near,
         "top_enriched": df_to_records(lr_df.head(15)),
         "skipped_examples": skipped[:20],
@@ -316,7 +353,11 @@ def run_07_spatial_communication(cfg: dict) -> dict:
             "Visium 的 spot 含 1-10 个细胞，所以『阈值内』是 spot 层面"
             "的接近，不是细胞接触",
             "z-score 用 50 次随机采样估计零分布，精度有限；"
-            "且没有做多重检验校正",
+            "且没有做多重检验校正（组合数是 O(配体×受体)，z 的排序不能"
+            "直接读成显著性）",
+            "**零模型与统计量同构但仍是近似**：零分布从全部 kNN 邻居对里抽，"
+            "保住了 prod 的空间自相关，但『邻居对』本身的图结构"
+            "（六边形、边界 spot 度数少）没有完全复制",
             "受体复合物（如 IL2 受体的 α/β/γ 三聚体）被简化成单个受体基因",
         ],
     }

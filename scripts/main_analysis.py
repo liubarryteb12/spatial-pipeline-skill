@@ -29,7 +29,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 from common import (NAMED_TOOLS, capture_versions, ensure_dirs,  # noqa: E402
                     init_manifest, load_config, log_info, log_warn,
                     manifest_path, manifest_summary, probe_named_tools,
-                    read_json, read_manifest, record_decision,
+                    read_manifest, record_decision,
                     record_human_review, record_input, record_params,
                     write_json)
 
@@ -506,6 +506,7 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
     # **这个检查是必要的**：matplotlib 在数据为空时会静默产出一张空白图，
     # 文件存在、大小正常，看不出问题。
     blank = []
+    blank_skipped = None
     try:
         from PIL import Image
         import numpy as np
@@ -516,10 +517,20 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
                     blank.append({"figure": p.name, "std": round(float(a.std()), 3)})
             except Exception as e:  # noqa: BLE001
                 blank.append({"figure": p.name, "error": str(e)})
-    except ImportError:
-        blank = [{"note": "PIL 不可用，跳过空白图检查"}]
-    chk("figures:non_blank", "content", not blank,
-        "所有图都有内容" if not blank else f"疑似空白图: {blank}", severity="content")
+    except ImportError as e:  # noqa: BLE001
+        # **T4：「跳过」不等于「通过」。** 原先 `blank` 被塞进一条 note，
+        # 于是 `not blank` 为 False → 记成失败，但 detail 写的是"跳过"，
+        # 读起来像通过。现在拆成两个字段：真空白进 `blank` 判红，
+        # PIL 缺失单独记 `blank_skipped`，**不伪装成通过、也不伪装成失败**。
+        blank_skipped = f"PIL 不可用（{e}）—— 空白图检查没有执行"
+    if blank_skipped:
+        chk("figures:non_blank", "content", False,
+            f"**空白图检查未执行**：{blank_skipped} —— 这不是通过",
+            severity="content")
+    else:
+        chk("figures:non_blank", "content", not blank,
+            "所有图都有内容" if not blank else f"疑似空白图: {blank}",
+            severity="content")
 
     # ---- content: CSV 有数据行 ----
     for f in ("svg_results.csv", "domain_markers.csv",
@@ -714,12 +725,20 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         # 它们是"文档点名、本环境用不了"，理由在 `NAMED_TOOLS` 里，
         # 只是没有哪一步负责把它们写进产物。判失败会让 job 红，
         # 但那不是分析错了。**必须可见**，否则下次又忘了。
-        chk("honesty:named_tools_never_probed", "honesty", True,
+        #
+        # **T3：判据不能写死 True。** 原先第三个参数是字面量 `True`，
+        # 于是这条检查在 `acceptance_report.json` 里**永远 `passed: true`**
+        # —— `detail` 里明明列着"3 个工具没被探测过"，`passed` 却是真，
+        # 任何按 `passed` 汇总的下游（含本文件的计数器）都会把它读成通过。
+        # 现在判据是真实条件，但 severity 仍是 `honesty`（**不进 `passed`**），
+        # 所以"不阻断 job"这个设计意图不变。
+        chk("honesty:named_tools_never_probed", "honesty", not _never_probed,
             (f"全部 {len(_all_nt)} 个点名工具都至少被一步探测过"
              if not _never_probed else
              f"**{len(_never_probed)} 个点名工具没有任何一步探测过**"
              f"（只存在于 `common.NAMED_TOOLS` 常量里，产物中看不到）："
-             f"{_never_probed} —— 逐条理由见清单 `named_tools` 决策"))
+             f"{_never_probed} —— 逐条理由见清单 `named_tools` 决策"),
+            severity="honesty")
         # **把全表探测结果写进清单。** 上面那条只报"哪些没被步骤碰到"，
         # 而这里把**全部 14 条连同 kind / section / reason** 落进
         # `run_manifest.json` —— 这样 §3.1 那种"没有任何步骤负责"的
@@ -833,6 +852,35 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
                   "靶基因表，scrna 记它读那张表 —— 两边都真有转换。"
                   "**所以这条不是「没做」，是「没有可做的」** —— "
                   "将来若加入 R 侧分析（如 BayesSpace），这条必须变成真记录"))
+
+    # ---- content: 域标签打分有没有产出（S2）----------------------------------
+    #
+    # `03_spatial_domains.py` 的整段域标签打分包在裸 `try/except` 里，
+    # 失败只 `log_warn`；而 `domain_annotation.json` 在本文件里
+    # **原本没有任何消费者** —— 于是"域标签没算出来"和"算出来了"在
+    # `acceptance_report.json` 里长得一模一样（都没有这条 id）。
+    #
+    # **"检测到了"不等于"有人会知道"。** 这条把"没产出"变成可见的红。
+    p = res_dir / "domain_annotation.json"
+    if not p.exists():
+        chk("content:domain_annotation", "content", False,
+            "**`domain_annotation.json` 不存在 —— 域标签打分整段没有执行**"
+            "（该步的 try/except 会吞掉异常，所以缺文件就是唯一的信号）",
+            severity="content")
+    else:
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            st = d.get("status")
+            n_dom = len(d.get("domains") or {})
+            chk("content:domain_annotation", "content", st == "ok" and n_dom > 0,
+                (f"域标签: {n_dom} 个域有标签（{d.get('signature_set')}）"
+                 if st == "ok" and n_dom > 0 else
+                 f"**域标签没有产出**：status={st}，{n_dom} 个域，"
+                 f"原因 {str(d.get('reason'))[:140]}"),
+                severity="content")
+        except Exception as e:  # noqa: BLE001
+            chk("content:domain_annotation", "content", False,
+                f"读取失败: {e}", severity="content")
 
     # ---- honesty: §3.2 跑了点名工具就必须量化它与主方法的一致性 --------------
     #
@@ -956,12 +1004,28 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
             chk("deconv:cell2location", "honesty", False, f"读取失败: {e}")
 
     # ---- 空间对齐检查（如果有）----
+    #
+    # **S4：没有 `else` 分支 = 文件缺失时这条检查根本不存在。**
+    # 原先只在文件存在时 `chk` —— 于是"对齐检查从没跑过"和"对齐检查跑了
+    # 且结论是最佳"在 `acceptance_report.json` 里看起来一样（都没有这条 id）。
+    # `00_fetch.py` 的对齐检查会在 `current_is_best` 为假时 `raise`，
+    # 所以正常情况下文件必然存在；**它不存在本身就是异常**。
     p = data_dir / "spatial_alignment_check.json"
     if p.exists():
-        d = json.loads(p.read_text(encoding="utf-8"))
-        chk("spatial:alignment", "content", d.get("current_is_best", False),
-            f"最佳假设: {d.get('best_hypothesis')}；"
-            f"当前是否最佳: {d.get('current_is_best')}", severity="content")
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            chk("spatial:alignment", "content", d.get("current_is_best", False),
+                f"最佳假设: {d.get('best_hypothesis')}；"
+                f"当前是否最佳: {d.get('current_is_best')}", severity="content")
+        except Exception as e:  # noqa: BLE001
+            chk("spatial:alignment", "content", False,
+                f"**对齐检查文件读不出来**: {e}", severity="content")
+    else:
+        chk("spatial:alignment", "content", False,
+            "**`spatial_alignment_check.json` 不存在 —— 对齐检查没有执行过**。"
+            "00_fetch 会在当前假设不是最佳时 raise，所以文件缺失说明这一步"
+            "被跳过或产物被删了；坐标方向/镜像从未被验证过。",
+            severity="content")
 
     # ---- 空间拟时序：读 status 的真实字段，不是只看文件在不在 ------------
     #
@@ -980,6 +1044,25 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
                 else "**没有记录朴素 vs 空间感知的对比数值** —— "
                      "那就只剩一个排序，说明不了空间感知有没有用",
                 severity="content")
+            # **S3：沿空间拟时序的基因分析也要有人看。**
+            # 那段整块包在 `try/except` 里只 `log_warn`，而
+            # `spatial_trajectory_genes.csv` 在本文件里没有任何消费者 ——
+            # 于是"一个基因都没算出来"和"算出来 300 个"在验收层一样。
+            gal = d.get("genes_along_pseudotime") or {}
+            if gal:
+                gal_ok = gal.get("status") == "ok" and (gal.get("n_genes_reported") or 0) > 0
+                chk("content:spatial_traj_genes", "content", gal_ok,
+                    (f"沿空间拟时序的基因 {gal.get('n_genes_reported')} 个"
+                     if gal_ok else
+                     f"**沿空间拟时序的基因分析失败**：status={gal.get('status')}，"
+                     f"{gal.get('n_genes_reported')} 个基因，"
+                     f"原因 {str(gal.get('reason'))[:140]}"),
+                    severity="content")
+            else:
+                chk("content:spatial_traj_genes", "content", False,
+                    "**status 里没有 `genes_along_pseudotime` 字段** —— "
+                    "无法区分『这段没跑』和『跑了但没结果』",
+                    severity="content")
             ntu = d.get("named_tools_not_used") or {}
             chk("honesty:named_tools", "honesty", len(ntu) >= 3,
                 f"写明了 {len(ntu)} 个具名工具未使用及原因：{','.join(list(ntu)[:5])}"

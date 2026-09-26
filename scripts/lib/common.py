@@ -993,7 +993,6 @@ def fix_dotplot_legends(fig, size_title=None, cbar_title=None):
     :returns: `dict(size=bool, colorbar=bool)` —— 各自是否成功转换
     """
     import numpy as np
-    from matplotlib.axes import Axes
     from matplotlib.colorbar import Colorbar
     from matplotlib.cm import ScalarMappable
     from matplotlib.colors import Normalize
@@ -1420,6 +1419,115 @@ def load_registry(repo_root=None) -> dict:
         return {}
     with open(p, encoding="utf-8") as fh:
         return (yaml.safe_load(fh) or {}).get("datasets", {}) or {}
+
+
+def reconstruct_counts_from_raw(adata, genes: list = None, log=log_info) -> tuple:
+    """
+    从 `adata.raw` 重建**原始计数矩阵**，返回 `(C, genes_out, info)`。
+
+    `genes=None` 时重建全基因集；给了 `genes` 就只重建那几列
+    （列选择在稀疏矩阵上做，避免把 3 万 × 4000 的稠密矩阵摊开）。
+
+    ---
+    ## 为什么需要它
+
+    `domains.h5ad` 里：
+      - `layers['counts']` 只有 **2000 个 HVG 列**（02/03 裁到 HVG 后才写盘）
+      - `adata.raw` 是**全基因集**，但存的是 `log1p(counts / total * target_sum)`
+
+    所以想要"全基因集的**计数**"没有现成的地方可取，必须从 `raw.X` 逆变换。
+    已有两个消费方需要它，且都不能用 log 值顶替：
+
+      1. `05_deconvolution.py` 的 marker 打分 —— 用 HVG 列会让不在 HVG 里的
+         marker 基因整类细胞**静默消失**（实测 `NK_cell` 7 个 marker 在
+         HVG 里只剩 2 个）。
+      2. `04_svg.py` 的 SpatialDE 预处理 —— `NaiveDE.stabilize` **假设输入是
+         原始计数**（它按 `var = mu + phi*mu^2` 拟合离散度）。喂 log 值会算出
+         **负的 `phi_hat`**，`np.log(负数)` 出 NaN，而
+         `get_mll_results` 的 merge 会把 NaN 行**悄悄丢掉** ——
+         实测 150 个基因只剩 3 行，而 status 报 `ok`。
+
+    ---
+    ## 尺度必须用全基因集的行和
+
+    `raw.X = log1p(counts / total * target_sum)`，所以
+
+      `counts = expm1(raw.X) * (total_counts / expm1(raw.X).sum(axis=1))`
+
+    **行和必须在这个 spot 的 `expm1(raw.X)` 全部列上求**，不能只在选中的
+    那几列上求。只对子集求行和会把尺度放大约一个数量级
+    （实测选中 150 基因时 `sel_rs` 与全基因集行和之比中位数 **8.9 倍**，
+    最大值从正确的 8745 涨到 18935）—— 而且**不会报错**，只是数值全错。
+
+    不硬编码 `target_sum`：按每行自己的行和反推，配置改了也不会错。
+    行和为 0 的 spot（空 spot）保持全 0，不产生 `inf`/`nan`。
+    """
+    import numpy as np
+    import scipy.sparse as sp
+
+    if adata.raw is None:
+        raise RuntimeError(
+            "adata.raw 为空 —— 无法重建全基因集计数。\n"
+            "  为什么必须停: 只有 HVG 列的话，不在 HVG 里的基因会让\n"
+            "  整个细胞类型被静默丢弃（05），或者让 NaiveDE.stabilize\n"
+            "  算出负 phi 后静默丢掉绝大多数基因（04）。\n"
+            "  预期 domains.h5ad 由 02_normalize.py 产出，raw 是全基因集。")
+
+    raw_genes = list(adata.raw.var_names)
+    R = adata.raw.X
+
+    # ---- 行和：必须在**全基因集**上算（见 docstring）------------------------
+    E = np.expm1(R)
+    row_sum = np.asarray(E.sum(axis=1)).ravel().astype(np.float64)
+
+    if "total_counts" in adata.obs.columns:
+        tc = adata.obs["total_counts"].values.astype(np.float64)
+        src = "obs['total_counts']"
+    else:
+        tc = row_sum.copy()
+        src = "行和（obs 里没有 total_counts）"
+        log("obs 里没有 total_counts —— 用 raw.X 的行和做尺度还原")
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scale = np.where(row_sum > 0, tc / np.where(row_sum > 0, row_sum, 1.0), 0.0)
+
+    # ---- 列选择：在稀疏矩阵上做，别先摊开 -----------------------------------
+    if genes is None:
+        cols = None
+        out_genes = raw_genes
+    else:
+        ri = {g: i for i, g in enumerate(raw_genes)}
+        out_genes = [g for g in genes if g in ri]
+        if not out_genes:
+            raise RuntimeError(
+                "要重建的基因一个都不在 adata.raw.var_names 里 —— "
+                "raw 与预期不是同一套基因名")
+        cols = [ri[g] for g in out_genes]
+
+    if cols is None:
+        sub = E
+    else:
+        if sp.issparse(E):
+            E = E.tocsc()          # csr 按列切很慢，先转 csc
+        sub = E[:, cols]
+    sub = sub.toarray() if sp.issparse(sub) else np.asarray(sub)
+
+    C = sub.astype(np.float64) * scale[:, None]
+    C[~np.isfinite(C)] = 0.0
+
+    info = {
+        "matrix": ("adata.raw 重建的" +
+                   ("全基因集计数" if cols is None else "指定基因计数")),
+        "n_genes": len(out_genes),
+        "n_genes_requested": len(raw_genes) if genes is None else len(genes),
+        "n_genes_hvg_only": int(adata.n_vars),
+        "scale_source": src,
+        "reconstruct_note": ("raw.X = log1p(counts/total*target_sum)，"
+                             "按**全基因集** expm1 行和反推尺度"),
+    }
+    log(f"从 adata.raw 重建计数: {C.shape[0]} spot x {C.shape[1]} 基因"
+        f"（layers['counts'] 只有 {adata.n_vars} 个 HVG 列；尺度来源 {src}）")
+    return C, out_genes, info
 
 
 def spatial_xy(adata, scale: float = 1.0):

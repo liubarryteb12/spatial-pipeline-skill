@@ -42,11 +42,12 @@ import scipy.sparse as sp  # noqa: E402
 import yaml  # noqa: E402
 from scipy.optimize import nnls  # noqa: E402
 
-from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
+from common import (ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, pkg_version, probe_named_tools,
+                    reconstruct_counts_from_raw,
                     record_cross_language, record_decision, record_step,
                     save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm,)
+                    write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm,)
 
 
 def load_signature(cfg: dict):
@@ -61,7 +62,33 @@ def load_signature(cfg: dict):
     return key, sigs[key]
 
 
-def marker_score_composition(adata, sig, C: np.ndarray, genes: list) -> tuple:
+def full_gene_counts(adata, log=log_info) -> tuple:
+    """
+    从 `adata.raw` 重建**全基因集计数矩阵**，返回 `(C, genes, info)`。
+
+    实现在 `lib/common.reconstruct_counts_from_raw` —— **04 也要用同一套
+    逆变换**（SpatialDE 的 VST 必须吃原始计数），所以放在公共库里，
+    避免两份实现漂移。这里保留本名作为本步骤的入口。
+
+    ---
+    ## 为什么不能直接用 `adata.layers['counts']`
+
+    `domains.h5ad` 里的 `layers['counts']` 只有 **2000 个 HVG 列**
+    （02/03 把 `adata` 裁到 HVG 之后才写盘）。而 marker 签名要的是
+    `CD3D` / `CD14` / `NKG7` 这类**通常进不了 HVG 的基因**。
+
+    用 HVG 列去查 marker 的后果不是"少算一点"，而是**整类细胞消失**：
+    `marker_score_composition` 里 `if len(present) < 3: continue`
+    会把这类细胞**静默跳过** —— 它不进 `types`，CSV 里少一列，
+    而 `status` 仍然是 `ok`。实测（lymph_node 这一轮）：
+
+      `NK_cell`：签名 7 个 marker，**在 raw 里 7 个都在，在 HVG 里只有 2 个**
+      → 被判成"数据里没有这类细胞"，无声丢弃。
+    """
+    return reconstruct_counts_from_raw(adata, genes=None, log=log)
+
+
+def marker_score_composition(sig, C: np.ndarray, genes: list) -> tuple:
     """
     **marker 打分法**（不是解卷积）—— 无外部参考时唯一站得住的做法。
 
@@ -89,7 +116,14 @@ def marker_score_composition(adata, sig, C: np.ndarray, genes: list) -> tuple:
     对每种类型算一个**相对富集分数**：该类型 marker 的平均表达，
     减去该 spot 全部基因的平均表达（校正测序深度），再除以该类型 marker
     在全部 spot 上的标准差（把不同类型放到可比的尺度上）。
-    然后按 spot 做 softmax 式归一化，让各类型的分数可比。
+    然后按 spot 做**非负化 + L1 归一化**（不是 softmax —— 没有 `exp`）：
+    先减去该 spot 的最小值把分数移到非负，再除以行和。这一步只改变
+    数值尺度，**不改变同一 spot 内各类型的相对次序**。
+
+    **注意"全部基因"要按实际传进来的矩阵读。** 本函数的 `C` 由
+    `full_gene_counts()` 提供（全基因集），所以 `C.mean(axis=1)` 确实是
+    "该 spot 全部基因的平均表达"。若有人把 HVG 矩阵传进来，这句话就不成立 ——
+    而代码不会报错，只会让深度校正项偏大。
 
     **这不给出细胞比例。** 它给出的是"这个 spot 里哪类细胞的标志基因
     更活跃"，可以看空间趋势，不能读成百分比。
@@ -102,7 +136,14 @@ def marker_score_composition(adata, sig, C: np.ndarray, genes: list) -> tuple:
         coverage[ct] = {"n_markers": len(d.get("markers", [])),
                         "n_present": len(present), "missing": missing}
         if len(present) < 3:
+            # **不静默丢弃。** 这一句 `continue` 之前是无声的：类型不进
+            # `types`，CSV 少一列，status 仍是 ok。现在把原因写进 coverage，
+            # 由调用方记进 status（见 run_05_deconvolution）。
+            coverage[ct]["dropped"] = True
+            coverage[ct]["drop_reason"] = (
+                f"只有 {len(present)} 个 marker 在基因集里（要求 >= 3）")
             continue
+        coverage[ct]["dropped"] = False
         sub = C[:, [gi[g] for g in present]]
         # 该 spot 该类型 marker 的平均表达，减去该 spot 的整体平均（深度校正）
         s = sub.mean(axis=1) - C.mean(axis=1)
@@ -388,17 +429,34 @@ def run_05_deconvolution(cfg: dict) -> dict:
     adata = sc.read_h5ad(data_dir / "domains.h5ad")
 
     # ---- 1. 取计数 ----------------------------------------------------------
+    # **必须用全基因集计数。** `layers['counts']` 只有 2000 个 HVG 列，
+    # 而 marker 签名里的基因大多不在 HVG 里 —— 用 HVG 会让整类细胞
+    # 因 `len(present) < 3` 被静默丢弃（见 full_gene_counts 的 docstring）。
     if "counts" not in adata.layers:
         raise RuntimeError(
             "adata.layers['counts'] 不存在 —— 解卷积必须用原始计数。\n"
             "  为什么必须停: NNLS 解的是线性混合 spot = Σ 比例 × 签名；\n"
             "  log 变换破坏线性关系，用 log 值解出的『比例』没有意义 ——\n"
             "  而结果看起来仍然像比例。")
-    C = adata.layers["counts"]
-    C = C.toarray() if sp.issparse(C) else np.asarray(C)
-    C = C.astype(np.float64)
-    genes = list(adata.var_names)
-    log_info(f"计数矩阵: {C.shape[0]} spot x {C.shape[1]} 基因（HVG）")
+    C_hvg = adata.layers["counts"]
+    C_hvg = C_hvg.toarray() if sp.issparse(C_hvg) else np.asarray(C_hvg)
+    C_hvg = C_hvg.astype(np.float64)
+    genes_hvg = list(adata.var_names)
+
+    if mode == "builtin":
+        # marker 打分**只能**在全基因集上做（HVG 会让类型消失）
+        C, genes, count_info = full_gene_counts(adata)
+        log_info(f"计数矩阵: {C.shape[0]} spot x {C.shape[1]} 基因（全基因集）")
+    else:
+        # h5ad 分支用参考与目标共同基因交集，HVG 矩阵够用（下面会再裁一次）
+        C, genes, count_info = C_hvg, genes_hvg, {
+            "matrix": "layers['counts']（HVG）",
+            "n_genes": len(genes_hvg),
+            "n_genes_hvg_only": len(genes_hvg),
+            "scale_source": "已是计数，无需重建",
+            "reconstruct_note": "h5ad 分支随后与参考取共同基因交集",
+        }
+        log_info(f"计数矩阵: {C.shape[0]} spot x {C.shape[1]} 基因（HVG）")
 
     # ---- 2. 参考 ------------------------------------------------------------
     if mode == "builtin":
@@ -407,7 +465,14 @@ def run_05_deconvolution(cfg: dict) -> dict:
         log_info("**marker 打分法，不是解卷积** —— 无外部参考时 NNLS 不适定"
                  "（见 marker_score_composition 的说明）")
         props, types, coverage, raw_scores = marker_score_composition(
-            adata, sig, C, genes)
+            sig, C, genes)
+        n_dropped = sum(1 for v in coverage.values() if v.get("dropped"))
+        if n_dropped:
+            _names = [k for k, v in coverage.items() if v.get("dropped")]
+            log_warn(f"有 {n_dropped} 种细胞类型因 marker 覆盖不足被丢弃："
+                     + ", ".join(f"{k}（{coverage[k]['n_present']}/"
+                                 f"{coverage[k]['n_markers']}）" for k in _names)
+                     + " —— 明细见 deconvolution_status.json 的 coverage")
         if props is None:
             status.update({"status": "no_usable_signature",
                            "reason": "没有任何细胞类型的 marker 基因在数据里出现 >=3 个",
@@ -418,8 +483,19 @@ def run_05_deconvolution(cfg: dict) -> dict:
         errors = None  # 打分法没有重建误差
         ref_desc = {"kind": "builtin_marker_score", "signature_set": sig_key,
                     "signature_note": sig.get("note", ""),
-                    "is_deconvolution": False}
-        log_info(f"marker 打分完成：{len(types)} 种类型")
+                    "is_deconvolution": False,
+                    # 记下 marker 打分用的是哪个基因宇宙 —— 不记的话，
+                    # "某类细胞消失了"和"这类细胞真的没有"看起来一样
+                    "gene_universe": count_info["matrix"],
+                    "n_genes_in_universe": count_info["n_genes"],
+                    "n_genes_hvg_only": count_info["n_genes_hvg_only"],
+                    "n_celltypes_dropped": n_dropped,
+                    "celltypes_dropped": [k for k, v in coverage.items()
+                                          if v.get("dropped")],
+                    "normalization": ("非负化（减逐行最小值）+ L1 归一化，"
+                                      "不是 softmax")}
+        log_info(f"marker 打分完成：{len(types)} 种类型"
+                 + (f"（丢弃 {n_dropped} 种）" if n_dropped else ""))
         mean_prop = pd.Series(props.mean(axis=0), index=types).sort_values(
             ascending=False)
         log_info("平均相对权重: " + ", ".join(
@@ -597,12 +673,37 @@ def run_05_deconvolution(cfg: dict) -> dict:
         raise ValueError(f"不支持的 deconvolution.reference: {mode}")
 
     # ---- 3. 后处理 ----------------------------------------------------------
+    #
+    # **M11：`min_proportion` 只能用在 NNLS 比例上。**
+    # 它是给解卷积设的阈值 —— "小于 1% 的比例不可信，截断到 0"。
+    # 但原先 builtin marker 打分分支也套用了同一段：打分法的输出是
+    # **相对富集权重**（逐 spot 做过非负化 + L1 归一化，见
+    # `marker_score_composition`），它的"0.01"与"1% 的细胞比例"
+    # 不是同一个量。更糟的是**截断后重新归一化会改变相对次序**：
+    # 某个 spot 里 rank-1 的类型若权重是 0.008，会被截成 0，
+    # 其余类型按比例放大 —— 产物看起来像"组成变了"，实际只是阈值。
+    #
+    # 修法：只有 NNLS 分支做截断；打分法默认不截断（`min_proportion`
+    # 在打分分支显式无效），并把这件事写进 status。
     min_prop = float(dec.get("min_proportion", 0.01))
     props_f = props.copy()
-    props_f[props_f < min_prop] = 0.0
-    rs = props_f.sum(axis=1, keepdims=True)
-    rs[rs == 0] = 1.0
-    props_f = props_f / rs
+    min_prop_applied = (mode == "h5ad")
+    min_prop_applies_to = ("NNLS 解卷积比例" if min_prop_applied
+                           else "**不适用** —— marker 打分给的是相对权重，"
+                                "不是细胞比例；截断会改变相对次序")
+    if min_prop_applied:
+        n_truncated = int((props_f < min_prop).sum())
+        props_f[props_f < min_prop] = 0.0
+        rs = props_f.sum(axis=1, keepdims=True)
+        rs[rs == 0] = 1.0
+        props_f = props_f / rs
+    else:
+        n_truncated = 0
+        rs = props_f.sum(axis=1, keepdims=True)
+        rs[rs == 0] = 1.0
+        props_f = props_f / rs
+        log_info("marker 打分法：**不做 min_proportion 截断**"
+                 "（权重不是细胞比例，截断会改变相对次序）")
 
     max_err = float(dec.get("max_reconstruction_error", 0.5))
     if errors is not None:
@@ -751,7 +852,21 @@ def run_05_deconvolution(cfg: dict) -> dict:
             "共享 MS4A1/CD79A）",
             "要用真正的解卷积：在 config 里设 deconvolution.reference: h5ad "
             "并给一个 scRNA-seq 参考",
+            f"`min_proportion={min_prop}` 只对 NNLS 比例生效；"
+            "本分支**不做截断**（见 `min_proportion_applied`）—— "
+            "相对权重不是细胞比例，截断后重新归一化会改变"
+            "同一 spot 内各类型的相对次序",
         ]
+        if ref_desc.get("n_celltypes_dropped"):
+            limits.append(
+                f"**有 {ref_desc['n_celltypes_dropped']} 种细胞类型因 marker "
+                f"覆盖不足被整类丢弃**（"
+                + "、".join(f"{k}（{coverage[k]['n_present']}/"
+                            f"{coverage[k]['n_markers']}）"
+                            for k in ref_desc["celltypes_dropped"])
+                + "）—— 它们在产物里**没有列**，所以『没这一类』和"
+                "『这类被丢了』从 CSV 上看不出来；"
+                "基因宇宙是 " + str(ref_desc.get("gene_universe")))
 
     status = {
         "dataset_id": cfg["dataset_id"],
@@ -762,7 +877,11 @@ def run_05_deconvolution(cfg: dict) -> dict:
         "n_celltypes": len(types),
         "celltypes": types,
         "signature_coverage": coverage,
+        "count_matrix": count_info,
         "min_proportion": min_prop,
+        "min_proportion_applied": bool(min_prop_applied),
+        "min_proportion_applies_to": min_prop_applies_to,
+        "n_proportion_values_truncated": int(n_truncated),
         "max_reconstruction_error": max_err if errors is not None else None,
         "reconstruction_error": err_block,
         "mean_composition": {k: round(float(v), 5) for k, v in mean_prop.items()},

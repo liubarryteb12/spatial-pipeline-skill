@@ -27,9 +27,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import numpy as np  # noqa: E402
 import scanpy as sc  # noqa: E402
 
-from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
+from common import (ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm,)
+                    write_json, spatial_xy, W_ONE_HALF, mm,)
 
 HB_PREFIXES = ("HBA", "HBB", "HBD", "HBE", "HBG", "HBM", "HBQ", "HBZ")
 
@@ -60,6 +60,13 @@ def check_connectivity(adata, n_neighbors: int = 6) -> dict:
     mask = d[:, 1:].ravel() <= med * 3.0
     adj = sp.coo_matrix((np.ones(mask.sum()), (rows[mask], cols[mask])),
                         shape=(len(xy), len(xy)))
+    # **T6：先对称化。** 03/04/06 的同款图都做了 `W.maximum(W.T)`，只有这里
+    # 没做 —— kNN 图是**有向**的（A 的 6 个邻居里不一定包含 B，即使 B 的
+    # 邻居里有 A）。`connected_components(directed=False)` 会把有向图当
+    # 无向图处理，**结果恰好不受影响**（它内部取 `adj + adj.T`），
+    # 但依赖"下游会自己补救"是脆的：一旦有人把这里改成别的图算法、
+    # 或把这个 `adj` 拿去复用，缺失的对称化就会变成真错误。
+    adj = adj.maximum(adj.T)
     n_comp, labels = connected_components(adj, directed=False)
     sizes = np.bincount(labels)
     sizes = np.sort(sizes)[::-1]
@@ -84,13 +91,29 @@ def run_01_qc(cfg: dict) -> dict:
 
     adata = sc.read_h5ad(data_dir / "raw.h5ad")
     info = None
+    organism_source = None
     try:
         import json
         with open(data_dir / "dataset_info.json", encoding="utf-8") as fh:
             info = json.load(fh)
-    except Exception:  # noqa: BLE001
-        pass
-    organism = (info or {}).get("organism") or "Homo sapiens"
+        organism_source = "dataset_info.json"
+    except FileNotFoundError:
+        organism_source = "**dataset_info.json 不存在**"
+    except Exception as e:  # noqa: BLE001
+        # **M7：不能把"文件读坏了"和"文件里没写"合并成静默的默认值。**
+        # 原先两者都走 `pass`，然后 `or "Homo sapiens"` 兜底 ——
+        # 物种决定了线粒体基因前缀（`MT-` vs `mt-`），而**用错前缀
+        # 不会报错**：`pct_counts_mt` 全 0、过滤形同虚设。
+        # 下面 `n_mt == 0` 的 raise 是兜底，但"读坏了"必须先说出来。
+        organism_source = f"**dataset_info.json 解析失败（{type(e).__name__}: {e}）**"
+        log_warn(f"{organism_source} —— 物种将按默认值处理，线粒体前缀可能用错")
+    organism = (info or {}).get("organism")
+    if not organism:
+        organism = "Homo sapiens"
+        if organism_source and "失败" not in organism_source and "不存在" not in organism_source:
+            organism_source = f"{organism_source}（**没有 organism 字段**）"
+        log_warn(f"没有拿到 organism，默认按 '{organism}' 处理 —— "
+                 f"若数据是小鼠，线粒体前缀应是 'mt-' 而不是 'MT-'")
     lib = list(adata.uns["spatial"].keys())[0]
     n0 = adata.n_obs
     log_info(f"读入 {n0} spot x {adata.n_vars} 基因（{organism}）")

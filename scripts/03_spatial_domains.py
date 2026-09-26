@@ -43,7 +43,7 @@ from scipy.sparse.csgraph import connected_components  # noqa: E402
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, named_tools_note, parse_args, pkg_version,
                     probe_named_tools, record_step, save_fig, set_seed,
-                    spot_radius_plot_units, write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm, plot_marker_dotplot, build_marker_dotplot_figure, PAL,)
+                    write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm, build_marker_dotplot_figure, PAL,)
 
 
 def spatial_neighbor_graph(adata, n_neighbors: int = 6):
@@ -504,7 +504,15 @@ def run_03_spatial_domains(cfg: dict) -> dict:
     axes[0].set_xlabel("smoothing strength α")
     axes[0].set_ylabel("neighbor same-domain fraction")
     axes[0].set_title("Spatial coherence vs smoothing")
-    axes[0].legend(fontsize=7)
+    # **M8：图例必须放到画布外。** 原先这里是 `axes[0].legend(fontsize=7)`
+    # —— 面板内图例违反约定 v2（画布右侧、单列竖排），而且会**压住数据**：
+    # 平滑扫描的两条线正好穿过左上角（`neighbor_same_frac` 从高往低走，
+    # 面板内图例默认 loc="best" 就落在那里）。门禁抓不到这条 ——
+    # `check_legend_convention.mjs` 的文件头明确写了它**不判**
+    # "有没有写 legend.position"（只判写法）。所以这里靠人读代码发现。
+    # 改成 `fig.legend` + `outside right center`，与同文件 768/816 行一致。
+    fig.legend(fontsize=6, ncol=1, loc="outside right center",
+               bbox_to_anchor=(1.0, 0.5))
     axes[1].plot(scan_df["smoothing"], scan_df["n_domains"], "o-", color=PAL["primary"])
     axes[1].set_xlabel("smoothing strength α")
     axes[1].set_ylabel("number of domains")
@@ -602,82 +610,108 @@ def run_03_spatial_domains(cfg: dict) -> dict:
     # "某些类型的 marker 天生高表达"这个系统性偏差，
     # 每个类型都站在自己的尺度上比。
     annot = {}
+    annot_error = None
+    sig_key = ((cfg.get("deconvolution") or {}).get("signature_set")
+               or (cfg.get("analysis") or {}).get("celltype_markers"))
     try:
         import yaml
         sig_path = (Path(__file__).resolve().parent.parent / "assets"
                     / "reference_signatures.yml")
-        sig_key = ((cfg.get("deconvolution") or {}).get("signature_set")
-                   or (cfg.get("analysis") or {}).get("celltype_markers"))
         with open(sig_path, encoding="utf-8") as fh:
             sigs = yaml.safe_load(fh).get("signatures", {})
         sig = sigs.get(sig_key)
-        if sig:
-            rawX = adata.raw.X
-            rawX = rawX.toarray() if sp.issparse(rawX) else np.asarray(rawX)
-            rgenes = list(adata.raw.var_names)
-            rgi = {g: i for i, g in enumerate(rgenes)}
-            doms = adata.obs["domain"].astype(str).values
-            dom_list = sorted(set(doms), key=lambda x: int(x) if x.isdigit() else x)
+        if not sig:
+            raise KeyError(f"signature_set='{sig_key}' 不在 {sig_path.name} 里"
+                           f"（可选: {', '.join(sorted(sigs))}）")
+        rawX = adata.raw.X
+        rawX = rawX.toarray() if sp.issparse(rawX) else np.asarray(rawX)
+        rgenes = list(adata.raw.var_names)
+        rgi = {g: i for i, g in enumerate(rgenes)}
+        doms = adata.obs["domain"].astype(str).values
+        dom_list = sorted(set(doms), key=lambda x: int(x) if x.isdigit() else x)
 
-            # 矩阵 (域 × 类型) 的原始平均 marker 表达
-            used_ct, M = [], []
-            for ct, d in sig["celltypes"].items():
-                present = [g for g in d.get("markers", []) if g in rgi]
-                if len(present) < 3:
-                    continue
-                col = [float(rawX[doms == dm][:, [rgi[g] for g in present]].mean())
-                       for dm in dom_list]
-                used_ct.append(ct)
-                M.append(col)
-            M = np.asarray(M, dtype=float)          # (n_ct, n_dom)
+        # 矩阵 (域 × 类型) 的原始平均 marker 表达
+        used_ct, M = [], []
+        for ct, d in sig["celltypes"].items():
+            present = [g for g in d.get("markers", []) if g in rgi]
+            if len(present) < 3:
+                continue
+            col = [float(rawX[doms == dm][:, [rgi[g] for g in present]].mean())
+                   for dm in dom_list]
+            used_ct.append(ct)
+            M.append(col)
+        M = np.asarray(M, dtype=float)          # (n_ct, n_dom)
+        if M.size == 0:
+            raise ValueError("没有任何细胞类型的 marker 覆盖 >= 3 个")
 
-            # **按类型（行）做 z-score** —— 消掉"某些类型 marker 天生高表达"
-            mu = M.mean(axis=1, keepdims=True)
-            sd = M.std(axis=1, keepdims=True)
-            sd[sd < 1e-12] = 1.0
-            Z = (M - mu) / sd                       # (n_ct, n_dom)
+        # **按类型（行）做 z-score** —— 消掉"某些类型 marker 天生高表达"
+        mu = M.mean(axis=1, keepdims=True)
+        sd = M.std(axis=1, keepdims=True)
+        sd[sd < 1e-12] = 1.0
+        Z = (M - mu) / sd                       # (n_ct, n_dom)
 
-            for j, dm in enumerate(dom_list):
-                col = Z[:, j]
-                order = np.argsort(-col)
-                top_i, second_i = int(order[0]), int(order[1]) if len(order) > 1 else int(order[0])
-                z_top, z_second = float(col[top_i]), float(col[second_i])
-                annot[dm] = {
-                    "label": used_ct[top_i],
-                    "z_score": round(z_top, 4),
-                    "runner_up": used_ct[second_i],
-                    "runner_up_z": round(z_second, 4),
-                    # margin 小时标签不该被当结论（沿用 Part 2 的做法）
-                    "z_margin": round(z_top - z_second, 4),
-                    "assignment_confident": bool(z_top - z_second > 0.5),
-                    "raw_mean_expression": round(float(M[top_i, j]), 4),
-                    "n_spots": int((doms == dm).sum()),
-                    "top5": [{"celltype": used_ct[int(i)],
-                              "z_score": round(float(col[int(i)]), 4)}
-                             for i in order[:5]],
-                }
-            log_info("域标签: " + ", ".join(
-                f"{k}->{v['label']}(z {v['z_score']:.2f}, Δ{v['z_margin']:.2f})"
-                for k, v in annot.items()))
-            n_unc = sum(1 for v in annot.values() if not v["assignment_confident"])
-            if n_unc:
-                log_warn(f"{n_unc}/{len(annot)} 个域的标签 z_margin <= 0.5 —— "
-                         f"这些标签不该被当结论")
-            write_json(res_dir / "domain_annotation.json",
-                       {"signature_set": sig_key, "domains": annot,
-                        "scoring": ("按类型跨域做 z-score 后取最高 —— "
-                                    "问的是『哪个域对这个类型相对最富集』，"
-                                    "不是『哪个类型表达最高』"),
-                        "why_zscore": ("直接比绝对平均表达时，13 个域里 12 个都被"
-                                       "标成 Plasma_cell —— 浆细胞的 marker "
-                                       "（MZB1/JCHAIN/IGHG1/IGKC）在淋巴结里"
-                                       "表达量本来就极高，绝对表达一比就压倒"
-                                       "所有其他类型。z-score 消掉了这个偏差"),
-                        "caveat": ("**标签是提示，不是结论。** Visium 的 spot 含 "
-                                   "1-10 个细胞，域是『组成相近的一片区域』，"
-                                   "不是某一种细胞。z_margin 小时标签不可信")})
+        for j, dm in enumerate(dom_list):
+            col = Z[:, j]
+            order = np.argsort(-col)
+            top_i, second_i = int(order[0]), int(order[1]) if len(order) > 1 else int(order[0])
+            z_top, z_second = float(col[top_i]), float(col[second_i])
+            annot[dm] = {
+                "label": used_ct[top_i],
+                "z_score": round(z_top, 4),
+                "runner_up": used_ct[second_i],
+                "runner_up_z": round(z_second, 4),
+                # margin 小时标签不该被当结论（沿用 Part 2 的做法）
+                "z_margin": round(z_top - z_second, 4),
+                "assignment_confident": bool(z_top - z_second > 0.5),
+                "raw_mean_expression": round(float(M[top_i, j]), 4),
+                "n_spots": int((doms == dm).sum()),
+                "top5": [{"celltype": used_ct[int(i)],
+                          "z_score": round(float(col[int(i)]), 4)}
+                         for i in order[:5]],
+            }
+        log_info("域标签: " + ", ".join(
+            f"{k}->{v['label']}(z {v['z_score']:.2f}, Δ{v['z_margin']:.2f})"
+            for k, v in annot.items()))
+        n_unc = sum(1 for v in annot.values() if not v["assignment_confident"])
+        if n_unc:
+            log_warn(f"{n_unc}/{len(annot)} 个域的标签 z_margin <= 0.5 —— "
+                     f"这些标签不该被当结论")
     except Exception as e:  # noqa: BLE001
-        log_warn(f"域标签打分跳过: {type(e).__name__}: {e}")
+        # **S2：不再静默吞掉。** 这一段原先整块包在裸 except 里，
+        # 失败只 `log_warn`，而 `domain_annotation.json` 在
+        # `main_analysis.py` 里**没有任何消费者** —— 于是"域标签没算出来"
+        # 和"域标签算出来了"在验收层看起来完全一样。
+        # 现在：① 把失败原因写进 status 文件（`domain_annotation_failed`）；
+        # ② 让 main_analysis 有一条 `content:domain_annotation` 消费它。
+        annot_error = f"{type(e).__name__}: {e}"
+        log_warn(f"域标签打分跳过: {annot_error}")
+
+    if annot:
+        write_json(res_dir / "domain_annotation.json",
+                   {"signature_set": sig_key, "domains": annot,
+                    "status": "ok",
+                    "scoring": ("按类型跨域做 z-score 后取最高 —— "
+                                "问的是『哪个域对这个类型相对最富集』，"
+                                "不是『哪个类型表达最高』"),
+                    "why_zscore": ("直接比绝对平均表达时，13 个域里 12 个都被"
+                                   "标成 Plasma_cell —— 浆细胞的 marker "
+                                   "（MZB1/JCHAIN/IGHG1/IGKC）在淋巴结里"
+                                   "表达量本来就极高，绝对表达一比就压倒"
+                                   "所有其他类型。z-score 消掉了这个偏差"),
+                    "caveat": ("**标签是提示，不是结论。** Visium 的 spot 含 "
+                               "1-10 个细胞，域是『组成相近的一片区域』，"
+                               "不是某一种细胞。z_margin 小时标签不可信")})
+    else:
+        # **必须留下一个文件。** 没有文件 = 验收层那条检查会以为
+        # "这一步不存在"，而不是"这一步失败了"（见 S2/S4 的教训）。
+        write_json(res_dir / "domain_annotation.json",
+                   {"signature_set": sig_key, "domains": {},
+                    "status": "failed" if annot_error else "empty",
+                    "reason": annot_error or "没有任何细胞类型的 marker 覆盖 >= 3 个",
+                    "n_celltypes_used": 0,
+                    "caveat": "**域标签没有产出** —— 不要把它当『这些域没有标签』"})
+        log_warn(f"域标签没有产出（{annot_error or '无可用类型'}）—— "
+                 f"已写 domain_annotation.json 的 status=failed")
 
     # ---- 4c. §3.2 点名方法：SpaGCN / STAGATE（交叉验证）----------------------
     #
@@ -773,11 +807,15 @@ def run_03_spatial_domains(cfg: dict) -> dict:
                            f"STAGATE ({stg_info['n_domains']})",
                            "03-03-04-unit3-domains-stagate"))
         for _ui, (key, title, name) in enumerate(panels, start=1):
-            # **方法色身份制**（差距清单 #26，SRC-16/BOMS 惯例）：每个方法一个
-            # 固定色，跨面板/跨图不变 —— 读者不用重复读图例就知道哪个是哪个。
-            METHOD_COLORS = {"domain": PAL["blue"], "domain_spagcn": PAL["orange"],
-                         "domain_stagate": PAL["green"]}
-            method_fill = METHOD_COLORS.get(key, PAL["primary"])
+            # **方法身份靠标题，不靠颜色。** 这里原先写了一段
+            # `METHOD_COLORS = {...}` + `method_fill = ...`，声称"每个方法一个
+            # 固定色"——但两个变量**赋值后从未被使用**，散点实际用的是
+            # `cmap(i % 20)`（按**域标签**上色）。留着它比删掉更危险：
+            # 读者会以为方法色在生效，于是按"色=方法"去读图。
+            # 真实约定是：**域标签色跨图一致**（tab20，见上面 PANEL_SPECS
+            # 的"同色纪律"），方法身份由 `title` 与图名承载。
+            # 想真的按方法上色，就得把散点改成单色 scatter —— 那会丢掉
+            # 域间对照，是另一个决定，不该藏在死变量里。
             cats = adata.obs[key].astype(str).values
             uniq = sorted(set(cats), key=lambda x: int(x) if x.isdigit() else x)
             cmap = plt.get_cmap("tab20")
@@ -788,7 +826,7 @@ def run_03_spatial_domains(cfg: dict) -> dict:
                 ax.scatter(xy[m, 0], xy[m, 1], s=8, color=cmap(i % 20),
                            label=u, linewidths=0)
             fig.legend(fontsize=5, markerscale=2.0, loc="outside right center",
-                      ncol=1 if len(uniq) > 8 else 1, framealpha=0.8,
+                      ncol=1, framealpha=0.8,
                       title="domain", title_fontsize=6)
             ax.set_title(title)
             ax.set_xticks([]); ax.set_yticks([])

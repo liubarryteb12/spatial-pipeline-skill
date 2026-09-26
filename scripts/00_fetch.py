@@ -15,6 +15,15 @@
   - spot 数必须与位置文件里 in_tissue=1 的行数对得上
   - 空间坐标必须覆盖全部 spot（缺坐标的 spot 画不到图上）
 
+  **最后一条是"必须"还是"尽量"？** 代码的实际行为是：barcode 交集为空
+  才 raise，**部分缺失只 `log_warn` 然后静默剔除**。这条差异原先只体现在
+  这一行文档里（写"必须"），产物里看不到剔了谁。现在缺失数与被剔的
+  barcode 会写进 `dataset_info.json`（`n_spots_dropped_no_coords` /
+  `dropped_no_coords_examples`），**所以"少了一些 spot"变成可查的事实**，
+  而不是一句可能被忽略的 WARN。
+  用 `filtered` 矩阵时这里通常是 0；用 `raw` 矩阵时会很多 —— 那时
+  剔除是**正确**的（raw 里的空 spot 本来就不在组织上），但必须看得见。
+
 输出：
   data/<id>/raw.h5ad          （含 obsm['spatial'] 与 uns['spatial']）
   data/<id>/dataset_info.json
@@ -188,8 +197,10 @@ def run_00_fetch(cfg: dict) -> dict:
             "表达矩阵的 barcode 与位置文件的 barcode 完全没有交集 —— "
             "这两个文件可能不是同一次 Space Ranger 运行的结果")
     n_missing_pos = int(adata.n_obs - len(common))
+    dropped_no_coords = [str(b) for b in adata.obs_names if b not in set(pos.index)]
     if n_missing_pos:
-        log_warn(f"{n_missing_pos} 个 spot 在位置文件里找不到坐标，将被剔除")
+        log_warn(f"{n_missing_pos} 个 spot 在位置文件里找不到坐标，将被剔除"
+                 f"（例：{dropped_no_coords[:3]}）")
 
     adata = adata[common].copy()
     pos = pos.loc[common]
@@ -286,6 +297,14 @@ def run_00_fetch(cfg: dict) -> dict:
         "condition": src.get("condition"),
         "n_spots_total": int(adata.n_obs),
         "n_spots_in_tissue": n_in_tissue,
+        # **M9：静默剔除的 spot 必须留痕。** 见文件头 docstring 的说明。
+        "n_spots_dropped_no_coords": int(n_missing_pos),
+        "dropped_no_coords_examples": dropped_no_coords[:5],
+        "coord_coverage_note": ("表达矩阵的每个 spot 都必须能在位置文件里找到"
+                                "坐标；找不到的被剔除。`filtered` 矩阵下通常为 0，"
+                                "`raw` 矩阵下会很多 —— 那种剔除是对的，"
+                                "但必须可见"),
+        "n_spots_raw_matrix": int(len(common) + n_missing_pos),
         "n_genes": int(adata.n_vars),
         "positions_file": pos_file.name,
         "positions_had_header": bool(had_header),

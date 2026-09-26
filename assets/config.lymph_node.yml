@@ -74,6 +74,10 @@ svg:
   method: moran             # moran | geary
   n_top: 30
   n_perms: 100              # 置换检验次数（算 p 值）
+  # **全基因集有 3 万多个，置换检验很慢**，所以按方差取前 N 个再跑。
+  # 这个上限原先只写在代码里的 `.get("max_genes", 4000)`，配置里没有 ——
+  # 于是它永远走默认、读者也看不到这轮到底看了多少基因（M12）。
+  max_genes: 4000
   # **Moran's I 需要一个空间权重矩阵。** 用 Visium 的六边形邻居图。
   n_neighbors: 6
 

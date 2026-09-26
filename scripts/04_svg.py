@@ -40,7 +40,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 
 import matplotlib as mpl  # noqa: E402
-from matplotlib.cm import ScalarMappable  # noqa: E402
 from matplotlib.colors import Normalize  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
@@ -48,9 +47,10 @@ import scanpy as sc  # noqa: E402
 import scipy.sparse as sp  # noqa: E402
 
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, probe_named_tools, record_step,
-                    save_fig, set_seed, spot_radius_plot_units, write_json,
-                    spatial_xy, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm, PAL,)
+                    log_warn, parse_args, probe_named_tools,
+                    reconstruct_counts_from_raw, record_step,
+                    save_fig, set_seed, write_json,
+                    spatial_xy, W_ONE_HALF, W_SINGLE, mm, PAL,)
 
 
 def build_weights(adata, n_neighbors: int = 6, row_standardize: bool = True):
@@ -229,7 +229,8 @@ def _shim_scipy_misc_derivative() -> bool:
 
 
 def try_spatialde(X: np.ndarray, xy: np.ndarray, genes: list,
-                  res: pd.DataFrame, cfg: dict, log=log_info):
+                  res: pd.DataFrame, cfg: dict, obs=None, adata=None,
+                  log=log_info):
     """跑 SpatialDE 并与 Moran's I 比对。
 
     **只在基因子集上跑。** SpatialDE 每个基因要拟合一个高斯过程，
@@ -240,6 +241,41 @@ def try_spatialde(X: np.ndarray, xy: np.ndarray, genes: list,
     **子集抽样会引入选择偏差**（前 100 个是 Moran's I 挑出来的），
     所以一致性数字要**分两组报**：top 组和随机背景组。
     只报合并的相关会把"两边都认为强"和"两边都认为弱"混成一个数。
+
+    ---
+    ## 为什么必须在 `dyn_de` 之前补两步预处理
+
+    `SpatialDE.run` 在调 `dyn_de` **之前**会做两步
+    （`SpatialDE/anndata.py:33-46`）：
+
+      `NaiveDE.stabilize(X.T).T`      ← 方差稳定变换（VST）
+      `NaiveDE.regress_out(obs, ., 'np.log(total_counts)')`  ← 回归掉测序深度
+
+    本仓库绕开 `run` 是为了躲 `util.qvalue` 对 pandas Series 调
+    `.ravel()` 的不兼容（见下），但**绕开 `run` 时把这两步也一起丢了**。
+    没有 VST，高表达基因的方差被低估；没有深度回归，测序深度本身
+    （它在空间上往往有梯度 —— 组织边缘的 spot 捕获的转录本更少）
+    会被当成"空间结构"。**两个方向都会让 qval 偏小、假阳性变多。**
+
+    `NaiveDE` 是 `SpatialDE` 的**硬依赖**，所以这两步不需要新依赖。
+
+    ---
+    ## ⚠️ VST 必须吃**原始计数**，不能吃 `X`（这里踩过一个坑）
+
+    传进来的 `X` 是 `adata.raw.X` 的 **log1p 值**（Moran's I 那条路要的
+    就是 log 值，所以 `X` 本身没错）。但 `NaiveDE.stabilize` 按
+    `var = mu + phi*mu^2` 拟合离散度，**假设输入是原始计数**。
+
+    喂 log 值的后果实测（lymph_node，150 个基因）：
+
+      `phi_hat = -0.2523` → `1/(2*phi) = -1.98`（负数）
+      → `np.log(负数)` 出 NaN → `stabilize` 后 43 个基因整列全 NaN
+      → `get_mll_results` 的 merge 把 NaN 行**悄悄丢掉**
+      → 150 个基因只剩 **3 行**，而 `status` 仍报 `ok`
+
+    所以这里用 `reconstruct_counts_from_raw` 重建计数再 stabilize。
+    **尺度必须按全基因集行和反推**（只对选中的 150 列求行和会把尺度
+    放大约 8.9 倍，且不报错）—— 公共库那个函数已经保证这一点。
     """
     info = {"attempted": True, "status": None, "reason": "",
             "max_genes": SPATIALDE_MAX_GENES}
@@ -273,6 +309,92 @@ def try_spatialde(X: np.ndarray, xy: np.ndarray, genes: list,
         coords = np.asarray(xy, dtype=float)
         counts = pd.DataFrame(X[:, [gi[g] for g in sel]], columns=sel)
 
+        # ---- S5：补上 SpatialDE.run 里的两步预处理 -------------------------
+        # 顺序不能反：先 VST（把方差与均值解耦），再回归掉深度。
+        # `NaiveDE` 假设**行是基因、列是样本**，所以 stabilize 要转两次。
+        #
+        # **VST 的输入必须是原始计数**（见 docstring 的坑）。有 adata 就
+        # 从 raw 重建这 150 个基因的计数；拿不到就如实记进 info，不假装做过。
+        vst_note = None
+        counts_vst = None
+        vst_block = None
+        if adata is not None and getattr(adata, "raw", None) is not None:
+            try:
+                C_sel, sel_ok, cinfo = reconstruct_counts_from_raw(
+                    adata, genes=sel, log=log)
+                if len(sel_ok) != len(sel):
+                    cinfo = dict(cinfo, status="incomplete",
+                                 n_genes_reconstructed=len(sel_ok),
+                                 n_genes_requested=len(sel))
+                    vst_block = (f"只有 {len(sel_ok)}/{len(sel)} 个基因能从 raw "
+                                 "重建计数")
+                elif cinfo.get("scale_source") != "obs['total_counts']":
+                    # **没有 total_counts 时不能做 VST。** 那条回退路径把每行
+                    # 归一到同一尺度，得到的是**深度归一后的值、不是计数** ——
+                    # 而 VST 恰恰要按 `var = mu + phi*mu^2` 拟合计数离散度。
+                    # 喂这种值实测会算出负 phi（NaN → 静默丢基因）。
+                    vst_block = ("obs 里没有 total_counts —— 只能还原到"
+                                 "每行同一尺度（深度归一的值），不是真实计数")
+                else:
+                    counts_vst = pd.DataFrame(C_sel, columns=sel_ok,
+                                              index=counts.index)
+                info["count_reconstruction"] = cinfo
+                if vst_block:
+                    log_warn(f"不做 VST：{vst_block}")
+            except Exception as exc:  # noqa: BLE001
+                vst_block = f"重建计数失败（{type(exc).__name__}: {exc}）"
+                info["count_reconstruction"] = {
+                    "status": "failed",
+                    "reason": f"{type(exc).__name__}: {exc}"}
+                log_warn(f"从 raw 重建计数失败：{type(exc).__name__}: {exc}")
+        else:
+            vst_block = "没有 adata 或 adata.raw 为空"
+            info["count_reconstruction"] = {
+                "status": "not_available",
+                "reason": vst_block}
+
+        try:
+            import NaiveDE
+            if counts_vst is None:
+                # 拿不到真实计数就**不做 VST** —— 宁可少做一步并记下来，
+                # 也不能喂 log 值（或深度归一值）假装做过：那会算出负 phi，
+                # 让 get_mll_results 静默丢掉绝大多数基因。
+                raise RuntimeError(
+                    f"没有可用的原始计数（{vst_block}），不能做 "
+                    "NaiveDE.stabilize")
+            counts_st = pd.DataFrame(
+                NaiveDE.stabilize(counts_vst.T.values).T,
+                columns=sel, index=counts.index)
+            if obs is not None and "total_counts" in getattr(obs, "columns", []):
+                # 这一步按 `np.log(total_counts)` 回归 —— 与 SpatialDE.run
+                # 的默认 regress_formula 一致（不改口径）
+                counts_use = pd.DataFrame(
+                    NaiveDE.regress_out(obs, counts_st.T.values,
+                                        "np.log(total_counts)").T,
+                    columns=sel, index=counts.index)
+                vst_note = ("NaiveDE.stabilize(原始计数) + "
+                            "regress_out('np.log(total_counts)')")
+            else:
+                counts_use = counts_st
+                vst_note = ("NaiveDE.stabilize(原始计数)（**没有 obs.total_counts，"
+                            "深度回归被跳过**）")
+                log_warn("obs 里没有 total_counts —— SpatialDE 的深度回归被跳过。"
+                         "**测序深度在空间上常有梯度，它会被当成空间结构**")
+            info["vst_applied"] = True
+            info["vst_input"] = "原始计数（从 adata.raw 重建）"
+            info["depth_regression"] = bool(
+                obs is not None and "total_counts" in getattr(obs, "columns", []))
+            info["preprocessing"] = vst_note
+        except Exception as exc:  # noqa: BLE001
+            # **不吞掉。** 预处理失败就退回原始计数，但必须把这件事
+            # 写进产物 —— "VST 没做成"和"做了 VST"的结果看起来一样。
+            counts_use = counts
+            info["vst_applied"] = False
+            info["vst_input"] = None
+            info["depth_regression"] = False
+            info["preprocessing"] = f"**未做 VST（{type(exc).__name__}: {exc}）**"
+            log_warn(f"NaiveDE 预处理失败，退回原始计数：{type(exc).__name__}: {exc}")
+
         # **不走 SpatialDE.run。** 它第 432 行是
         #     mll_results['qval'] = qvalue(mll_results['pval'])
         # 而 util.qvalue 第 19 行是 `pv = pv.ravel()` —— pandas Series
@@ -292,12 +414,30 @@ def try_spatialde(X: np.ndarray, xy: np.ndarray, genes: list,
         # `SpatialDE/__init__.py` 只导出 dyn_de / run / model_search /
         # fit_patterns / spatial_patterns 五个名字，get_l_limits 与
         # get_mll_results 都在 base 里、没被提上来。
-        raw = SpatialDE.base.dyn_de(coords, counts, kernel_space)
+        raw = SpatialDE.base.dyn_de(coords, counts_use, kernel_space)
         out = pd.DataFrame(SpatialDE.base.get_mll_results(raw))
         out["pval"] = 1.0 - _st.chi2.cdf(out["LLR"], df=1)
         out["qval"] = multipletests(out["pval"], method="fdr_bh")[1]
         out["_group"] = np.where(out["g"].isin(set(top)), "top_morans", "background")
-        info["status"] = "ok"
+        # ---- 静默丢基因的守门 ------------------------------------------------
+        # `get_mll_results` 内部是 merge，NaN 行会被**悄悄丢掉**：
+        # 实测喂 log 值时 150 个基因只剩 3 行，而这里原先照报 ok。
+        # 所以产出基因数与请求数不一致时必须显式记下来。
+        n_out = len(out)
+        n_dropped = info["n_genes_run"] - n_out
+        info["n_genes_out"] = n_out
+        info["n_genes_dropped"] = n_dropped
+        if n_dropped > 0:
+            missing = [g for g in sel if g not in set(out["g"].astype(str))]
+            info["genes_dropped_examples"] = missing[:10]
+            info["status"] = "partial"
+            info["reason"] = (f"{n_dropped}/{info['n_genes_run']} 个基因在 "
+                              "get_mll_results 里被丢掉（NaN 行会被 merge 静默丢弃）")
+            log_warn(f"SpatialDE **只产出 {n_out}/{info['n_genes_run']} 个基因**，"
+                     f"丢了 {n_dropped} 个（例：{missing[:5]}）—— 见 status 的 "
+                     "n_genes_dropped。VST 输入不是原始计数时就会这样")
+        else:
+            info["status"] = "ok"
         info["qval_method"] = "BH（本仓库实现）"
         info["bypassed_spatialde_run"] = True
         info["bypass_reason"] = ("SpatialDE.util.qvalue 对 pandas Series 调 .ravel()，"
@@ -305,7 +445,8 @@ def try_spatialde(X: np.ndarray, xy: np.ndarray, genes: list,
         info["columns"] = sorted(map(str, out.columns))
         info["n_significant_qval_0.05"] = int((out["qval"] < 0.05).sum())
         log(f"SpatialDE 完成：{len(out)} 个基因，"
-            f"qval<0.05 的 {info['n_significant_qval_0.05']} 个")
+            f"qval<0.05 的 {info['n_significant_qval_0.05']} 个"
+            f"（预处理：{vst_note}）")
         return out, info
     except Exception as exc:  # noqa: BLE001
         info["status"] = "failed"
@@ -398,16 +539,25 @@ def run_04_svg(cfg: dict) -> dict:
         # 保留方差 > 0 的基因（全零基因的 I 无定义）
         keep = np.flatnonzero(var > 0)
         # 上限：按方差取前 N 个，控制置换检验耗时
+        #
+        # **M12：这个上限原先不在配置里。** `svg.max_genes` 在
+        # `assets/config.lymph_node.yml` 的 `svg:` 段根本没有这一项，
+        # 所以 `s.get("max_genes", 4000)` **永远走默认**，而且 status 里
+        # 也不记它 —— 读者无法知道这轮的 SVG 到底看了多少基因。
+        # 现在两处都补：配置里写出来（可调），status 里记实际值。
         max_genes = int(s.get("max_genes", 4000))
+        n_genes_all = len(genes_all)
         if len(keep) > max_genes:
             keep = keep[np.argsort(var[keep])[::-1][:max_genes]]
-            log_info(f"全基因集 {len(genes_all)} 个，按方差取前 {max_genes} 个做置换检验")
+            log_info(f"全基因集 {n_genes_all} 个，按方差取前 {max_genes} 个做置换检验")
         X = np.ascontiguousarray(Xall[:, keep].astype(np.float64))
         genes = [genes_all[i] for i in keep]
     else:
         X = adata.X.toarray() if sp.issparse(adata.X) else np.asarray(adata.X)
         X = np.ascontiguousarray(X.astype(np.float64))
         genes = list(adata.var_names)
+        max_genes = None
+        n_genes_all = len(genes)
         log_warn("adata.raw 为空 —— 只用 HVG 做 SVG。"
                  "**HVG 是按样本间变异选的，会漏掉空间结构强但整体变异不大的基因**")
 
@@ -528,7 +678,8 @@ def run_04_svg(cfg: dict) -> dict:
     # ---- 7. SpatialDE 交叉验证（文档 §3.4）---------------------------------
     # 用 array 坐标（不缩放）：SpatialDE 估的是长度尺度，坐标等比缩放
     # 只改 l 的数值，不改检验结论；用原始坐标少一层换算。
-    sd_res, sd_info = try_spatialde(X, spatial_xy(adata), genes, res, cfg)
+    sd_res, sd_info = try_spatialde(X, spatial_xy(adata), genes, res, cfg,
+                                    obs=adata.obs, adata=adata)
     sd_cmp = {"compared": False}
     if sd_res is not None:
         sd_res.to_csv(res_dir / "spatialde_results.csv", index=False)
@@ -546,8 +697,25 @@ def run_04_svg(cfg: dict) -> dict:
         "stat_name": stat_name,
         "expected_under_no_autocorrelation": round(float(expected), 5),
         "n_genes_tested": int(len(res)),
+        "n_genes_in_raw": int(n_genes_all),
+        "max_genes_cap": max_genes,
+        "gene_selection": ("全基因集按方差取前 max_genes 个" if max_genes
+                           else "adata.raw 为空，退回 HVG"),
         "n_significant_bh": n_sig,
         "n_permutations": n_perms,
+        # **M1：p 值分辨率。** `n_perms` 次置换下 p 值只有 `n_perms + 1`
+        # 个可能取值（`(n_ge+1)/(n_perms+1)`），最小值是 `1/(n_perms+1)`。
+        # 4000 个基因共用 101 档 → **大量基因并列同一个 p**，
+        # 于是 BH 校正的分母虽然是 4000，实际可分辨的位次远少于 4000。
+        # 这不是"错了"，但必须写出来：读者会以为 `p_adj` 有 4000 档分辨率。
+        "p_value_resolution": {
+            "n_permutations": n_perms,
+            "n_distinct_p_values_possible": n_perms + 1,
+            "min_possible_p": round(1.0 / (n_perms + 1), 6),
+            "n_genes_at_min_p": int((res["p_value"] <= 1.0 / (n_perms + 1) + 1e-12).sum()),
+            "note": ("置换检验的 p 值只有 n_perms+1 档；**并列最小值**的基因"
+                     "数量在这里一并报出 —— 并列越多，BH 的『排名』信息越少"),
+        },
         "weights": winfo,
         "top_genes": df_to_records(res.head(20)),
         "gene_set_note": ("用的是**全基因集**（adata.raw）按方差粗筛后的结果。"

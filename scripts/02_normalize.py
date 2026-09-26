@@ -24,9 +24,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import numpy as np  # noqa: E402
 import scanpy as sc  # noqa: E402
 
-from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
+from common import (ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, record_step, save_fig, set_seed, write_json,
-                    spatial_xy, PAL, W_DOUBLE, W_ONE_HALF, mm,)
+                    spatial_xy, PAL, W_ONE_HALF, mm,)
 
 
 def run_02_normalize(cfg: dict) -> dict:
@@ -214,7 +214,27 @@ def run_02_normalize(cfg: dict) -> dict:
         "n_pcs": int(cfg["reduce"]["n_pcs"]),
         "pca_variance_ratio_top10": [round(float(v), 5) for v in var_ratio[:10]],
         "pca_cumvar_top10": [round(float(v), 5) for v in np.cumsum(var_ratio[:10])],
-        "counts_layer_preserved": "counts" in work.layers or "counts" in adata.layers,
+        # **M3：这个字段原先恒为 True。** 原式是
+        #     "counts" in work.layers or "counts" in adata.layers
+        # 而 `work = adata[:, hvg].copy()` 会把 `layers` 一起裁下来 ——
+        # 所以左边永远为真，`or` 右边的分支从来没被求值过。
+        # 更关键的是：**它答的不是下游要问的问题。** 下游（08_spatial_trajectory
+        # 的复杂度）需要知道的是"落盘的 counts 覆盖哪些基因"，而
+        # `normalized.h5ad` 里的 counts 只有 **2000 个 HVG 列** ——
+        # 一个 `True` 让读者以为全基因集的计数还在。
+        "counts_layer": {
+            "present_in_saved_file": "counts" in work.layers,
+            "n_genes_in_saved_counts": (
+                int(work.layers["counts"].shape[1]) if "counts" in work.layers else 0),
+            "n_genes_saved_total": int(work.n_vars),
+            "full_gene_counts_available": bool(adata.raw is not None),
+            "full_gene_view": ("adata.raw（log1p 全基因集）" if adata.raw is not None
+                               else "**没有** —— 全基因集计数在这一步之后不可得"),
+            "note": ("落盘的是**只含 HVG 的 scaled 矩阵**；counts 层同样是 HVG 子集。"
+                     "全基因集只能从 `adata.raw` 取（log1p 值），"
+                     "需要计数时按每行 expm1 行和反推尺度（见 05_deconvolution."
+                     "full_gene_counts）"),
+        },
         "note": ("Visium 的 spot 是多个细胞的混合物，HVG 会偏向**细胞组成差异**"
                  "而非细胞状态差异 —— 这对空间域划分是想要的，"
                  "但不能解读成『同一类细胞内的调控差异』"),

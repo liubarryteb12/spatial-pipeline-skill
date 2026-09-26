@@ -33,10 +33,10 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import scipy.sparse as sp  # noqa: E402
 
-from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
+from common import (ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, probe_named_tools, record_step, save_fig,
                     set_seed,
-                    spatial_xy, write_json, W_DOUBLE, W_ONE_HALF, mm,)
+                    spatial_xy, write_json, W_ONE_HALF, mm,)
 
 # 复用 03 的空间平滑与 04 的 Moran's I —— 不重复实现。
 # 目录名以数字开头，不能直接 import，所以按文件路径加载。
@@ -116,10 +116,29 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
     # 判据：转录组复杂度（表达基因数）最高的 spot。
     # **这是启发式，不是生物学判据。** 空间数据里没有时间轴，"根"只是
     # 排序的起点；换一个根，整条轴会反向（见 limitations）。
-    complexity = np.asarray((adata.X > 0).sum(axis=1)).ravel().astype(float)
+    #
+    # **M3：复杂度必须在全基因集上数。** `adata` 是 `domains.h5ad`，
+    # 它的 `.X` 是**只含 2000 个 HVG 的 scaled 矩阵**（02_normalize 写盘时
+    # 就裁过）—— 于是在 `.X` 上数 `> 0` 得到的是"有多少个 HVG 的
+    # z-score 为正"，一个**恒在 2000 附近**的量，几乎不区分 spot。
+    # 复杂度要问的是"这个 spot 测到了多少种基因"，那只有 `adata.raw` 有。
+    if adata.raw is not None:
+        _Xr = adata.raw.X
+        _Xr = _Xr.toarray() if hasattr(_Xr, "toarray") else np.asarray(_Xr)
+        complexity = np.asarray((_Xr > 0).sum(axis=1)).ravel().astype(float)
+        complexity_source = "adata.raw（全基因集，>0 计数）"
+    else:
+        complexity = np.asarray((adata.X > 0).sum(axis=1)).ravel().astype(float)
+        complexity_source = ("adata.X（**只有 HVG 的 scaled 矩阵** —— "
+                             "数出来的是『z-score 为正的 HVG 个数』，"
+                             "不是『检测到的基因数』）")
+        log_warn(f"adata.raw 为空，复杂度只能退回 HVG 矩阵：{complexity_source}")
     root_idx = int(np.argmax(complexity))
     root_record = {
         "method": "auto_max_detected_genes",
+        "complexity_source": complexity_source,
+        "complexity_range": [round(float(np.min(complexity)), 2),
+                             round(float(np.max(complexity)), 2)],
         "root_spot": str(adata.obs_names[root_idx]),
         "root_xy": [round(float(xy[root_idx, 0]), 2), round(float(xy[root_idx, 1]), 2)],
         "reason": ("取表达基因数最多的 spot 作排序起点。**这是启发式**："
@@ -212,6 +231,7 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
 
     # ---- 6. 沿空间拟时序变化的基因 -----------------------------------------
     gene_rows = []
+    genes_along_error = None
     try:
         use = adata.raw.to_adata() if adata.raw is not None else adata
         X = use.X
@@ -235,7 +255,16 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
         pd.DataFrame(gene_rows).to_csv(res_dir / "spatial_trajectory_genes.csv", index=False)
         log_info(f"沿空间拟时序变化的基因：表达基因 {len(idx)} 个，报前 {len(gene_rows)} 个")
     except Exception as e:  # noqa: BLE001
-        log_warn(f"沿空间拟时序的基因分析失败: {type(e).__name__}: {e}")
+        # **S3：不再静默吞掉。** 整块原先只 `log_warn`，而
+        # `spatial_trajectory_genes.csv` 在 main_analysis 里**没有消费者** ——
+        # "基因没算出来"和"算出来了"在验收层看起来一样。
+        # 现在：① 失败原因进 status（`genes_along_pseudotime`）；
+        # ② 落一个**只有表头**的 CSV，让消费方能区分"文件不存在"与"空结果"。
+        genes_along_error = f"{type(e).__name__}: {e}"
+        log_warn(f"沿空间拟时序的基因分析失败: {genes_along_error}")
+        pd.DataFrame(columns=["gene", "rho_with_spatial_pseudotime",
+                              "morans_I", "direction"]).to_csv(
+            res_dir / "spatial_trajectory_genes.csv", index=False)
 
     # ---- 7. 每 spot 落盘 ---------------------------------------------------
     out = pd.DataFrame({
@@ -320,6 +349,12 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
         "spearman_between_two": round(rho_two, 4),
         "gradient": grad_rows,
         "n_genes_along": len(gene_rows),
+        "genes_along_pseudotime": {
+            "status": "failed" if genes_along_error else "ok",
+            "reason": genes_along_error,
+            "n_genes_reported": len(gene_rows),
+            "csv": "spatial_trajectory_genes.csv",
+        },
         "top_genes": gene_rows[:20],
         "method": ("在空间平滑过的 PCA 嵌入上跑扩散图 + DPT，与直接在原始嵌入上"
                    "跑的结果**定量对比**（Moran's I 与邻居间差值）。"
