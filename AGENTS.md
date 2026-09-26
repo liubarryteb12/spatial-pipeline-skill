@@ -972,9 +972,15 @@ E-63 的自检第一版有 9 个用例，**用例 8 自己另写了一遍路径�
 
 | 位置 | 内容 |
 |---|---|
-| `.github/workflows/spatial_analysis.yml` / `scrna_analysis.yml` | 「静态检查（不装依赖）」那一步跑 `check_legend_convention.mjs --selftest` + `check_figures.mjs --selftest` |
-| `.github/workflows/geo_analysis.yml` | 同一步跑 `check_legend_convention.mjs --selftest`（geo 无 `check_figures.mjs`）|
+| `.github/workflows/spatial_analysis.yml`（本仓）/ `scrna-pipeline-skill/.github/workflows/scrna_analysis.yml` | 「静态检查（不装依赖）」那一步跑 `check_legend_convention.mjs --selftest` + `check_figures.mjs --selftest` |
+| `geo-normal-pipeline-skill/.github/workflows/geo_analysis.yml` | 同一步跑 `check_legend_convention.mjs --selftest`（geo 无 `check_figures.mjs`）|
 | `governance/hooks/pre-push.mjs` | 新增 `SELFTESTS` 表，在**所有**静态门禁之后跑，日志标签是 `（自检）` |
+
+> **跨仓引用必须写仓名前缀。** 三个仓的目录结构很像（都有
+> `.github/workflows/`），只写文件名（不带仓名）读者不知道去哪个仓找。
+> `check_doc_refs.mjs` 的判据 C 就是为此加的 —— 它以前**两条判据都不进**，
+> 于是这类引用**完全不被检查**（E-62 / E-63 同一类：检查器"没报错"
+> 不等于"检查了"）。
 
 **日志标签必须区分"带镜像目录"与"带 `--selftest`"** —— 两者都走 `extraArgs`，
 但一个是拿真实产物判、一个是拿合成用例判，长得一样就没法排查。
@@ -987,5 +993,52 @@ E-63 的自检第一版有 9 个用例，**用例 8 自己另写了一遍路径�
 
 > **接了线但从不失败的检查，与没接线是一样的。** 每加一条自检，都要问
 > "我怎样让它红一次"——答不上来就说明它现在是个装饰。
+
+### 30.4 判据的"通过数"必须能看见 0 —— 否则死代码与"没有这类输入"无法区分（E-64）
+
+补判据 C（跨仓引用）时，主体写在 `if (!isA && !isB) continue` **之后** ——
+而跨仓 token 正是"两条判据都不进"的那一类，于是**判据 C 的分支永远走不到**。
+更糟的是报告那行是 `if (nCheckedC) console.log(...)` 守卫的：计数恒 0 时
+**连打印都不打印**，输出看起来与本仓没有跨仓引用**完全一样**。
+三仓复跑全绿、exit=0、毫无异常迹象 —— **假阴性顺手把自己藏了起来**。
+
+**两条规则：**
+
+1. **新判据要放在早退分支之前** —— 分流顺序错了分支就是死代码，
+   而**死代码不报错、只是永远不执行**。
+2. **计数行不能加 `if (n)` 守卫** —— **0 也是信息**。"检查了 0 条"与
+   "根本没检查"必须在输出上长得不一样。
+
+**修后计数变化本身就是证据**：geo 102→107 条（C=5）、scrna 113→139 条（C=24）、
+spatial 103→117 条（C=14）—— geo/scrna 的跨仓引用**以前一条都没被检查过**。
+`--selftest` 11 个用例在 `mkdtempSync` 造的隔离 workspace 里自建两个真姊妹仓
++ 一个**伪装成仓库的非 git 目录**（`releases/`）；其中回归 2 就是"判据 C 计数为 0
+时那行照样打印"。
+
+> **自检里"看起来像仓库但不是仓库"的干扰项是必需的** —— 首版把 `releases/`
+> 当成姊妹仓，提示给出 `releases/scrna_analysis.yml`，**连路径都是错的**。
+> 修法是只认有 `.git` 的目录。**指错地方比不指地方更糟**（同 E-61 防复发④）。
+
+### 30.5 门禁的"检查范围"要和"它守护的动作"对齐（E-65）
+
+`governance/hooks/pre-push.mjs` 的 `changesOf(repo)` 原来只读
+`git status --porcelain`（**只含未提交改动**）。而 pre-push 是 `git push`
+的钩子，**它唯一被调用的时刻就是"已经提交、还没推送"** —— 那时 porcelain
+为空，三仓全走 `无改动，跳过`，**[4/6] 静态门禁段一条都没跑**，
+而打印的是 `PRE-PUSH 通过（0 条提醒）。可以 push。`
+
+**这不是边角，是主路径**：正常情况下它每次都在空转，给出虚假的安心。
+触发它的是"门禁说通过、而门禁自己（`check_doc_refs.mjs`）说 exit=1"
+这个**直接矛盾**。修法是取并集 —— 除未提交改动外，再加
+`git log --name-only --pretty=format: @{upstream}..HEAD`（**已提交未推送**）；
+没有 upstream 时那一段抛错被吞（"不适用"不是失败）。
+
+> **一个门禁段被整段跳过时，不能打印"通过"。** `无改动，跳过` 用的是
+> `ok()`（绿勾），它和"查过了没问题"在输出上一样。写门禁前先跑一次
+> "什么都没改"的路径 —— 如果它空转时也说通过，那它有改动时说的通过
+> 也不可信。**反向标定的输出是 `exit=0` 而三仓全被跳过** ——
+> 它的失败方式不是失败，是**沉默**。
+>
+> **正确的提交顺序是：改完 → 跑 pre-push → 提交 → push。**
 
 
