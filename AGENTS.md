@@ -253,70 +253,15 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 
 ### 17.1 写死的名单只覆盖了它自己 —— 现在是真正的逐作用域分析（E-61）
 
-上面那份名单**只有 10 个名字**，而 `common.py` 实际导出 **68 个**。
-于是它挡住的全是"恰好被列进去的"，没列进去的照旧漏到 CI。
-实测踩到（2026-09-26）：`03_spatial_domains.py` 漏 import
-`spot_radius_plot_units`，本地 `check_py_syntax.mjs` 报"全部通过"，
-CI 跑 25 分钟到 §3.2 的 H&E 叠图段才
-`NameError: name 'spot_radius_plot_units' is not defined`，
-04–08 步全没跑。
+上面那份名单**只有 10 个名字**，而 `common.py` 实际导出 **68 个** —— 挡住的全是
+"恰好被列进去的"，没列进去的照旧漏到 CI。实测 `03_spatial_domains.py` 漏 import
+`spot_radius_plot_units`，本地报"全部通过"，CI 跑 25 分钟到 H&E 叠图段才
+`NameError`。**根因不是"名单短了一点"，而是判据的输入域与它要防的缺陷不匹配。**
 
-**根因不是"名单短了一点"，而是判据的输入域与它要防的缺陷不匹配** ——
-漏 import 的可以是任意一个导出。把名单补成 68 个只是把同一种漂移往后推一次
-（`common.py` 下次加函数又会漂）。
-
-规则 17 当年放弃做作用域分析的理由是"那是重写一个 linter"。
-**那个顾虑是对的，但作用域分析不必自己写**：标准库 `symtable` 就是
-CPython 编译器的符号表，按作用域给出每个名字是 local / parameter /
-imported / free（闭包）/ global，正是这里需要的。
-
-现在 `tools/check_py_names.py` 做三件事：
-
-| 检查 | 判据 |
-|---|---|
-| 未定义名字 | 某名字在某作用域**被引用**，却既非该作用域局部绑定、也非闭包自由变量、模块层也没有、也不是内置 → 运行时必然 `NameError` |
-| 幽灵 import | `from common import X` 而 common 模块级没有 `X` |
-| 不安全构造 | 出现 `import *` / `globals()` / `exec` / `eval` / `vars` / `locals` → **判红退出**，而不是假装通过 |
-
-**三个实现上的坑（都实测踩过）：**
-
-1. **不安全构造必须用 AST 判，不能扫子串。** 第一版扫裸子串，于是本文件
-   自己的模式元组 `("import *", "globals()", "exec(")` 命中了它自己 ——
-   **检查器把自己的源码判红**。"检查器要检查的东西"与"检查器描述自己要检查
-   什么"在文本上无法区分，只有语法结构能区分（同规则 25.1：`stripComments`
-   把字符串换成 `""` 后把要检查的东西本身擦掉了）。确实需要时在同一行写
-   `# py-names: unsafe-ok —— <理由>` 豁免（**故意做成要写一句话的**，
-   静默豁免会让检查退化成没有检查）。
-2. **行号必须按作用域定位，不能全文件找首次出现。** 第一版在整棵 AST 上找
-   第一个同名 `Name`，于是 `plt` 被报成 `common.py:859` —— 那是**另一个
-   函数**（`plot_marker_dotplot`）里的 `plt`，那个函数自己 `import
-   matplotlib.pyplot as plt`，行号指向一处**没问题的代码**。真正有问题的在
-   `fix_dotplot_legends` 的 L1086。**指向错的行号比不指行号更糟**：下一个人
-   会去读一段正确的代码然后困惑。
-3. **"common 提供这个名字"的提示要扣掉 common 自己 import 进来的。**
-   `import numpy as np` 被删时报出「common 导出过 np —— 加进
-   `from common import (...)`」，而 `np` 出现在 common 命名空间里只是因为
-   **common 自己也 import 了 numpy**。照着改会写出 `from common import np`
-   —— 把 common 的内部依赖当接口用。两个集合分工：含 import 的用于**幽灵
-   import 判据**（`from common import np` 运行期确实能成功，不算幽灵），
-   只有 `def`/赋值的才用于**提示**。
-
-**标定（`D:\tmp\_r04\calib_names.py`，13 项全过）：** 正向两仓零命中；
-geo（纯 R）判为**不适用且不判红**；传错目录判红；反向逐类注入 —— 删 common
-import（报 `log_info`）、删第三方 import（报 `np`，证明不限于 common 导出）、
-幽灵 import、`import *`、`globals()`、`eval()` 各自只让它自己那条响；逃生舱
-写了理由后放行；a7bd1bd 夹具精确报出
-`scripts/03_spatial_domains.py:754 spot_radius_plot_units`。
-
-> **"没有 Python 文件"是"不适用"，不是"失败"。** geo 是纯 R 仓库
-> （`scripts/` 下 0 个 `.py`），跑到这里必须放行 —— 判红会让 pre-push 在 geo
-> 上永远红，而那条告警与 geo 的改动毫无关系。但"仓库根目录传错了"必须
-> 与它长得不一样，所以分开检查（`scripts/` 和 `tools/` 都不存在才判红）。
-
-**门禁接线：** CI 在两个 workflow 的「静态检查（不装依赖）」那一步跑；
-`governance/hooks/pre-push.mjs` 的 `PY_GATES` 表（Python 门禁用解释器跑，
-不是 `process.execPath`；本机没有 `python` 时记为**提醒**而不是通过 ——
-"没跑成"和"跑过了没问题"必须长得不一样）。
+现在 `tools/check_py_names.py` 用标准库 `symtable` 做逐作用域分析（判四件事，
+见上表）。**三个实现坑**（不安全构造必须用 AST 判、行号必须按作用域定位、
+提示要扣掉 common 自己 import 的名字）、geo 判"**不适用**不是失败"、
+`PY_GATES` 接线与 13 项标定：`references/agents-detail.md#原规则-171`。
 
 ### 17.2 手工删 import 会连带删掉同一行的活名字
 
@@ -397,13 +342,13 @@ top 组 `0.8713`）。
 
 **规则：** 判一个包"装不上"之前，**读它的源码看运行路径上到底 import 谁** —— 依赖表里有的包可能一次都没用到。`SpaGCN` 曾被登记成"装不上"（PyPI 有真包 1.2.7，但依赖 `louvain`，该包没有 py3.12 wheel）；**前半句是实测的，后半句的推论是错的** —— 读 SpaGCN 1.2.7 源码：包内 `SpaGCN.py` / `models.py` / `util.py` **没有一处** `import louvain`（走的是 `scanpy.tl.louvain`），且 `simple_GC_DEC.fit` 的 `init` 参数有 `"kmeans"` 分支可绕开。**"实测的前半句 + 未验证的推论"合成一条读起来完全合理的结论，是这类记录最危险的形态。**
 
-完整原文（含源码证据与排查顺序）：references/agents-detail.md#原规则-20
+完整原文（含源码证据与排查顺序）：`references/agents-detail.md#原规则-20`
 
 ## 21. `set_seed()` 不 seed torch，而第三方工具的随机性可能在 torch 里
 
 **规则：** **"我设了种子"不等于"结果可复现"** —— `set_seed()` 覆盖不到第三方库内部的迭代求解器、并行归约与 GPU 内核。实测：同一份代码、同一批包版本，**只改并行度/种子设置**，SpaGCN 与内置方法的 ARI/NMI 就逐轮漂（五轮 CI 对比表见原文）。空间这边踩到的是 **torch**（姊妹项目 `scrna-pipeline-skill/AGENTS.md` 规则 20 记的是同一类问题的另一面：`pynndescent` 的 Numba 并行）。并行度有三个独立旋钮（BLAS 线程数 / `OPENBLAS_CORETYPE` / `NUMBA_NUM_THREADS`），**设它们是对的，但设了不保证可复现**。
 
-完整原文（含五轮 CI 对比表与三个旋钮）：references/agents-detail.md#原规则-21
+完整原文（含五轮 CI 对比表与三个旋钮）：`references/agents-detail.md#原规则-21`
 
 ## 22. 文档改动走独立的 `docs_check.yml`
 
@@ -592,111 +537,49 @@ const edgeBad = !darkBg && margins &&
 ## 28. 验收层四条补强（Q-27，2026-09-25）
 
 姊妹项目 `scrna-pipeline-skill/AGENTS.md` 规则 25 是同一批补强的另一半。
-**本仓库的口径与它不同**（规则 23：本仓库的图检查是 glob 数张数、
-不引用具体文件名），所以**没有照抄**，而是按空间侧的结构重新设计。
+**本仓库的口径与它不同**（规则 23：图检查是 glob 数张数、不引用具体文件名），
+所以**没有照抄**，而是按空间侧结构重新设计：
 
-### 28.1 步骤函数自己返回的 `status` 必须有人读（验收层）
+- **28.1 步骤函数自己返回的 `status` 必须有人读。** `run_steps` 把 `fn(cfg)` 的
+  返回值记进 `results[name]["result_status"]`，**而全仓没有一个消费者** ——
+  于是 `08_spatial_trajectory.py` 返回 `bad_root` / `not_applicable` /
+  `missing_pca` 时验收照样记 `status="ok"`。**"步骤崩了"与"步骤跑完了但结果是
+  没做成"是两件事**，后者最容易读成成功。现在 `step_result:<sid>` 消费它，
+  只把 `failed`/`error`/`fail` 判红。
+  > **坑：`chk(cid, kind, ok, detail, severity="required")` 的第二个位置参数是
+  > `kind`（归类），不是 severity。** 传错**不报错**，只是把"只可见"记成
+  > "必须通过"。**同名同型同位置数相邻，传错不报错。**
+- **28.2 嵌套 `status` 的 `failed` 必须判红。** `domain_methods.STAGATE.status` /
+  `cell2location.status` / `spatialde.status` 都是嵌套的，旧验收层只看顶层 ——
+  **里面崩了、顶层还是 `ok`**。实现 `_iter_nested_status(obj, path=())` 递归扫
+  **全部** `*status.json`，只判 `failed`/`error`/`fail`（其余取值判红会让每个 job
+  都红，反而没人看）。本仓实测嵌套分布 `{ok: 11, needs_reference: 1,
+  package_missing: 1}` —— 零命中、零误伤。
+- **28.3 溢出检测必须落盘，不能只打 WARN。** E-49 的形态：`_content_overflow()`
+  **正确检测到** `width_overflow_frac=0.3523`、**正确打了 WARN**，然后**没有任何
+  人读**。**"检测到了"不等于"有人会知道"。** 现在 `_record_figure_overflow()`
+  落盘到 `results/<dataset_id>/figure_overflow.json`，验收层读它并**判红**。
+  三条约束：**跑前必须删旧文件**（否则图修好了旧记录还在）、**只累积不覆盖**、
+  记录可被修复。
+- **28.4 图验收从"数张数"换成"声明过的每张在不在"。** 旧判据 `len(figs) >= 8`
+  是**纯计数**，于是"该有的图没有"这一整类没有任何检查看得见。声明**从源码扫
+  出来**（`declared_figures()`）不手抄表（手抄的表会漂，漂移方向恰好是"新加的
+  图不在表里"），扫时要**排除 `main_analysis.py` 自己**。三条判据分工：
+  `figures:declared` 逐名核存在性 / `figures:dynamic` 声明了槽位的动态图名每组
+  **至少 1 张** / `figures:count >= 8` 保留为**下限兜底**。
+  > **"判据因为输入域重叠而永远为真"的坑，正向标定看不出来：** `03-03-04` 前缀
+  > **同时**有静态图（unit1/2/3）与动态图（unit8 Jaccard）。按前缀计数而不扣掉
+  > 静态声明图，动态循环整段没跑时计数仍是 2（全是静态的），**判据永远不响**。
+- **28.5 双向标定：正向零误报 + 反向逐类注入，缺一不可。** 正向（真实 artifact
+  干跑）只说明"没误报"；**一个永远返回 True 的判据在干净 artifact 上也是零命中**。
+  逐类注入实测：删 1 张静态声明图 → 只 `declared` 红；删整组动态图 → 只
+  `dynamic` 红；写 `figure_overflow.json` → 只 `overflow` 红；嵌套
+  `STAGATE.status=failed` → 只 `status:nested` 红；删全部图 → 三条都红。
+  正向：76 张图干跑，新增 4 条检查全 PASS，`n_checks` 59 → 63，**没有一条既有
+  检查消失**。（干跑把所有写盘函数 patch 成 no-op —— 否则会重写 artifact 里的
+  `acceptance_report.json`，变成"自己改自己的证据"。）
 
-`run_steps` 把 `fn(cfg)` 的返回值记进了 `results[name]["result_status"]`，
-**而全仓没有一个消费者** —— 于是 `08_spatial_trajectory.py` 返回
-`bad_root` / `not_applicable` / `missing_pca` 时，验收照样记 `status="ok"`。
-
-**这不是"步骤崩了"，而是"步骤跑完了、但结果是『没做成』"** ——
-恰恰是最容易读成成功的一种。现在 `step_result:<sid>` 消费它，
-判据仍只把 `failed`/`error`/`fail` 判红；`bad_root` 之类的取值是
-**设计如此地没做成**，只可见（`honesty`）、不阻断。
-
-> **实现踩到的坑：** `chk(cid, kind, ok, detail, severity="required")` 的
-> **第二个位置参数是 `kind`（归类），不是 severity**。第一版把
-> `"required" if bad else "honesty"` 传在第二个位置，于是
-> `bad_root` 这些**本该只可见**的取值全被记成 required —— 注入测试里
-> 7 类 `result_status` 只有 `failed` 该红，实测却红了一片。
-> **`kind` 与 `severity` 同名同型同位置数相邻，传错不报错。**
-
-### 28.2 嵌套 `status` 的 `failed` 必须判红（验收层）
-
-`status` 不只在顶层。`domain_status.json` 的
-`domain_methods.STAGATE.status`、`deconvolution_status.json` 的
-`cell2location.status`、`svg_status.json` 的 `spatialde.status` 都是
-**嵌套**的，而旧验收层只看顶层 —— **里面崩了、顶层还是 `ok`**。
-
-姊妹仓库实测（E-48）：顶层分布 `{ok: 7, not_configured: 1}`，
-嵌套分布里躺着唯一一条 `failed`（`figsize` 三元素元组让整段抛异常），
-而它所属文件的顶层 `status` 是 `ok`。**顶层全绿、里面已经崩了。**
-
-实现是 `_iter_nested_status(obj, path=())` 递归产出
-`(路径, 值, 同级 reason)`，扫**全部** `*status.json`（不只可选步骤那几个）。
-判据只把 `failed`/`error`/`fail` 判红 —— 把 `needs_reference` /
-`package_missing` / `not_done` / `not_applicable` / `disabled` /
-`missing_domains` / `bad_root` 判红会让每个 job 都红，反而没人看。
-
-**本仓库实测嵌套分布 `{ok: 11, needs_reference: 1, package_missing: 1}` ——
-零命中、零误伤。**
-
-### 28.3 溢出检测必须落盘，不能只打 WARN（产物级）
-
-E-49 的形态：`_content_overflow()` **正确检测到了**
-`width_overflow_frac=0.3523`、**正确打了 WARN**，然后**没有任何人读**。
-
-**"检测到了"不等于"有人会知道"。** 现在 `save_fig()` 里的
-`_record_figure_overflow(cfg, name, bad)` 把溢出**落盘**到
-`results/<dataset_id>/figure_overflow.json`，验收层读它并**判红（required）**。
-
-三条配套约束：
-
-1. **与状态文件同理，跑前必须删旧文件** —— 否则图修好了旧记录还在，
-   验收把已修好的图判红（规则 16 的同一条道理）。
-2. **只累积、不覆盖** —— 同一次运行多张图溢出要全部记下。
-3. **记录可被修复** —— 标题改短后不应再新增记录。
-
-### 28.4 图验收从"数张数"换成"声明过的每张在不在"（验收层）
-
-旧判据是 `len(figs) >= 8` —— **纯计数**，于是"该有的图没有"这一整类
-问题没有任何检查看得见：姊妹仓库实测 5 张图因 `figsize` 三元素元组
-从未产出过，而验收 70 项全绿（E-48）。
-
-声明**从源码扫出来**（`declared_figures()`），不手抄表 —— 手抄的表会漂移，
-漂移方向恰好是"新加的图不在表里"，等于把盲区原样再造一遍。
-扫的时候要**排除 `main_analysis.py` 自己**（它的检查项里也有图名字符串，
-不排除会把"检查项的名字"当成"声明的图"）。
-
-三条判据分工：
-
-| 检查 | 判据 |
-|---|---|
-| `figures:declared` | 逐名核存在性；条件图不适用时进合法豁免 |
-| `figures:dynamic` | 声明了槽位的**动态图名**每组**至少产出 1 张** |
-| `figures:count` | `>= 8`，**保留为下限兜底**（声明扫描本身失效时还能拦住） |
-
-**动态图名为什么要单独一条**：名字运行期才拼得出来（`DYNAMIC_FIG_BASES`
-声明槽位数），不能逐名检查；但**整组 0 张**说明那段循环整段没跑 ——
-槽位是上限不是精确值，少出合法。
-
-> **这里有一个"判据因为输入域重叠而永远为真"的坑，正向标定看不出来：**
-> `03-03-04` 这个前缀**同时**有静态图（unit1/unit2/unit3）和动态图
-> （unit8 的 Jaccard 矩阵）。按前缀计数而不扣掉静态声明图的话，
-> 动态循环整段没跑时计数仍是 2（全是静态的），**判据永远不会响**。
-> 只有注入"整组动态图消失"才会暴露 —— 见规则 29。
-
-### 28.5 双向标定：正向零误报 + 反向逐类注入
-
-**这两半缺一不可。** 正向（拿真实 artifact 干跑）只能说明"没误报"；
-**一个永远返回 True 的判据在干净 artifact 上也是零命中**。
-所以逐类注入，确认每一类缺陷都真的会让**它自己那条**判据变红：
-
-| 注入 | 应红的判据 | 实测 |
-|---|---|---|
-| 删 1 张静态声明图 | `figures:declared` | ✅ 只它红 |
-| 删整组动态图（30 张） | `figures:dynamic` | ✅ 只它红 |
-| 写 `figure_overflow.json` | `figures:overflow` | ✅ 只它红 |
-| 嵌套 `STAGATE.status = failed` | `status:nested` | ✅ 只它红 |
-| 删全部图 | `count` + `declared` + `dynamic` | ✅ 三条都红 |
-
-正向：真实 artifact（`lymph_node`，76 张图）干跑 —— 新增 4 条检查
-**全部 PASS**，`n_checks` 59 → 63，**没有一条既有检查消失**。
-（干跑只调 `run_acceptance()` 并把所有写盘函数 patch 成 no-op ——
-否则会重写 artifact 里的 `acceptance_report.json`，那就变成
-"自己改自己的证据"了。）
+完整原文（含注入表与全部实测证据）：`references/agents-detail.md#原规则-28`
 
 ## 29. 叠 H&E 的图必须 `set_aspect("equal")`，且**不能**跟着别的脚本 `invert_yaxis()`
 
@@ -970,4 +853,49 @@ dict/list/tuple/numpy；**dict 的键必须是 `str`，否则 `default` 回调�
 台账：`governance/15_ERROR_LEDGER.md` E-69
 （同族前两次：E-68 自查同族两处、E-61 静态检查名单只覆盖它自己）
 
+## 32. 循环里建的图必须在循环体内保存（E-70，2026-09-26）
 
+**规则：`for` 里 `plt.subplots()` 建的图，保存调用必须在**同一个循环体**里 ——
+缩进错一格不会报错，只会少出图。**
+
+现场：`scripts/07_spatial_communication.py` 画 top3 配体受体对。E-69 把整段包进
+`if top3.empty: ... else:` 时给外层几行加了 4 个空格，**而循环体的 6 行
+（含 `save_fig`）留在了原来的 8 空格** —— 于是它们跑到 `for` 外面去了。
+后果（实测 CI artifact）：循环建了 3 张图、**一张都没保存**；循环结束后 `ui=3`、
+`r` 是最后一行，所以只出 `03-07-02-unit3-icam1-itgal`，
+**E-68 基线 76 张 → 本轮 74 张**。**而数据侧完全正确**：
+`communication_status.json` 的 `n_z_defined=62 / n_z_undefined=0`，
+`top_enriched` 前三名正是 CXCL12/CXCR4 z=1.939、CCL21/CCR7 z=1.901、
+ICAM1/ITGAL z=1.569 —— **要画的三对就是它们，图却只出了一张。**
+
+**四套门禁为什么全绿：** `check_figures.mjs` 只看"有没有墨 / 贴不贴边"；
+`check_fig_names.mjs` 的账目判据是 `if (deficit > declared)`，**把 `declared`
+（`DYNAMIC_FIG_BASES` 槽位和）当上限用** —— 本例 `deficit=1`、`declared=3`
+⇒ **`1 > 3` 为假**，结构上不可能看见这一类；验收层 `figures:dynamic` 只要求
+"每组 ≥1 张"；`py_compile` / `check_py_names.py` 语法与名字全对。
+**只有"跨 artifact 比对图名集合 + 亲读像素"才看得见。**
+
+**门禁：** `tools/check_py_names.py` 新增第三条判据（同文件、不新建检查器）。
+对每个 `For` / `AsyncFor` / `While`，在**同作用域**子树（`walk_same_scope`，
+**不下潜**嵌套 `def` / `lambda` / `class`）里数建图调用
+（`MAKE_FIG_TAILS = {"subplots", "figure"}` 或名字以 `sc.pl.` 开头）与保存调用
+（`SAVE_FIG_TAILS = {"save_fig", "savefig", "close"}` **或**
+`save_helper_names(tree)` —— 本文件里"函数体内含保存调用"的函数名）。
+`makes and not saves` ⇒ 判红。
+**`save_helper_names` 是标定抓出来的必要修正**：没有它时"循环里建图后调同文件
+`_draw(i)`、`_draw` 内部 `save_fig`"会被**误报**，而**误报会让门禁被关掉**
+（同 E-64 首版把 `releases/` 当姊妹仓、E-61 行号指向另一段正确代码）。
+**已知局限：跨模块的保存帮助函数仍会判红。**
+
+**双向标定 20 项全过**（`D:\tmp\_e70\calib_gate.py`）：11 条合成用例 + 反向注入
+真仓库（把 `pair_slug` + `save_fig` 退回 8 空格 ⇒ 判红、带非空摘要、报
+`07_spatial_communication.py:391`、提示含 `L388`、**只有 1 处命中**；还原后逐字节
+一致）。**判红必须断言摘要非空** —— 少 `cwd` / `PYTHONIOENCODING` 时子进程按
+cp936 读 UTF-8 源码抛 `UnicodeDecodeError`，**崩溃的非零退出会被误读成"判红"**。
+
+**验收层同步把"少出了几张"摆出来（判据不变）：** `figures:dynamic` 详情追加
+`（产出/槽位：03-03-04 1/3, 03-04-01 30/30, ...）` —— 用**有缺陷的那一轮**
+artifact 干跑，`03-07-02 1/3` 直接印在验收详情里，而 `n_checks` 与基线逐位相同
+79、**消失/新增的检查 id 均为空**（只加详情、不加判据）。
+
+台账：`governance/15_ERROR_LEDGER.md` E-70（任务行 `governance/02_TASKLIST.md` R-04h）
