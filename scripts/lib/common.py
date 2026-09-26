@@ -778,6 +778,100 @@ W_ONE_HALF = mm(136)   # 单栏半（Nature 允许 120-136 mm）
 W_DOUBLE = mm(183)     # 双栏（= 满版宽）
 
 
+def fit_fig_to_aspect(fig, ax, width_mm: float, aspect: float,
+                      iters: int = 3, tol_mm: float = 0.01) -> float:
+    r"""
+    按**图像长宽比**定画布高度，把浪费掉的空白挤掉。返回最终画布高（mm）。
+
+    `aspect` = 源图宽 / 源图高（`arr.shape[1] / arr.shape[0]`）。
+
+    ---
+    ## 为什么需要它
+
+    叠底图（`imshow`）时 `ax.set_aspect("equal")` 会把 axes 盒子锁成
+    图像的长宽比 —— 但**画布不会跟着变**。于是画布高度由 `figsize` 定死，
+    图像按自己的比缩到盒子中央，上下（或左右）留出大片空白。
+
+    实测（真实 Visium hires 1921x2000，`figsize=(W_ONE_HALF, mm(56))`）：
+    图像只占画布面积的 **32%**，其余全是白边。把它当"单图"排进论文，
+    读者看到的是一张细长条。
+
+    ---
+    ## 怎么算
+
+    装饰（标题、图例、坐标轴标签）占掉的尺寸是**绝对长度**，与画布大小
+    无关 —— 所以量一次就能解出方程，不必迭代拟合：
+
+        deco = tightbbox - axes_bbox          # 装饰占的绝对尺寸
+        axes_w = width_mm - deco_w            # 宽度给满
+        fig_h  = axes_w / aspect + deco_h     # 高度 = 图像高 + 装饰高
+
+    仍然循环几次，是为了让 `set_size_inches` 后的 constrained layout
+    重新定稿、`tightbbox` 跟上（实测第 2 轮即收敛）。
+
+    ---
+    ## 三个坑（都踩过）
+
+    1. **`get_tightbbox()` 返回的单位是英寸，`get_window_extent()` 是像素。**
+       混着减会得到负数（实测 deco_w = -120.3 mm），而负数**不会报错**，
+       只会让画布被算成一个荒谬的尺寸。乘 `fig.dpi` 归一。
+    2. **不能在方画布上量"装饰边距"。** 方画布下高度受 aspect 约束而非
+       装饰约束，`fig_h - bb_h` 里绝大部分是"未用的长宽比余量"，把它当
+       装饰会把画布永远锁在方形。实测这条路（`probe_deco.py` /
+       `probe_onepass.py`）在合成横长/竖长图上全部失败。
+    3. **宽高比要取自源图，不能取自 axes。** 加了散点之后 axes 的数据范围
+       由散点决定，用 `ax.get_xlim()` 推出来的比不是图像的比。合成用例
+       必须不画散点才测得准。
+
+    实测（`D:\tmp\_r04\probe_deco3.py`，修后）：真实图 136mm → 画布
+    136x133.2mm、利用率 **85.0%**（修前 32%）；无图例的 H&E 参考 →
+    136x146.0mm、**94.0%**；合成横长/竖长/极宽/极高图利用率
+    83%~96%，且长宽比与源图**逐位相等**。
+    """
+    w_in = mm(width_mm)
+    fig.set_size_inches(w_in, w_in / aspect)      # 先给个能算的初值
+    h_prev = None
+    for _ in range(iters):
+        fig.canvas.draw()
+        tb = fig.get_tightbbox(fig.canvas.get_renderer())
+        bb = ax.get_window_extent()
+        # **单位归一**：tightbbox 是英寸，axes bbox 是像素。
+        deco_w = tb.width * fig.dpi - bb.width
+        deco_h = tb.height * fig.dpi - bb.height
+        axes_w = w_in * fig.dpi - deco_w
+        h_in = axes_w / aspect / fig.dpi + deco_h / fig.dpi
+        fig.set_size_inches(w_in, h_in)
+        h_mm = h_in * 25.4
+        if h_prev is not None and abs(h_mm - h_prev) < tol_mm:
+            break
+        h_prev = h_mm
+    fig.canvas.draw()          # 定稿一次，之后 transData 才可靠
+    return h_prev if h_prev is not None else h_in * 25.4
+
+
+def marker_area_pt2(fig, ax, radius_data: float) -> float:
+    """
+    把**数据单位**的半径换算成 `scatter(s=...)` 要的面积（点²）。
+
+    `s` 是标记面积，matplotlib 的圆标记路径是直径 1 的单位圆，
+    所以渲染直径 = `sqrt(s)` 点 ⇒ `s = (直径_点)²`。
+
+    **必须传半径的数据单位，不是像素。** 换算要用 `ax.transData`，
+    而它只有在画布定稿（`fig.canvas.draw()`）之后才准 —— 所以调用顺序
+    是「先 `fit_fig_to_aspect` 再调它」，或它自己补一次 draw。
+
+    用法（空间侧叠 H&E）：
+        r = spot_radius_plot_units(entry["scalefactors"], "hires")
+        s = marker_area_pt2(fig, ax, r)
+        ax.scatter(xy[:, 0], xy[:, 1], s=s, ...)
+    """
+    fig.canvas.draw()
+    p0 = ax.transData.transform((0.0, 0.0))
+    p1 = ax.transData.transform((2.0 * radius_data, 0.0))
+    d_pt = abs(p1[0] - p0[0]) * 72.0 / fig.dpi
+    return float(d_pt ** 2)
+
+
 def _content_overflow(fig) -> dict:
     """
     检查内容有没有超出画布（= 被裁掉）。
@@ -993,6 +1087,7 @@ def fix_dotplot_legends(fig, size_title=None, cbar_title=None):
     :returns: `dict(size=bool, colorbar=bool)` —— 各自是否成功转换
     """
     import numpy as np
+    import matplotlib.pyplot as plt
     from matplotlib.colorbar import Colorbar
     from matplotlib.cm import ScalarMappable
     from matplotlib.colors import Normalize

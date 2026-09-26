@@ -83,7 +83,9 @@ old = os.getcwd()
 os.chdir(tmp)
 try:
     with contextlib.redirect_stdout(buf):
-        exec(compile(code, "<summary>", "exec"), {"__name__": "__main__"})
+        # 本工具的**全部工作**就是把 workflow 里那段代码抠出来跑一遍，
+        # 所以 exec 是它的目的、不是副作用。
+        exec(compile(code, "<summary>", "exec"), {"__name__": "__main__"})  # py-names: unsafe-ok —— 本工具专职执行抠出的代码块
 finally:
     os.chdir(old)
 out = buf.getvalue()
@@ -123,7 +125,7 @@ buf2 = io.StringIO()
 os.chdir(tmp)
 try:
     with contextlib.redirect_stdout(buf2):
-        exec(compile(OLD, "<old>", "exec"), {"__name__": "__main__"})
+        exec(compile(OLD, "<old>", "exec"), {"__name__": "__main__"})  # py-names: unsafe-ok —— 同上，反向检查用
 finally:
     os.chdir(old)
 old_out = buf2.getvalue()

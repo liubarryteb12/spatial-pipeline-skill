@@ -235,6 +235,83 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 要正确处理得做作用域分析 —— 那是重写一个 linter。同时会剥掉注释和字符串再扫，
 避免"名字只出现在注释里"的误报。
 
+### 17.1 写死的名单只覆盖了它自己 —— 现在是真正的逐作用域分析（E-61）
+
+上面那份名单**只有 10 个名字**，而 `common.py` 实际导出 **68 个**。
+于是它挡住的全是"恰好被列进去的"，没列进去的照旧漏到 CI。
+实测踩到（2026-09-26）：`03_spatial_domains.py` 漏 import
+`spot_radius_plot_units`，本地 `check_py_syntax.mjs` 报"全部通过"，
+CI 跑 25 分钟到 §3.2 的 H&E 叠图段才
+`NameError: name 'spot_radius_plot_units' is not defined`，
+04–08 步全没跑。
+
+**根因不是"名单短了一点"，而是判据的输入域与它要防的缺陷不匹配** ——
+漏 import 的可以是任意一个导出。把名单补成 68 个只是把同一种漂移往后推一次
+（`common.py` 下次加函数又会漂）。
+
+规则 17 当年放弃做作用域分析的理由是"那是重写一个 linter"。
+**那个顾虑是对的，但作用域分析不必自己写**：标准库 `symtable` 就是
+CPython 编译器的符号表，按作用域给出每个名字是 local / parameter /
+imported / free（闭包）/ global，正是这里需要的。
+
+现在 `tools/check_py_names.py` 做三件事：
+
+| 检查 | 判据 |
+|---|---|
+| 未定义名字 | 某名字在某作用域**被引用**，却既非该作用域局部绑定、也非闭包自由变量、模块层也没有、也不是内置 → 运行时必然 `NameError` |
+| 幽灵 import | `from common import X` 而 common 模块级没有 `X` |
+| 不安全构造 | 出现 `import *` / `globals()` / `exec` / `eval` / `vars` / `locals` → **判红退出**，而不是假装通过 |
+
+**三个实现上的坑（都实测踩过）：**
+
+1. **不安全构造必须用 AST 判，不能扫子串。** 第一版扫裸子串，于是本文件
+   自己的模式元组 `("import *", "globals()", "exec(")` 命中了它自己 ——
+   **检查器把自己的源码判红**。"检查器要检查的东西"与"检查器描述自己要检查
+   什么"在文本上无法区分，只有语法结构能区分（同规则 25.1：`stripComments`
+   把字符串换成 `""` 后把要检查的东西本身擦掉了）。确实需要时在同一行写
+   `# py-names: unsafe-ok —— <理由>` 豁免（**故意做成要写一句话的**，
+   静默豁免会让检查退化成没有检查）。
+2. **行号必须按作用域定位，不能全文件找首次出现。** 第一版在整棵 AST 上找
+   第一个同名 `Name`，于是 `plt` 被报成 `common.py:859` —— 那是**另一个
+   函数**（`plot_marker_dotplot`）里的 `plt`，那个函数自己 `import
+   matplotlib.pyplot as plt`，行号指向一处**没问题的代码**。真正有问题的在
+   `fix_dotplot_legends` 的 L1086。**指向错的行号比不指行号更糟**：下一个人
+   会去读一段正确的代码然后困惑。
+3. **"common 提供这个名字"的提示要扣掉 common 自己 import 进来的。**
+   `import numpy as np` 被删时报出「common 导出过 np —— 加进
+   `from common import (...)`」，而 `np` 出现在 common 命名空间里只是因为
+   **common 自己也 import 了 numpy**。照着改会写出 `from common import np`
+   —— 把 common 的内部依赖当接口用。两个集合分工：含 import 的用于**幽灵
+   import 判据**（`from common import np` 运行期确实能成功，不算幽灵），
+   只有 `def`/赋值的才用于**提示**。
+
+**标定（`D:\tmp\_r04\calib_names.py`，13 项全过）：** 正向两仓零命中；
+geo（纯 R）判为**不适用且不判红**；传错目录判红；反向逐类注入 —— 删 common
+import（报 `log_info`）、删第三方 import（报 `np`，证明不限于 common 导出）、
+幽灵 import、`import *`、`globals()`、`eval()` 各自只让它自己那条响；逃生舱
+写了理由后放行；a7bd1bd 夹具精确报出
+`scripts/03_spatial_domains.py:754 spot_radius_plot_units`。
+
+> **"没有 Python 文件"是"不适用"，不是"失败"。** geo 是纯 R 仓库
+> （`scripts/` 下 0 个 `.py`），跑到这里必须放行 —— 判红会让 pre-push 在 geo
+> 上永远红，而那条告警与 geo 的改动毫无关系。但"仓库根目录传错了"必须
+> 与它长得不一样，所以分开检查（`scripts/` 和 `tools/` 都不存在才判红）。
+
+**门禁接线：** CI 在两个 workflow 的「静态检查（不装依赖）」那一步跑；
+`governance/hooks/pre-push.mjs` 的 `PY_GATES` 表（Python 门禁用解释器跑，
+不是 `process.execPath`；本机没有 `python` 时记为**提醒**而不是通过 ——
+"没跑成"和"跑过了没问题"必须长得不一样）。
+
+### 17.2 手工删 import 会连带删掉同一行的活名字
+
+E-61 的直接触发动作是**手工清理死 import**：`unused_imports.py` 正确报出
+死名字 `plot_marker_dotplot`，但我在执行删除时把同一 import 行里相邻的
+`spot_radius_plot_units`（它**有**调用点，不在死名单里）一起删了。
+
+**扫描器没错，是执行删除这一步错了。** 所以：删 import 时逐名核对
+"这个名字在文件里还有引用吗"，不要按行删。死名字扫描器的输出是**名单**，
+不是**待删行号**。
+
 ## 18. 每轮运行必须留下可追溯的运行清单（模块零）
 
 参考规范：三大部分整合文档的「模块零」（§0.2–§0.4）。姊妹项目
@@ -791,3 +868,64 @@ E-49 的形态：`_content_overflow()` **正确检测到了**
 （干跑只调 `run_acceptance()` 并把所有写盘函数 patch 成 no-op ——
 否则会重写 artifact 里的 `acceptance_report.json`，那就变成
 "自己改自己的证据"了。）
+
+## 29. 叠 H&E 的图必须 `set_aspect("equal")`，且**不能**跟着别的脚本 `invert_yaxis()`
+
+**这条是补上的规则缺口**：`03_spatial_domains.py` 的三处 H&E 叠图从仓库建立起
+就没有 `set_aspect("equal")`（`git log -S` 零命中），而
+`assets/publication.mplstyle:108` 是 `image.aspect: auto`。后果是
+1921x2000 的 hires 图被铺进 136mm x 56mm 的 axes —— **横向拉伸 2.585 倍**，
+组织被拉扁、**fiducial 点阵的圆点被画成横椭圆**（实测渲染产物里 w/h 中位 3.000，
+源图里是圆）。
+
+### 29.1 为什么不能照抄同仓其它脚本
+
+全仓 `set_aspect("equal"); ax.invert_yaxis()` 出现在 `01_qc.py` / `02_normalize.py` /
+`04_svg.py` / `05_deconvolution.py` / `07_spatial_communication.py` ——
+**这些脚本都没有 `imshow`**（纯 scatter，坐标是 y 向下的原始像素，所以要 invert）。
+`ax.imshow(img)` **默认就已经把源图朝向显示对了**：实测 `ax.yaxis_inverted() == True`，
+按网格点与源图灰度做相关，同点 **0.9894**，上下翻转 0.7251、左右翻转 0.7239；
+**显式 `invert_yaxis()` 之后同向相关反而掉到 0.7199**。
+
+> **一句话**：`imshow` 的 y 轴本来就是反的，再 invert 一次就把图上下翻过来了。
+> 叠图段只加 `set_aspect("equal")`，**不要**加 `invert_yaxis()`。
+
+### 29.2 图幅要跟着宽高比走，不能写死
+
+等比例之后 `136mm x 56mm` 只剩 31% 利用率。正确做法是让画布高由源图宽高比推出 ——
+`lib/common.py:fit_fig_to_aspect(fig, ax, width_mm, aspect)` 用
+`fig.get_tightbbox()` 解方程（迭代 3 次、容差 0.01mm，第 2 轮即收敛）。
+
+**这里有一个量纲坑**：`get_tightbbox()` 返回**英寸**，`ax.get_window_extent()` 返回**像素**，
+直接相减得 `deco_w = -120.3 mm` —— **负数不报错，只给出荒谬的画布尺寸**。
+必须先乘 `fig.dpi` 再减。
+
+**还有一个"在方画布上量边距"的坑**：不能用 `fig_h - bb_h` 估装饰边距 ——
+等比例没占满的那部分长宽比余量会被当成装饰，结果把画布锁死在方形
+（合成横长/竖长用例全败，fig 恒 136x136）。必须用 tightbbox 解方程。
+
+实测（修后）：真实图 136mm → fig 136x133.2、axes w/h **0.960500 逐位等于源图**、
+利用率 **85.0%**；无图例 94.0%；合成横长/方形/竖长/极宽/极高 6 种用例
+83.1%~95.9%，全部无溢出。
+
+### 29.3 spot 大小要由尺度因子推，不要写魔法数
+
+硬编码 `s=8` 与源图无关。用 `spot_radius_plot_units(scalefactors, "hires")`
+拿到**数据单位**半径，再用 `lib/common.py:marker_area_pt2(fig, ax, radius_data)`
+换算成 `scatter(s=)` 的面积（内部 `ax.transData.transform` 量 2r 个数据单位的
+显示长度，乘 `72/fig.dpi` 得点数）。
+
+**换算必须在 `fig.canvas.draw()` 之后做**（constrained layout 定稿后
+transform 才是最终的）；`ax.get_window_extent()` 在 `savefig` 前后不变（实测 True），
+所以可以在画图前一次算好。
+
+> `references/troubleshooting.md:98` 早就点名了这个修法，但 03 一直没照做 ——
+> **文档写了正确做法、代码做的是相反的事**，是 E-58 那一类缺陷的同族。
+
+### 29.4 门禁覆盖
+
+`check_legend_convention.mjs` 只能看图例；等比例**没有自动门禁**（像素级形变
+需要渲染后比对，成本高）。所以本规则靠**人读图 + 像素级探针**守：
+`D:\tmp\_r04\verify_he_fix.py` 会把渲染结果里 fiducial 暗斑的 w/h 量出来，
+**圆的就该是 1.000，旧产物是 3.000**。
+

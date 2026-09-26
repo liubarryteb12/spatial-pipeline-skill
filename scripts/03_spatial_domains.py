@@ -43,7 +43,104 @@ from scipy.sparse.csgraph import connected_components  # noqa: E402
 from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, named_tools_note, parse_args, pkg_version,
                     probe_named_tools, record_step, save_fig, set_seed,
-                    write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm, build_marker_dotplot_figure, PAL,)
+                    write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm,
+                    build_marker_dotplot_figure, PAL,
+                    spot_radius_plot_units, fit_fig_to_aspect,
+                    marker_area_pt2,)
+
+
+def he_overlay_fig(img, xy, cats, title: str, *, r_plot: float = None,
+                   alpha: float = 0.55, legend_kw: dict = None,
+                   width_mm: float = 136.0):
+    """
+    画一张 **H&E 底图 + 域散点** 的单图，返回 `(fig, ax)`。
+
+    抽出来是因为同一个模式在本脚本里用了 3 次（unit1/unit2/unit3 与
+    方法对照的每个方法），而这三处**各自漏了同一件事** —— 见下。
+
+    `legend_kw` **只接外观参数**（fontsize / markerscale / title…）。
+    `loc` 与 `ncol` 由本函数焊死成约定 v2 的值，调用方传了会直接报错 ——
+    理由见下面第 3 条。
+
+    ---
+    ## 这个函数修掉的两个缺陷（同一个 H&E 段的两个问题）
+
+    ### 1. `set_aspect("equal")` 缺失 -> 图像被横向拉伸 2.585 倍
+
+    `assets/publication.mplstyle:108` 是 `image.aspect: auto`，而 `imshow`
+    又会把图像铺满整个 axes。于是 1921x2000 的 hires 图被画进一个
+    136mm x 56mm 的盒子里 —— **横向拉伸**，spot 散点的坐标系跟着一起拉。
+
+    像素级证据（旧 CI 产物 `03-03-03-unit3-he-reference.png`）：非白外接框
+    1584x638 px，w/h = **2.4828**，而源图是 0.9605 —— 拉伸 **2.585 倍**。
+    源图里近圆的 fiducial 点阵（w/h 1.16~1.67）在渲染图里变成横椭圆
+    （w/h 2.71~3.20，中位 **3.000**）。
+
+    ### 2. 硬编码 `s=8` -> 点的大小没有尺度依据
+
+    `references/troubleshooting.md:98` 点名的修法是
+    `common.spot_radius_plot_units(scalefactors, "hires")`，但代码写的是
+    `s=8`。改用 `marker_area_pt2()` 从物理半径换算，点的大小才有依据。
+
+    ---
+    ## 朝向：**不要加 `invert_yaxis()`**
+
+    全仓其它脚本是 `set_aspect("equal"); ax.invert_yaxis()`（纯 scatter，
+    用 y 向下的原始坐标）。**本函数不能照抄** —— `imshow` 自己就已经把
+    图像显示成正确的朝向（`ax.yaxis_inverted()` 默认就是 True）。
+    实测（`D:\\tmp\\_r04\\probe_orient4.py`，`transData` 映射源图网格点后
+    与源图灰度做相关）：默认 同向 **0.9532** / 上下翻 0.7197；加
+    `invert_yaxis()` 后反过来变成 同向 0.7199 / 上下翻 0.9537 ——
+    即**加了就把图上下颠倒了**。
+
+    ---
+    ## 图幅
+
+    `fit_fig_to_aspect()` 按源图长宽比定画布高。修前 `(W_ONE_HALF, mm(56))`
+    下图像只占画布 **32%**；修后 136x133.2mm、利用率 **85%**。
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(mm(width_mm), mm(width_mm)))
+    ax.imshow(img, alpha=alpha)
+    ax.set_aspect("equal")
+    scs = []
+    if cats is not None:
+        uniq = sorted(set(cats), key=lambda x: int(x) if x.isdigit() else x)
+        cmap = plt.get_cmap("tab20")
+        for i, u in enumerate(uniq):
+            m = cats == u
+            scs.append(ax.scatter(xy[m, 0], xy[m, 1], s=8, color=cmap(i % 20),
+                                  label=u, linewidths=0))
+    if legend_kw:
+        # **约定 v2 的 `loc`/`ncol` 不可覆盖。** 第一版写成
+        # `fig.legend(**legend_kw)` 并让调用方传 `loc=...`/`ncol=1` ——
+        # 运行期没问题，但 `tools/check_legend_convention.mjs` 是纯文本
+        # 检查器：它在 `fig.legend(` 的实参文本里找 `loc="outside` 与
+        # `ncol=` 两个字面量，**看不见经 `**kwargs` 转发的值**，于是报红。
+        #
+        # 扩宽检查器要跨函数数据流分析（成本高、还会引入假阴性），而
+        # 约定 v2 本来就是不可协商的 —— 正确做法是让 helper 把它焊死，
+        # 调用方只能改外观参数。传了 loc/ncol 直接报错，避免"看起来改了
+        # 其实被覆盖"的静默分歧。
+        for k in ("loc", "ncol"):
+            if k in legend_kw:
+                raise ValueError(
+                    f"he_overlay_fig: legend_kw 不接受 {k!r} —— 约定 v2 要求"
+                    f"图例一律框外右侧、纵向单列，这两项由本函数固定。"
+                    f"只传外观参数（fontsize / markerscale / title 等）。")
+        fig.legend(loc="outside right center", ncol=1, **legend_kw)
+    ax.set_title(title)
+    ax.set_xticks([]); ax.set_yticks([])
+    # 画布定稿之后再定 spot 大小 —— transData 只有定稿后才准。
+    fit_fig_to_aspect(fig, ax, width_mm, img.shape[1] / img.shape[0])
+    if scs and r_plot:
+        s = marker_area_pt2(fig, ax, r_plot)
+        for sc in scs:
+            sc.set_sizes([s])
+    return fig, ax
 
 
 def spatial_neighbor_graph(adata, n_neighbors: int = 6):
@@ -751,6 +848,9 @@ def run_03_spatial_domains(cfg: dict) -> dict:
     entry = adata.uns["spatial"][lib]
     img = entry["images"]["hires"]
     sf = float(entry["scalefactors"]["tissue_hires_scalef"])
+    # **spot 大小要有尺度依据，不能用魔法数。** `spot_diameter_fullres` 是
+    # 全分辨率图上的直径，乘 `tissue_hires_scalef` 才是 hires 绘图单位的
+    # 半径（见 `references/troubleshooting.md:98` 点名的修法）。
     r_plot = spot_radius_plot_units(entry["scalefactors"], "hires")
     xy = spatial_xy(adata, sf)
 
@@ -765,24 +865,12 @@ def run_03_spatial_domains(cfg: dict) -> dict:
                     "03-03-03-unit2-domains-spatial")]
     for key, title, name in PANEL_SPECS:
         cats = adata.obs[key].astype(str).values
-        uniq = sorted(set(cats), key=lambda x: int(x) if x.isdigit() else x)
-        cmap = plt.get_cmap("tab20")
-        fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(56)))
-        ax.imshow(img, alpha=0.55)
-        for i, u in enumerate(uniq):
-            m = cats == u
-            ax.scatter(xy[m, 0], xy[m, 1], s=8, color=cmap(i % 20),
-                       label=u, linewidths=0)
-        fig.legend(fontsize=6, markerscale=2.2, loc="outside right center",
-                  ncol=1, framealpha=0.8)
-        ax.set_title(title)
-        ax.set_xticks([]); ax.set_yticks([])
+        fig, ax = he_overlay_fig(
+            img, xy, cats, title, r_plot=r_plot,
+            legend_kw=dict(fontsize=6, markerscale=2.2, framealpha=0.8))
         save_fig(cfg, name, fig)
     # unit3：H&E 参考（无散点，纯组织学底图）
-    fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(56)))
-    ax.imshow(img, alpha=1.0)
-    ax.set_title("H&E reference")
-    ax.set_xticks([]); ax.set_yticks([])
+    fig, ax = he_overlay_fig(img, xy, None, "H&E reference", alpha=1.0)
     save_fig(cfg, "03-03-03-unit3-he-reference", fig)
 
     # ---- 5b. 方法对照图（只在点名方法真的跑了时才画）------------------------
@@ -817,19 +905,10 @@ def run_03_spatial_domains(cfg: dict) -> dict:
             # 想真的按方法上色，就得把散点改成单色 scatter —— 那会丢掉
             # 域间对照，是另一个决定，不该藏在死变量里。
             cats = adata.obs[key].astype(str).values
-            uniq = sorted(set(cats), key=lambda x: int(x) if x.isdigit() else x)
-            cmap = plt.get_cmap("tab20")
-            fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(52)))
-            ax.imshow(img, alpha=0.55)
-            for i, u in enumerate(uniq):
-                m = cats == u
-                ax.scatter(xy[m, 0], xy[m, 1], s=8, color=cmap(i % 20),
-                           label=u, linewidths=0)
-            fig.legend(fontsize=5, markerscale=2.0, loc="outside right center",
-                      ncol=1, framealpha=0.8,
-                      title="domain", title_fontsize=6)
-            ax.set_title(title)
-            ax.set_xticks([]); ax.set_yticks([])
+            fig, ax = he_overlay_fig(
+                img, xy, cats, title, r_plot=r_plot,
+                legend_kw=dict(fontsize=5, markerscale=2.0,
+                               framealpha=0.8, title="domain", title_fontsize=6))
             save_fig(cfg, name, fig)
         log_info(f"方法对照已拆分单图输出；一致性: {sub}")
         # **域×域对应矩阵热图**（差距清单 #25）：把方法对照的 ARI 拆成
