@@ -265,8 +265,8 @@ suptitle 超出 183 mm 宽 2.9%，被静默裁掉（`savefig.bbox: standard` 下
 
 | # | 位置 | 症状 | 处理 |
 |---|---|---|---|
-| 1 | `base.py:12` `from scipy.misc import derivative` | scipy 1.12 移除了 `scipy.misc.derivative` → `ImportError`，**装得上但导不进来** | 垫片补回该名字（3 点中心差分，Vandermonde 解权重）|
-| 2 | `base.py:432` → `util.py:19` `pv = pv.ravel()` | 传入的是 pandas Series，**Series 没有 `ravel`** → `AttributeError` | 绕开 `run`，直接用 `base.dyn_de` + `base.get_mll_results`，多重检验校正改用本仓库的 BH |
+| 1 | SpatialDE **包内** `base.py:12` `from scipy.misc import derivative` | scipy 1.12 移除了 `scipy.misc.derivative` → `ImportError`，**装得上但导不进来** | 垫片补回该名字（3 点中心差分，Vandermonde 解权重）|
+| 2 | SpatialDE **包内** `base.py:432` → `util.py:19` `pv = pv.ravel()` | 传入的是 pandas Series，**Series 没有 `ravel`** → `AttributeError` | 绕开 `run`，直接用 `base.dyn_de` + `base.get_mll_results`，多重检验校正改用本仓库的 BH |
 
 **两条硬要求：**
 
@@ -442,7 +442,7 @@ def set_seed(cfg):
 
 SpaGCN 1.2.7 的两处随机源：
 
-1. `models.py:55` `KMeans(self.n_clusters, n_init=20)` —— **没有
+1. SpaGCN **包内** `models.py:55` `KMeans(self.n_clusters, n_init=20)` —— **没有
    `random_state`**，走全局 numpy 遗留 RNG；
 2. `train()` 训练 GCN 走 **torch**（权重初始化 + dropout）。
 
