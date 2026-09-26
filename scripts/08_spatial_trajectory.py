@@ -33,7 +33,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import scipy.sparse as sp  # noqa: E402
 
-from common import (ensure_dirs, load_config, log_info,  # noqa: E402
+from common import (ensure_dirs, finite_round, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, probe_named_tools, record_step, save_fig,
                     set_seed,
                     spatial_xy, write_json, W_ONE_HALF, mm,)
@@ -52,6 +52,44 @@ def _load(modname: str, fnname: str):
 
 
 N_GENES_ALONG = 300
+
+
+def summarize_morans_pair(i_expr, i_spatial, ndigits: int = 4) -> dict:
+    """把「朴素 vs 空间感知」的两个 Moran's I 收口成可判定的三态结果。
+
+    **为什么抽成纯函数。** 原写法是内联的一句
+
+        improved = I_spatial > I_expr
+
+    两个都是 `nan` 时 `nan > nan` 为 `False`，于是状态里写下
+    `spatial_smoothing_improves_coherence: False` —— 读者看到的是
+    **"空间平滑把连贯性搞坏了"**，而实际处境是**这两个量根本没有定义**
+    （常数列 / 退化权重矩阵会让 Moran's I 无定义）。这两句话的排查方向
+    完全相反：前者去看平滑参数，后者去看输入是不是常量。
+
+    同族形态在本仓库反复出现（E-69：`nan is not None`、`nan or 1e-9`、
+    `nan < 0.3`），共同点都是**用一个布尔量把"判不了"和"判成了否"压成
+    同一个值**。抽出来之后自检能调真代码（AGENTS 规则 30.1 / E-63：
+    自检重写一遍判据 = 测的是重写的那份，不是真代码）。
+
+    返回键：`defined`（两个量是否都有限）/ `improved`（**只有在 defined
+    时才是有意义的判断**）/ `gain` / `expression_only` /
+    `spatially_smoothed`（三个经 `finite_round` 收口，算不出来时 `None`）/
+    `note`（判不了时的说明，可判定时为 `None`）。
+    """
+    defined = bool(np.isfinite(i_expr) and np.isfinite(i_spatial))
+    return {
+        "defined": defined,
+        "improved": bool(defined and i_spatial > i_expr),
+        "gain": finite_round(i_spatial - i_expr, ndigits) if defined else None,
+        "expression_only": finite_round(i_expr, ndigits),
+        "spatially_smoothed": finite_round(i_spatial, ndigits),
+        "note": (None if defined else
+                 "两个 Moran's I 至少有一个算不出来（常数列 / 退化权重矩阵会让它"
+                 "无定义）—— 所以这一轮**没有「平滑是否提高连贯性」这个结论可下**；"
+                 "`spatial_smoothing_improves_coherence=False` 读作「没改善」，"
+                 "不是「判不了」"),
+    }
 
 
 def run_08_spatial_trajectory(cfg: dict) -> dict:
@@ -218,6 +256,11 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
 
     log_info(f"Moran's I（拟时序的空间自相关）：朴素 {I_expr:.4f} → 空间感知 {I_spatial:.4f}"
              f"（期望值 {expected:.4f}）")
+    if not (np.isfinite(I_expr) and np.isfinite(I_spatial)):
+        # 打印 nan 本身是诚实的，但**光打印 nan 不够** —— 读者要能从日志上
+        # 分清"算出来是 nan"和"这个量在这里没有定义"。见上面 `improved` 的注释。
+        log_warn("Moran's I 至少有一个算不出来（nan）—— 所以**没有「空间平滑是否"
+                 "提高连贯性」这个结论可下**，不是「平滑没有提高」")
     log_info(f"邻居间拟时序平均绝对差：朴素 {gap_expr:.4f} → 空间感知 {gap_spatial:.4f}")
 
     # ---- 5. 与空间轴的相关（梯度方向）--------------------------------------
@@ -226,7 +269,8 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
         for tag, v in (("expr", expr_pt), ("spatial", spatial_pt)):
             r = float(spearmanr(v, axis_vals).correlation)
             grad_rows.append({"pseudotime": tag, "spatial_axis": axis_name,
-                              "spearman_rho": round(r, 4)})
+                              "spearman_rho": finite_round(r, 4),
+                              "rho_defined": bool(np.isfinite(r))})
     pd.DataFrame(grad_rows).to_csv(res_dir / "spatial_trajectory_gradient.csv", index=False)
 
     # ---- 6. 沿空间拟时序变化的基因 -----------------------------------------
@@ -324,7 +368,22 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
     save_fig(cfg, "03-08-02-unit2-pseudotime-scatter", fig)
 
     # ---- 9. 状态 -----------------------------------------------------------
-    improved = I_spatial > I_expr
+    #
+    # **`improved` 必须先判"这两个 Moran's I 算不算得出来"。** 原写法是
+    #     improved = I_spatial > I_expr
+    # 于是两个都是 nan 时 `nan > nan` 为 `False`，状态里写下
+    # `spatial_smoothing_improves_coherence: False` —— 读者看到的是
+    # **"空间平滑把连贯性搞坏了"**，而实际处境是**这两个量根本没有定义**
+    # （常数列 / 退化图会让 Moran's I 无定义）。这两句话的排查方向完全相反：
+    # 前者要去看平滑参数，后者要去看输入是不是常量。
+    # 同族形态在本仓库已经出现过多次（E-69：`nan is not None`、
+    # `nan or 1e-9`、`nan < 0.3`），所以这里不再写 `>`，而是先判有限性。
+    # 判据本身在 `summarize_morans_pair()` 里 —— **抽成纯函数是为了让自检
+    # 能调真代码**（AGENTS 规则 30.1 / E-63：自检里重写一遍判据，测的是
+    # 重写的那份，不是真代码）。
+    _mi = summarize_morans_pair(I_expr, I_spatial)
+    _mi_pair_defined = _mi["defined"]
+    improved = _mi["improved"]
     status = {
         "dataset_id": cfg["dataset_id"],
         "status": "ok",
@@ -333,20 +392,28 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
         "spatial_weights": w_info,
         "spatial_graph": adj_info,
         "root_selection": root_record,
-        "morans_I_expression_only": round(I_expr, 4),
-        "morans_I_spatially_smoothed": round(I_spatial, 4),
-        "morans_I_expected_no_autocorrelation": round(expected, 4),
-        "morans_I_gain": round(I_spatial - I_expr, 4),
-        "spatial_smoothing_improves_coherence": bool(improved),
+        # `finite_round()` 会把 nan/inf 收口成 `None`（JSON 里是 null）——
+        # 写 nan 会产出 `NaN` 字面量，那不是合法 JSON，严格解析器读不了。
+        "morans_I_expression_only": _mi["expression_only"],
+        "morans_I_spatially_smoothed": _mi["spatially_smoothed"],
+        "morans_I_expected_no_autocorrelation": finite_round(expected, 4),
+        "morans_I_gain": _mi["gain"],
+        # **三态**，不是两态：可判定且改善 / 可判定但没改善 / **判不了**。
+        # 压成布尔量就把"判不了"和"没改善"合并了（E-69 的教训）。
+        "spatial_smoothing_improves_coherence": improved,
+        "morans_I_defined": _mi_pair_defined,
+        "morans_I_undefined_note": _mi["note"],
         # **§3.6 点名的 StPedf / SpaceFlow / ISORT / Stereopy-TGPI / stLearn
         # 一个都没跑。** 上面跑的是扩散图 + DPT 的内置实现 ——
         # 不记这条，读者会以为空间轨迹用的是文档点名的框架。
         "named_tools": probe_named_tools(
             log=log_warn,
             only=("StPedf", "SpaceFlow", "ISORT", "Stereopy-TGPI", "stLearn")),
-        "neighbor_gap_expression_only": round(gap_expr, 4),
-        "neighbor_gap_spatially_smoothed": round(gap_spatial, 4),
-        "spearman_between_two": round(rho_two, 4),
+        # 下面三个同样是 Spearman / 邻居差，也会在退化输入下变 nan ——
+        # 一律走 `finite_round` 收口，不写裸 `round()`。
+        "neighbor_gap_expression_only": finite_round(gap_expr, 4),
+        "neighbor_gap_spatially_smoothed": finite_round(gap_spatial, 4),
+        "spearman_between_two": finite_round(rho_two, 4),
         "gradient": grad_rows,
         "n_genes_along": len(gene_rows),
         "genes_along_pseudotime": {

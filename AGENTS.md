@@ -395,202 +395,15 @@ top 组 `0.8713`）。
 
 ## 20. `install_requires` 里有某个包，不等于运行时会 import 它
 
-`SpaGCN` 上一轮被登记成"装不上"，理由是：
+**规则：** 判一个包"装不上"之前，**读它的源码看运行路径上到底 import 谁** —— 依赖表里有的包可能一次都没用到。`SpaGCN` 曾被登记成"装不上"（PyPI 有真包 1.2.7，但依赖 `louvain`，该包没有 py3.12 wheel）；**前半句是实测的，后半句的推论是错的** —— 读 SpaGCN 1.2.7 源码：包内 `SpaGCN.py` / `models.py` / `util.py` **没有一处** `import louvain`（走的是 `scanpy.tl.louvain`），且 `simple_GC_DEC.fit` 的 `init` 参数有 `"kmeans"` 分支可绕开。**"实测的前半句 + 未验证的推论"合成一条读起来完全合理的结论，是这类记录最危险的形态。**
 
-> PyPI 有真包（1.2.7），但依赖 `louvain` —— 该包最新版 0.8.2 没有
-> py3.12 wheel，只有 sdist，要从 2019 年的 C++/Cython 源码编译。
-
-**前半句是实测的，后半句的推论是错的。** 读 SpaGCN 1.2.7 的源码：
-
-- `SpaGCN/SpaGCN.py`、以及 SpaGCN 包内的 `models.py`、`util.py`
-  里**没有一处** `import louvain`；
-- 它走的是 `scanpy.tl.louvain`（包内 `models.py:69`、`util.py:272`）；
-- `simple_GC_DEC.fit` 的 `init` 参数有 **`"kmeans"` 分支**
-  （包内 `models.py:52-61`），完全不碰 louvain。
-
-所以 `pip install --no-deps SpaGCN==1.2.7` + `init="kmeans"` 绕开了整条
-编译链，SpaGCN 现在**真的在跑**。代价（已写进产物的 `limitations`）：
-簇心初始化从"表达+空间"变成"只用 GCN 特征"，`n_clusters` 因此必须
-外部给定 —— 传内置方法的域数，两边域数相同 ARI 才可比。
-
-**规则：判断一个包能不能用，判据是源码里的 import，不是元数据。**
-元数据只说明"pip 会不会去装它"。这一条和规则 19（SpatialDE 垫片）
-是同一件事的两面：**装得上但导不进来**（SpatialDE）与
-**元数据说装不上但根本不需要**（SpaGCN），都不能靠读 PyPI 页面判断。
-
-反过来也成立：**上游 `setup.py` 里没写的依赖不代表不需要。**
-`STAGATE_pyG` 的 `install_requires = ["requests"]`，而它的
-`gat_conv.py:10` 是模块级 `from torch_sparse import SparseTensor, set_diag`。
-**两个方向都会骗人。**
-
-### 落地登记要能表达"缺数据"这一种
-
-`NAMED_TOOLS` 的 `kind` 原来有四类（`r_package` / `not_on_pypi` /
-`deps` / `name_taken`），这一轮加了第五类 **`needs_reference`**：
-
-| kind | 含义 | 例子 |
-|---|---|---|
-| `needs_reference` | **包装得上，缺的是数据** | `cell2location`（§3.3） |
-
-`cell2location` 0.1.5 的依赖（scvi-tools + torch + pyro-ppl + opencv-python）
-都装得上，卡住的是 `Cell2location(...)` 需要 `cell_state_df` ——
-每个细胞类型的全转录组后验表达谱，而默认配置是 marker 签名。
-
-**把"缺数据"写成"装不上"会让下一个人去折腾安装，方向完全错。**
-所以 `probe_named_tools` 对 `needs_reference` 这类**不报"登记过期"** ——
-它可 import 是符合预期的。
-
-### 点名工具跑了，就必须量化它与主方法的一致性
-
-**"跑通了"不是结论。** 一个点名工具跑出 13 个域，如果不说它和内置划分
-的 ARI，读者只能看到一个孤立的划分。所以 `main_analysis.py` 里有一条
-honesty 检查：`domain_methods` 里任何 `used: True` 的工具，
-`method_agreement` 里必须有对应的 `<tool>_vs_builtin`。
-
-ARI 是主判据（对域编号置换免疫）；`same_label_frac` 只作参考 ——
-它会被编号顺序完全支配。**ARI 高也不等于两套方法都对**：
-它们可能共享同一个错误（比如被同一个技术批次效应驱动）。
-
-### 登记位置不唯一，验收要把两张表合并起来看
-
-§3.2 的 SpaGCN 跑起来之后从 `named_tools` 搬到了 `domain_methods`
-（它不再是"用不了的工具"）。所以 `named_tools:*` 这条验收检查必须
-**把 `named_tools` 与 `domain_methods` 合并**再比对点名的工具名单 ——
-只认 `named_tools` 会把"已经跑了的工具"报成"缺登记"，
-**正好把好事判成坏事**。
-
-### 按步检查查不出"整段没登记"——要再做一次全局清点
-
-上面那条是**按步**查的：每个状态文件声明自己负责哪几个工具，检查它们在不在。
-它查不出"**没有任何一步声明过某个工具**"。
-
-实测踩到：`Bering` 与 `BOMS` 的 `section` 是 **§3.1**，而 §3.1 对应的步骤
-（`01_qc` / `02_normalize`）**没有 `named_tools` 字段** —— 于是这两个工具
-只活在 `common.NAMED_TOOLS` 这个 Python 常量里，**任何产物里都看不到它们**。
-按步检查全部通过。
-
-**这是"缺口没登记"最隐蔽的形态：不是登记错了，是根本没登记，
-而验收看起来是绿的。**
-
-所以 `main_analysis.py` 另有三条：
-
-| 检查 | 判据 |
-|---|---|
-| `honesty:named_tools_registry` | `NAMED_TOOLS` 每条都有 `kind` 与 `reason` |
-| `honesty:named_tools_never_probed` | 清点哪些工具**没有任何一步探测过**（可见，不判失败）|
-| （落盘） | 全表探测结果写进清单 `params.named_tools_probe` |
-
-第三条不能省：前两条只是 CI 日志里的两行，**日志会滚掉，清单不会**。
-不加 `only=` 过滤 —— 全局清点过滤掉谁都会漏。
-
----
+完整原文（含源码证据与排查顺序）：references/agents-detail.md#原规则-20
 
 ## 21. `set_seed()` 不 seed torch，而第三方工具的随机性可能在 torch 里
 
-姊妹项目 `scrna-pipeline-skill/AGENTS.md` 规则 20 记了同一类问题的另一面
-（那边是 `pynndescent` 的 Numba 并行）。空间这边实测踩到的是 **torch**。
+**规则：** **"我设了种子"不等于"结果可复现"** —— `set_seed()` 覆盖不到第三方库内部的迭代求解器、并行归约与 GPU 内核。实测：同一份代码、同一批包版本，**只改并行度/种子设置**，SpaGCN 与内置方法的 ARI/NMI 就逐轮漂（五轮 CI 对比表见原文）。空间这边踩到的是 **torch**（姊妹项目 `scrna-pipeline-skill/AGENTS.md` 规则 20 记的是同一类问题的另一面：`pynndescent` 的 Numba 并行）。并行度有三个独立旋钮（BLAS 线程数 / `OPENBLAS_CORETYPE` / `NUMBA_NUM_THREADS`），**设它们是对的，但设了不保证可复现**。
 
-**证据（五轮 CI，同一份代码、同一批包版本，只改并行度/种子设置）：**
-
-| run | 并行度 / 种子设置 | SpaGCN vs 内置 ARI | NMI |
-|---|---|---|---|
-| 35488906157 | 无钉 | 0.3734 | 0.5535 |
-| 35489064432 | +OMP/OPENBLAS/MKL + CORETYPE | 0.3784 | 0.5557 |
-| 35489172104 | 同上 | 0.3639 | 0.5310 |
-| 35489534090 | +`NUMBA_NUM_THREADS=1` | 0.4216 | 0.5762 |
-| 35489962167 | +`random`/`numpy`/`torch` 三个全局 RNG | **0.3708** | 0.5451 |
-
-**五轮五个值。三次归因、三次被否证 —— 变量不在这里。**
-
-而同一五轮里，**主方法的数全部逐位相同**：Moran's I（空间平滑后）
-`0.7670`、域数 `13`、不平滑邻居同域率 `0.507`、平滑后 `0.668`。
-
-**"某个量在变"不等于"所有量都在变"** —— 先看哪些**没**变，
-范围一下就缩小了。这一步比"设了种子"有用得多。
-
-### 21.1 三次归因都被否证了
-
-| # | 归因 | 依据 | 否证 |
-|---|---|---|---|
-| 1 | 多线程 BLAS 归约顺序 | geo 规则 12 的经验 | 钉住 OMP/OPENBLAS/MKL + CORETYPE 后仍从 0.3784 变 0.3639 |
-| 2 | Numba `prange` 线程数 | SpaGCN 走 numpy，怀疑并行归约 | 补 `NUMBA_NUM_THREADS=1` 后仍给 0.4216 |
-| 3 | **torch 未 seed** | `set_seed()` 确实没 seed torch（读源码确认） | 钉住三个全局 RNG 后仍给 **0.3708** |
-
-**第 3 条的依据是真的**（`set_seed()` 确实只 seed 了 `random` 与
-`numpy`），**但"依据为真"不等于"它就是变量"。** 三次都是"读源码
-看着很有道理"就动手，三次都被日志否证。
-
-> **残留随机源尚未定位。** 第四次动手之前先读日志（规则 13）。
-> 上面那五轮 ARI 摆在一起，说明问题不在"哪个 RNG 没设"这个层面 ——
-> 继续加环境变量只是碰运气。
-
-### 21.2 已确认的源码事实（不是推测）
-
-```python
-def set_seed(cfg):
-    random.seed(seed)
-    np.random.seed(seed)      # <-- 没有 torch.manual_seed(seed)
-    apply_style(cfg)
-```
-
-SpaGCN 1.2.7 的两处随机源：
-
-1. SpaGCN **包内** `models.py:55` `KMeans(self.n_clusters, n_init=20)` —— **没有
-   `random_state`**，走全局 numpy 遗留 RNG；
-2. `train()` 训练 GCN 走 **torch**（权重初始化 + dropout）。
-
-**SpaGCN 自己知道要 seed。** `util.search_res()` 与
-`ez_mode.detect_spatial_domains_ez_mode()` 开头都有
-
-```python
-random.seed(r_seed); torch.manual_seed(t_seed); np.random.seed(n_seed)
-```
-
-**但本仓库走的是 `init="kmeans"` + 外部给定 `n_clusters` 那条路**
-（规则 20 为了绕开 louvain 的 py3.12 编译链选的），两个函数都不经过 ——
-**它的 seeding 全部被跳过。**
-
-### 21.3 处理
-
-在 `clf.train()` 之前照抄 SpaGCN 自己的做法把三个全局 RNG 钉死：
-
-```python
-random.seed(seed); np.random.seed(seed)
-torch.manual_seed(seed); torch.set_num_threads(1)
-```
-
-并把结果记进 `domain_methods.SpaGCN.seeded_before_train` ——
-**没有 torch 时要如实记 `torch_seeded: False`，不能假装 seed 成功。**
-
-**留着它**：成本为零、方向正确、`seeded_before_train` 可核对。
-**但不要以为设了就可复现** —— 实测不足以让 ARI 稳定。
-
-### 21.4 报数
-
-**ARI 是范围，不是定值。** `domain_status.json` 的 `reproducibility`
-字段写明哪些量能按定值报（Moran's I、域数、邻居同域率）、
-哪些必须带范围报（`SpaGCN_vs_builtin` 的 ARI，实测
-`0.3639` ~ `0.4216`），以及**被否证的三条假设**。
-
-**别把数值写死在 README 里。** 实测 README 里"不平滑 9 域、同域率 0.536、
-基线 0.133"早就对不上了（现在是 11 域 / 0.507 / 0.111）——
-**文档里写死的数一定会过时**，而读者不会知道它过时了。
-
-### 21.5 诊断字段必须扛得住日志截断
-
-排查这个 ARI 时卡了很久，一部分原因是**日志里根本看不到需要的字段**：
-`汇总产物` 那一步原来打的是 `json.dumps(v)[:500]`，而 `domain_methods`
-一长就从中间被切断 —— `seeded_before_train` / `seed` 恰好落在第 500 个
-字符之后。**只能靠猜，而我已经猜错三次了。**
-
-现在改成**按字段名挑**：短标记与数值逐条打全，长散文（`reason` /
-`note` / `why_kmeans`）才截断，并把 `reproducibility` 一起打出来。
-
-> **规则：日志的截断位置不该由"字典有多长"决定，该由"哪些字段能定位
-> 问题"决定。** 一个 `[:500]` 会让下一轮排查同样卡住 ——
-> 而 `results/` 的 artifact 有 14 天保留期，日志滚得更快。
-
----
+完整原文（含五轮 CI 对比表与三个旋钮）：references/agents-detail.md#原规则-21
 
 ## 22. 文档改动走独立的 `docs_check.yml`
 
@@ -1056,5 +869,105 @@ spatial 103→117 条（C=14）—— geo/scrna 的跨仓引用**以前一条都
 > 它的失败方式不是失败，是**沉默**。
 >
 > **正确的提交顺序是：改完 → 跑 pre-push → 提交 → push。**
+
+## 31. 「写出来了」不等于「有人读」：三种形态与三个守卫（E-69，2026-09-26）
+
+**规则：一个字段/一条判据的价值不在于它被算出来，而在于有人消费它；
+而"算不出来"和"算出来很小"必须在产物里长得不一样。**
+
+E-68 是同族第一次自查（规则 30 那批门禁的连带产物），E-69 是拿它的判据
+**回头扫全仓**抓到的第二次 —— 第三次跨仓抓到东西。三种形态：
+
+### 31.1 Form A：`nan` 参与比较会静默变成 `False`
+
+`nan > x` / `nan < x` **都是 `False`，且不报错**。于是"这个量算不出来"
+被读成"这个量很小 / 没改善"。三处现场：
+
+| 现场 | 旧写法 | 后果 |
+|---|---|---|
+| `05_deconvolution.py` 重建误差 | `np.nanmean` / `np.nanpercentile` / `np.nanmax` 在**全 nan** 时返回 nan 并继续算 | `frac_unreliable` 的分母用了 `len(errors)` 而不是有限值个数 |
+| `07_spatial_communication.py` z 分数 | `null_sd = float(np.nanstd(perm_means)) or 1e-9` | 全 nan 时 `or` **不触发** → `z = nan` 写进 top5；`denom` 全零 → `100.0/1e-9 = 1e11` 假放大 |
+| `08_spatial_trajectory.py` Moran's I | `improved = I_spatial > I_expr` | `nan > nan` 为 `False` → 状态声称"平滑损害了一致性"，而**两个量都没算出来** |
+
+**修法：抽纯函数，让"算不出来"有名字。**
+
+- `summarize_morans_pair(i_expr, i_spatial, ndigits=4) -> {"defined","improved","gain","expression_only","spatially_smoothed","note"}`
+- `spatial_z_score(near_mean, perm_means) -> (null_mu, null_sd, z, z_reason)`
+- `summarize_reconstruction_error(errors, max_err) -> dict`（含 `error_defined` / `n_unreliable` / `frac_unreliable`）
+- `common.finite_round(x, n)` **三态**：nan/inf/None → `None`；有限 → 四舍五入；**`0.0` 要保留，判空用 `is not None`**
+
+**为什么必须抽函数**：抽出来才能被标定脚本**直接调**（139 项纯函数断言）。
+内联写法只能靠"跑整条流水线看产物"，而那是 25 分钟一轮。
+
+### 31.2 Form B：只写不读的状态字段
+
+全仓 **15 个字段没有任何消费者** —— 坏值和"根本不存在"在验收层长得一样。
+现在 12 条探针注册表（`main_analysis.py` 的
+`dict(cid, base, f, path, kind, severity, opt, fn, good, bad)`）：
+`status:input_is_counts` / `coords_dropped` / `hvg_flavor` / `full_gene_counts` /
+`svg_gene_subset` / `svg_gene_selection` / `svg_genes_dropped` /
+`proportions_truncated` / `deconv_matrix_source` / `niche_spot_alignment` /
+`smoothing_improves` / `morans_I_defined`。
+
+- `fn` 返回 `None` ⇒ **不适用**（PASS），不是失败。
+- `opt=False` = **无条件写**；缺失 ⇒ 判红「产生端不再写了」。
+  `opt=True` = 条件写；缺失 ⇒ PASS。
+
+**三个守卫（都是踩出来的）：**
+
+1. **`chk(cid, kind, ok, detail, severity="required")` 的第二个位置参数是
+   `kind`，不是 severity。** 传错**不报错**，只是把"只可见"记成"必须通过"。
+2. **父状态白名单**：`_PROBE_PARENT_OK = (None, "ok")` + `_PARENT_NOT_EXECUTED`
+   把 12 个非 ok 状态字面量映射成中文说明；**未知状态跳过但打印原始值**
+   —— 静默放行会让"新增了一种没见过的状态"退化成没有检查。
+3. **`_dig_present(obj, path) -> (found, value)`** —— `_dig()` 对"键不存在"
+   与"键存在但值为 `None`"返回同一个 `None`，而 `hvg_fallback=None`
+   的意思是**没有回退**（好事）。两者必须能区分。
+
+### 31.3 Form C：恒真判据
+
+`manifest:human_review` 的 `ok` 曾写死 `True`、`required: False` ——
+**"一个都没登记"被写成"全部已确认"**。修法：`_n_hr > 0` 才可能为真；
+`human_review_confirmed` 只列 `status in ("confirmed","overridden","not_needed")`
+的节点；**默认 `pending` 不算失败**（判红会让每个 job 都红，反而没人看）。
+**两仓同形**（本仓 `main_analysis.py` + `scrna-pipeline-skill/scripts/main_analysis.py`）。
+
+### 31.4 标定：正向 139 项 + 反向 10/10，缺一不可
+
+- 正向 `D:\tmp\_q28\calib_e69_probes.py` **139 项 / 0 失败**；
+  `calib_e69.py` 100 项（纯函数）；`calib_e69_consumer.py` 36 项（验收消费端）。
+- 反向 `D:\tmp\_q28\neg_e69_probes.py`：11 类注入 → **符合预期 10 类 /
+  不符合 0 类**，`exit=0`，末尾 `源码已还原: True（main=88962, traj=25549）`。
+- **判红必须伴随非空 FAIL 摘要。** 只有 `exit != 0` 不算证据 ——
+  `subprocess.run` 少 `cwd` / `PYTHONIOENCODING` 时，子进程按 cp936 读
+  UTF-8 源码抛 `UnicodeDecodeError`，**崩溃的非零退出被误读成"判红"**。
+
+### 31.5 三个反复踩到的实现坑
+
+1. **消费端标定看不见产生端。** 把产生端的 `morans_I_defined` 键改名后
+   12 条探针**全绿** —— 因为消费端读的是标定脚本构造的 JSON 夹具，
+   **产生端写什么它根本不知道**。补的判据必须是**源码级**：
+   `08_spatial_trajectory.py:404` 必须是 `"morans_I_defined": _mi_pair_defined`。
+2. **`_code_only`（剥 COMMENT+STRING）不能用来查字典键名** ——
+   键名本身就是 STRING token，被一起剥掉，判据**永远找不到**。
+   查键名要用只剥 COMMENT 的 `_no_comment`。
+   **同一个文件里两种剥离策略各服务一条判据。**
+3. **tokenize 的 token 是无空格拼接** —— `"key":value` 匹配得上，
+   `"key": value` **永远匹配不上**。
+
+### 31.6 收口
+
+`common.write_json` 加 `allow_nan=False` + `_scrub_nonfinite`（递归
+dict/list/tuple/numpy；**dict 的键必须是 `str`，否则 `default` 回调崩**）
+—— 以前会写出裸 `NaN`（非法 JSON 字面量）；`lib/alignment.py` 是唯一
+绕过 `write_json` 的写盘点，已收口。`common.read_json` 改成**损坏时抛异常**
+（原来 `except Exception: return None` 把"文件不存在"和"文件坏了"混成一种），
+另新增 `read_json_or_none`。
+
+> **`np.float64` 是 `float` 的子类，`np.float32` 不是** ——
+> 后者会一路走到 `json.dump` 的 `default` 回调。
+
+台账：`governance/15_ERROR_LEDGER.md` E-69
+（同族前两次：E-68 自查同族两处、E-61 静态检查名单只覆盖它自己）
 
 

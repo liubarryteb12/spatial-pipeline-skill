@@ -40,7 +40,8 @@ import scanpy as sc  # noqa: E402
 import scipy.sparse as sp  # noqa: E402
 from scipy.sparse.csgraph import connected_components  # noqa: E402
 
-from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
+from common import (df_to_records, ensure_dirs, finite_round,  # noqa: E402
+                    load_config, log_info,
                     log_warn, named_tools_note, parse_args, pkg_version,
                     probe_named_tools, record_step, save_fig, set_seed,
                     write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, mm,
@@ -522,17 +523,14 @@ def try_stagate(adata, cfg: dict, log=log_info) -> tuple:
 
 
 def _r4(x):
-    """四舍五入到 4 位；**非有限值一律落 `None`，不落裸 `NaN`**（E-68 同族）。
+    """四舍五入到 4 位；**非有限值一律落 `None`**（E-68 同族）。
 
-    `round(float("nan"), 4)` 是 `nan`，`json.dumps(..., allow_nan=False)` 会抛，
-    而 `allow_nan=True`（默认）会写出裸 `NaN` —— 那不是合法 JSON，
-    `json.loads` 读得回来、别的语言读不回来。同一个数值在「算不出来」时
-    应当是「空」，不是「一个看起来像数字的东西」。
-    （`common.write_json` 的 `_scrub_nonfinite` 是最后一道兜底，但不该
-    指望兜底：本函数返回的字典也会被内存里的消费者直接读。）
+    **已改为调 `common.finite_round`（E-69）** —— 本函数保留为薄壳，因为
+    本文件里 `_r4` 的调用点有 4 处，且它是 E-68 第三处缺陷的标定锚点
+    （`D:\\tmp\\_q27\\calib_domain_margin.py` / `neg_domain_margin.py` 直接
+    按这个名字注入与断言）。逻辑只有一份，在 `common.finite_round`。
     """
-    x = float(x)
-    return None if not np.isfinite(x) else round(x, 4)
+    return finite_round(x, 4)
 
 
 def domain_label_from_z(Z, used_ct, M, dom_list) -> tuple:

@@ -42,7 +42,7 @@ import scipy.sparse as sp  # noqa: E402
 import yaml  # noqa: E402
 from scipy.optimize import nnls  # noqa: E402
 
-from common import (ensure_dirs, load_config, log_info,  # noqa: E402
+from common import (ensure_dirs, finite_round, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, pkg_version, probe_named_tools,
                     reconstruct_counts_from_raw,
                     record_cross_language, record_decision, record_step,
@@ -362,6 +362,58 @@ def try_cell2location(C, genes, ref_a, ct_key: str, cfg: dict,
         info["reason"] = f"{type(exc).__name__}: {exc}"
         log_warn(f"  §3.3 cell2location 跑失败：{info['reason']}")
         return None, None, info
+
+
+def summarize_reconstruction_error(errors: np.ndarray, max_err: float) -> dict:
+    """把每个 spot 的重建误差汇成可落盘的 `reconstruction_error` 块（E-69）。
+
+    **抽成纯函数是为了让自检能调真代码**（AGENTS 规则 30.1 / E-63）——
+    这段逻辑原先内联在 `run_05_deconvolution` 里，自检只能重写一遍，
+    而重写出来的判据不测真代码（E-63 的教训：自检用例本身是假的）。
+
+    三态设计，**「算不出来」与「算出来是 0」必须分开**：
+
+    - 全部算不出来（每个 spot 的 counts 行和都 <= 0，`errors` 全 nan）：
+      `error_defined=False`、`median/p95/max/frac_unreliable` 全 `None`。
+      原实现写的是 `median=nan, n_unreliable=0, frac_unreliable=0.0` ——
+      **读起来是「所有 spot 都可靠」，实际是一个 spot 都没算出来**。
+    - 部分算不出来：`n_unreliable` / `frac_unreliable` 的分母**只数算得出来
+      的 spot**。原写法用 `len(errors)` 当分母，10 个空 spot + 1 个真不可靠
+      会报成 1/11=0.091 而不是 1/1=1.0，**把一个 100% 的问题稀释成 9%**。
+    - 全部算得出来：正常报。
+
+    `n_spots_with_error` / `error_defined` 让「一个都没算出来」在 JSON 里
+    就是一句话，不靠读者从 `median=null` 反推。
+    """
+    n_finite = int(np.isfinite(errors).sum())
+    n_total = int(len(errors))
+    all_nan = (n_finite == 0)
+    n_unreliable = int(np.nansum(errors > max_err))
+    if all_nan:
+        note = (f"**{n_total} 个 spot 的重建误差全部算不出来** —— "
+                "每个 spot 的 counts 行和都 <= 0（空 spot）。"
+                "`n_unreliable=0` **不代表都可靠**，而是**没有可判定的样本**；"
+                "排查方向是看上游 QC 的 `min_counts` 过滤，而不是重建误差本身")
+    elif n_finite < n_total:
+        note = (f"**有 {n_total - n_finite} 个 spot 的重建误差算不出来**"
+                f"（空 spot）—— 它们不计入 `frac_unreliable` 的分母，"
+                f"所以那个比例只描述其余 {n_finite} 个 spot")
+    else:
+        note = None
+    return {
+        "median": None if all_nan else finite_round(np.nanmedian(errors), 4),
+        "p95": None if all_nan else finite_round(np.nanpercentile(errors, 95), 4),
+        "max": None if all_nan else finite_round(np.nanmax(errors), 4),
+        "n_unreliable": n_unreliable,
+        "frac_unreliable": (round(n_unreliable / n_finite, 4)
+                            if n_finite else None),
+        "frac_unreliable_denominator": ("n_spots_with_error（只数算得出来的 spot）"
+                                        if n_finite else None),
+        "n_spots_with_error": n_finite,
+        "n_spots_total": n_total,
+        "error_defined": not all_nan,
+        "undefined_note": note,
+    }
 
 
 def run_05_deconvolution(cfg: dict) -> dict:
@@ -708,9 +760,22 @@ def run_05_deconvolution(cfg: dict) -> dict:
     max_err = float(dec.get("max_reconstruction_error", 0.5))
     if errors is not None:
         n_unreliable = int(np.nansum(errors > max_err))
-        log_info(f"重建误差: 中位 {np.nanmedian(errors):.4f}，"
-                 f"最大 {np.nanmax(errors):.4f}；"
-                 f"{n_unreliable} 个 spot 误差 >{max_err}")
+        # **日志也不能把「算不出来」印成数字**（E-69 同族 Form A）：
+        # `f"{np.nanmedian(all_nan):.4f}"` 打印 `nan`，读日志的人只会看到
+        # 一行「中位 nan，0 个 spot 误差 >0.5」，比不打印更容易误导。
+        n_err_finite_log = int(np.isfinite(errors).sum())
+        if n_err_finite_log == 0:
+            log_warn(f"重建误差: **{len(errors)} 个 spot 全部算不出来**"
+                     f"（每个 spot 的 counts 行和都 <= 0）—— "
+                     f"`n_unreliable=0` 不代表都可靠，是**没有可判定的样本**；"
+                     f"排查方向是上游 QC 的 min_counts 过滤")
+        else:
+            log_info(f"重建误差: 中位 {np.nanmedian(errors):.4f}，"
+                     f"最大 {np.nanmax(errors):.4f}；"
+                     f"{n_unreliable} 个 spot 误差 >{max_err}"
+                     + (f"（另有 {len(errors) - n_err_finite_log} 个 spot 的误差"
+                        f"算不出来 —— 空 spot，不计入分母）"
+                        if n_err_finite_log < len(errors) else ""))
     else:
         n_unreliable = 0
         log_info("打分法没有重建误差这个诊断量 —— 见 limitations")
@@ -718,8 +783,14 @@ def run_05_deconvolution(cfg: dict) -> dict:
     prop_df = pd.DataFrame(props_f, index=adata.obs_names, columns=types)
     prop_df.to_csv(res_dir / "deconvolution_proportions.csv")
     if errors is not None:
+        # **三态而不是布尔**：`errors <= max_err` 对 nan 给 `False`，于是空 spot
+        # 被写成「不可靠」—— 它既不是可靠也不是不可靠，是**判不了**。
+        # 布尔列会把「误差太大」和「根本没算」混成一类，两者的处理方式不同。
+        _finite = np.isfinite(errors)
+        _reliable = np.where(_finite, errors <= max_err, False)
         pd.DataFrame({"reconstruction_error": errors,
-                      "reliable": errors <= max_err},
+                      "error_defined": _finite,
+                      "reliable": _reliable},
                      index=adata.obs_names).to_csv(
             res_dir / "deconvolution_errors.csv")
 
@@ -781,12 +852,21 @@ def run_05_deconvolution(cfg: dict) -> dict:
 
     # ---- 5. 重建误差的空间分布（只有解卷积才有）----------------------------
     if errors is not None:
+        # **标题里的中位数也要判可判定性**（E-69 同族 Form A）：全空 spot 时
+        # `np.nanmedian` 是 nan，`f"{nan:.3f}"` 不抛错但标题写成
+        # "Reconstruction error (median nan)" —— 读者看到的是一个数，
+        # 而事实是**这张图上的点全是空的**，该说清楚。
+        _n_fin_fig = int(np.isfinite(errors).sum())
+        _err_title = (f"Reconstruction error (median {np.nanmedian(errors):.3f})\n"
+                      "high = signature set cannot explain this spot"
+                      if _n_fin_fig else
+                      "Reconstruction error: **all spots undefined**\n"
+                      f"({len(errors)} spots with counts row-sum <= 0; nothing to show)")
         fig, ax = plt.subplots(figsize=(W_SINGLE, mm(76)))
         s = ax.scatter(xy[:, 0], xy[:, 1], c=errors, s=5, cmap="magma")
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
-        ax.set_title(f"Reconstruction error (median {np.nanmedian(errors):.3f})\n"
-                     f"high = signature set cannot explain this spot")
+        ax.set_title(_err_title)
         fig.colorbar(s, ax=ax, shrink=0.8, label="relative error")
         save_fig(cfg, "03-05-03-unit1-deconvolution-error-map", fig)
 
@@ -794,13 +874,9 @@ def run_05_deconvolution(cfg: dict) -> dict:
     is_deconv = bool(ref_desc.get("is_deconvolution"))
     err_block = None
     if errors is not None:
-        err_block = {
-            "median": round(float(np.nanmedian(errors)), 4),
-            "p95": round(float(np.nanpercentile(errors, 95)), 4),
-            "max": round(float(np.nanmax(errors)), 4),
-            "n_unreliable": n_unreliable,
-            "frac_unreliable": round(n_unreliable / len(errors), 4),
-        }
+        # **全 nan 时不能再报「0 个不可靠」**（E-69 同族 Form A）——
+        # 汇整逻辑抽在 `summarize_reconstruction_error()` 里，那里有完整理由。
+        err_block = summarize_reconstruction_error(errors, max_err)
 
     common_limits = [
         "Visium 的 spot 含 1-10 个细胞，所以即使组成准确，"
@@ -817,8 +893,15 @@ def run_05_deconvolution(cfg: dict) -> dict:
             "NNLS 没有似然模型，无法给出每个估计的不确定性"
             "（RCTD / cell2location 有）",
             "比例之和被强制为 1，所以一个类型的比例被高估会压低其他类型",
-            f"重建误差中位 {err_block['median']:.3f}；误差大的 spot 说明"
-            "这套参考解释不了它 —— 看 deconvolution_error_map",
+            # **`median` 可能是 `None`，格式化前必须判**（E-69 同族 Form A）：
+            # `f"{None:.3f}"` 抛 `TypeError` —— 一个「算不出来」的诊断信息
+            # 变成整步崩溃，是最不该发生的连锁。
+            (f"重建误差中位 {err_block['median']:.3f}；误差大的 spot 说明"
+             "这套参考解释不了它 —— 看 deconvolution_error_map"
+             if err_block["error_defined"] else
+             "**重建误差一个都算不出来**（全是空 spot）—— "
+             "所以这一轮没有「误差大的 spot」这个结论可下，"
+             "见 `reconstruction_error.undefined_note`"),
         ]
         # §3.3 点名工具真的跑了 / 启用了但没跑成 —— 两种都要说出来
         if c2l_info.get("status") == "ok":

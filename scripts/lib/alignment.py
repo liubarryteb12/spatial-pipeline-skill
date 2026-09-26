@@ -37,7 +37,6 @@ scripts/lib/alignment.py — spot 坐标与 H&E 图像的定量对齐验证
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 
@@ -214,10 +213,21 @@ def verify_alignment(adata, log_info=None, log_warn=None) -> dict:
 
 
 def write_alignment_check(adata, data_dir, log_info=None, log_warn=None) -> dict:
-    """验证并把结果写到 data_dir/spatial_alignment_check.json。"""
+    """验证并把结果写到 data_dir/spatial_alignment_check.json。
+
+    **走 `common.write_json`，不自己 `json.dumps`**（E-69）。这里原先直接
+    `out.write_text(json.dumps(res, ...))` —— 与 `common.write_json` 一样
+    没有 `allow_nan=False`，是全仓**唯一绕过公共写盘函数**的地方。虽然
+    `verify_alignment()` 当前的几条路径都收口了（`if nn.size == 0: return
+    {"cv": None}`、`best_key = gs if gs is not None else -99.0`），但
+    "目前不可达"不等于"安全"：判据将来加一条就可能把裸 `NaN` 写进
+    artifact。**写盘只该有一个入口**，否则每加一处收口都要记得改两遍。
+    """
+    from common import write_json  # 延迟 import，避免与 00_fetch 的导入顺序耦合
+
     res = verify_alignment(adata, log_info=log_info, log_warn=log_warn)
     out = Path(data_dir) / "spatial_alignment_check.json"
-    out.write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(out, res)
     if log_info:
         log_info(f"写出 {out}")
     return res

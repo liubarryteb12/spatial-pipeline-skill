@@ -46,8 +46,8 @@ import pandas as pd  # noqa: E402
 import scanpy as sc  # noqa: E402
 import scipy.sparse as sp  # noqa: E402
 
-from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
-                    log_warn, parse_args, probe_named_tools,
+from common import (df_to_records, ensure_dirs, finite_round, load_config,  # noqa: E402
+                    log_info, log_warn, parse_args, probe_named_tools,
                     reconstruct_counts_from_raw, record_step,
                     save_fig, set_seed, write_json,
                     spatial_xy, W_ONE_HALF, W_SINGLE, mm, PAL,)
@@ -486,8 +486,16 @@ def compare_with_spatialde(sd: pd.DataFrame, res: pd.DataFrame,
             rho, p = spearmanr(m.loc[common].values,
                                sub.set_index("g").loc[common, "FSV"].values)
             out[f"{grp}_n"] = len(common)
-            out[f"{grp}_spearman_rho"] = round(float(rho), 4)
-            out[f"{grp}_spearman_p"] = float(p)
+            # **`round(float(rho), 4)` 会把 nan 原样落盘**（E-69 同族 Form A/C）：
+            # 输入里只要有一侧是常量列，`spearmanr` 就返回 nan。落成 `None`
+            # 而不是 `nan` —— 下游 `is not None` 才挡得住（见 main_analysis.py
+            # 的 `svg:spatialde_vs_morans`）。
+            out[f"{grp}_spearman_rho"] = finite_round(rho, 4)
+            out[f"{grp}_rho_defined"] = out[f"{grp}_spearman_rho"] is not None
+            # p 值**不能四舍五入** —— `1e-30` 会被舍成 0.0，那是把「极显著」
+            # 写成「完全不可能」。只做非有限值收口。
+            _p = float(p)
+            out[f"{grp}_spearman_p"] = _p if math.isfinite(_p) else None
         out["interpretation"] = (
             "SpatialDE 用高斯过程似然比，**不需要空间权重矩阵**；"
             "Moran's I 依赖权重矩阵。两者一致说明空间结构不是权重选择的产物。"

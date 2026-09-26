@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import re
 import sys
 import time
@@ -217,6 +218,28 @@ def _dig(obj, path):
     return cur
 
 
+def _dig_present(obj, path):
+    """和 `_dig()` 一样取值，但**同时告诉调用方"这个键在不在"**。
+
+    **为什么必须分开。** `_dig()` 对"键不存在"和"键存在、值恰好是 `None`"
+    返回同一个 `None` —— 而这两种处境在这里含义相反：
+
+      * `normalize_status.json` 的 `hvg_fallback` 值是 `None` 表示
+        **"没有发生回退"**（好事），键不存在表示**产生端不再写这个字段**
+        （坏事）；
+      * 若用 `_dig()`，好事会被当成"字段丢了"，于是给每一轮正常跑完的
+        job 判红 —— 一个永远红的门禁（E-29）。
+
+    返回 `(found, value)`；`found` 为假时 `value` 一定是 `None`。
+    """
+    cur = obj
+    for k in path:
+        if not isinstance(cur, dict) or k not in cur:
+            return False, None
+        cur = cur[k]
+    return True, cur
+
+
 def _iter_nested_status(obj, path=()):
     """递归产出所有名为 `status` 的字段：`(路径, 值, 同级 reason)`。
 
@@ -411,6 +434,221 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
         p = res_dir / f
         chk(f"result:{f}", "required", p.exists(), f"{f} {'存在' if p.exists() else '缺失'}")
 
+    # ---- honesty/content: **只写不读**的状态字段（E-69 Form B）--------------
+    #
+    # 审计（`D:\tmp\_e69\REPORT.md`）实测：15 个字段**全仓零读者** ——
+    # 产生端老老实实写了，验收层从头到尾不看一眼。根因就是上面那圈
+    # `result:*status.json` 只查"文件在不在"，而**坏值和"这一项不存在"
+    # 在验收层长得一模一样**（都是没人说话）。
+    #
+    # **不是所有状态字段都需要代码读者。** 状态文件本来就是给人读的，
+    # `coordinate_note` / `coord_coverage_note` 这种纯说明文字没有判据可写，
+    # 不该硬造一条检查出来。下面这些不同：它们的取值直接决定"这一轮的分析
+    # **前提**还成不成立"，而前提塌了却全绿，正是本仓库反复踩的形态
+    # （E-48 的空白图、E-49 的溢出 WARN、E-69 的 `nan is not None`）。
+    #
+    # 判据返回 `None` = "本轮没有这一项"，`opt=True` 的字段走这个分支
+    # **不判红**（不是每个数据集都会走到那个分支：内置参考没有
+    # `used_counts_layer`，没丢基因就没有 `n_genes_dropped`）——
+    # 但 detail 必须写明是"**没记录**"而不是"检查过了"，否则读者分不清
+    # "没问题"和"没检查"（本仓库的规则：两者不能长得一样）。
+    # `opt=False` 的字段是**无条件写出**的，取不到就说明产生端不再写了，
+    # 那是真缺陷。
+    #
+    # **但"无条件写出"有个前提：那一步真的跑了。** 这一步的正文没执行到，
+    # 字段当然不存在，**不是"产生端不再写了"**。而"没执行到"的形态有一打：
+    # `04_svg.py` 有 `disabled`/`not_available`/`failed`，`05` 有
+    # `not_done`/`needs_reference`/`no_usable_signature`，`06` 有
+    # `disabled`/`missing_domains`/`not_available`，`07` 有
+    # `disabled`/`no_usable_pairs`，`08` 有 `disabled`/`not_available`/
+    # `not_applicable`/`missing_pca`/`bad_root`/`failed`（实测 12 种）。
+    #
+    # **所以判据不能写成"父状态在黑名单里就跳过"** —— 黑名单必然漏，
+    # 而漏掉的那一种会让一个合法配置把验收判红（把"设计如此"当"出错了"，
+    # 与 `manifest_summary()` docstring 同一条），更糟的是新增状态值时会
+    # **静默**落进"字段丢了"分支，给出一条诊断错误的提示。
+    # 改成**白名单**：父状态是 `ok`（或文件压根没有 `status` 键，
+    # 如 `dataset_info.json`）才逐字段判；其余一律跳过并写明是哪种状态。
+    # 这样以后新增状态值会**自动**被跳过，不会假红。
+    #
+    # 尤其 `failed`/`bad_root`：那时字段缺失是**后果**不是**原因**，而失败
+    # 本身已经由 `status:nested` 判红了 —— 这里再红一次只会给出一条
+    # 指向错误方向的提示。
+    _PROBE_PARENT_OK = (None, "ok")
+    _PARENT_NOT_EXECUTED = {
+        "disabled": "本轮该步骤未启用",
+        "skipped": "本轮该步骤未启用",
+        "not_configured": "本轮该步骤未配置",
+        "not_done": "本轮该步骤未执行",
+        "not_applicable": "本轮该步骤不适用",
+        "not_available": "本轮该步骤的输入不可得",
+        "needs_reference": "本轮缺参考数据，该步骤没跑",
+        "no_usable_signature": "本轮没有可用的 signature，该步骤没跑",
+        "no_usable_pairs": "本轮没有可用的 LR 对，该步骤没跑",
+        "missing_domains": "本轮缺空间域结果，该步骤没跑",
+        "missing_pca": "本轮缺 PCA 嵌入，该步骤没跑",
+        "bad_root": "本轮根节点选择不可靠，该步骤没继续",
+        "failed": "本轮该步骤**没跑成**",
+        "error": "本轮该步骤**没跑成**",
+        "fail": "本轮该步骤**没跑成**",
+    }
+    #
+    # **`severity` 必须走关键字。** `chk(cid, kind, ok, detail, severity=)`
+    # 的第二个位置参数是 `kind` 不是 `severity` —— 两者同名同型又相邻，
+    # 传错**不会报任何错**，只会把 `honesty`/`content` 记进 `kind` 而
+    # severity 默默取默认值 `required`。Q-27 已经踩过一次（`bad_root` /
+    # `not_applicable` / `missing_pca` 全被记成 `required`），这里
+    # 一律显式写 `severity=`。
+    _probes = [
+        dict(cid="status:input_is_counts", base="data",
+             f="dataset_info.json", path=("counts_check", "is_counts"),
+             kind="honesty", severity="honesty", opt=False,
+             fn=lambda v: None if v is None else (v is not False),
+             good="输入矩阵判定为原始计数",
+             bad="**输入不是原始计数**（`counts_check.is_counts=False`）—— "
+                 "下游凡是假设计数的步骤（SpatialDE 的 VST、解卷积的 counts "
+                 "层）前提都不成立"),
+        dict(cid="status:coords_dropped", base="data",
+             f="dataset_info.json", path=("n_spots_dropped_no_coords",),
+             kind="content", severity="content", opt=False,
+             fn=lambda v: isinstance(v, int),
+             good=lambda v: (f"{v} 个 spot 因在位置文件里找不到坐标被剔除"
+                             + ("（`filtered` 矩阵下通常为 0）" if v == 0 else
+                                " —— 见 dataset_info.json 的 coord_coverage_note")),
+             bad="`n_spots_dropped_no_coords` 不是整数 —— 静默剔除的 spot "
+                 "数量不可知"),
+        dict(cid="status:hvg_flavor", base="results",
+             f="normalize_status.json", path=("hvg_fallback",),
+             kind="honesty", severity="honesty", opt=True,
+             fn=lambda v: v is None,
+             good="HVG flavor 按要求生效，没有回退",
+             bad=lambda v: (f"**HVG flavor 回退了**：{v} —— 配置要求的 flavor "
+                            "没生效，HVG 是用另一套方法选的，下游对 HVG 的"
+                            "解释要跟着改")),
+        dict(cid="status:full_gene_counts", base="results",
+             f="normalize_status.json",
+             path=("counts_layer", "full_gene_counts_available"),
+             kind="honesty", severity="honesty", opt=False,
+             fn=lambda v: v is not False,
+             good="落盘的 counts 层可用，全基因集计数也能从 `adata.raw` 取",
+             bad="**全基因集计数不可得** —— 解卷积与重建误差只能退回 HVG "
+                 "子集，而 HVG 是**按方差选的**，不是随机子集"),
+        dict(cid="status:svg_gene_subset", base="results",
+             f="svg_status.json", path=("max_genes_cap",),
+             kind="honesty", severity="honesty", opt=False,
+             fn=lambda v: bool(v),
+             good=lambda v: (f"SpatialDE 跑在全基因集按方差取前 {v} 个 —— "
+                             "**不是全基因集**，未入选的基因没有被检验过"),
+             bad="`max_genes_cap` 取不到 —— 读者无法知道 SpatialDE 跑的是"
+                 "全基因集还是退回的 HVG 子集"),
+        dict(cid="status:svg_gene_selection", base="results",
+             f="svg_status.json", path=("gene_selection",),
+             kind="honesty", severity="honesty", opt=False,
+             fn=lambda v: isinstance(v, str) and bool(v.strip()),
+             good=lambda v: f"基因子集来源已写明：{v}",
+             bad="没有写明基因子集来源 —— 一个 FSV 排名在"
+                 "「全基因集」和「HVG 子集」上不可比"),
+        dict(cid="status:svg_genes_dropped", base="results",
+             f="svg_status.json", path=("n_genes_dropped",),
+             kind="content", severity="content", opt=True,
+             fn=lambda v: v == 0,
+             good="没有基因被 `get_mll_results` 丢掉",
+             bad=lambda v: (f"**SpatialDE 丢了 {v} 个基因**（NaN 行会被 merge "
+                            "静默丢弃）—— 见 `genes_dropped_examples`；"
+                            "VST 输入不是原始计数时就会这样")),
+        dict(cid="status:proportions_truncated", base="results",
+             f="deconvolution_status.json",
+             path=("n_proportion_values_truncated",),
+             kind="content", severity="content", opt=False,
+             fn=lambda v: v == 0,
+             good="比例矩阵没有被截断",
+             bad=lambda v: (f"**{v} 个比例值被 `min_proportion` 截断** —— "
+                            "截断把「测不出来」改写成「确实是 0」，"
+                            "下游的组成比较会受影响")),
+        dict(cid="status:deconv_matrix_source", base="results",
+             f="deconvolution_status.json",
+             path=("reference", "used_counts_layer"),
+             kind="honesty", severity="honesty", opt=True,
+             fn=lambda v: v is not False,
+             good="解卷积用的是参考数据的计数层",
+             bad="**解卷积退回了 `.X`（log 值）** —— 「退回 log 值」这个错误"
+                 "前提会一路静默到比例上"),
+        dict(cid="status:niche_spot_alignment", base="results",
+             f="niche_status.json",
+             path=("celltype_spot_alignment", "same_spot_set"),
+             kind="content", severity="content", opt=True,
+             fn=lambda v: v is not False,
+             good="niche 与 proportions 用的是同一组 spot",
+             bad="**spot 集合不一致** —— niche 富集分析用的细胞类型比例来自"
+                 "另一组 spot，两边的「同一个 spot」不是同一个"),
+        dict(cid="status:smoothing_improves", base="results",
+             f="spatial_trajectory_status.json",
+             path=("spatial_smoothing_improves_coherence",),
+             kind="honesty", severity="honesty", opt=False,
+             fn=lambda v: v is not False,
+             good="空间平滑提高了连贯性（Moran's I 增益见 `morans_I_gain`）",
+             bad="**空间平滑没有提高连贯性**（Moran's I 反而下降）—— "
+                 "「空间感知的拟时序比朴素的好」这个前提在本数据集上不成立，"
+                 "下游结论要按此打折"),
+        # **这一条是上面那条的"前提守卫"。** `spatial_smoothing_improves_
+        # coherence` 是个布尔量：两个 Moran's I 都是 nan 时 `nan > nan` 为假，
+        # 它照样写 `False` —— 于是**"判不了"被写成了"没改善"**，而这两句话
+        # 的排查方向完全相反（前者查输入是不是常量，后者调平滑参数）。
+        # 产生端现在另外写 `morans_I_defined`；没有它，上面那条 `is not False`
+        # 就在替一个**没有定义**的量背书。
+        dict(cid="status:morans_I_defined", base="results",
+             f="spatial_trajectory_status.json", path=("morans_I_defined",),
+             kind="honesty", severity="honesty", opt=False,
+             fn=lambda v: v is True,
+             good="两个 Moran's I 都算得出来，「平滑是否提高连贯性」这个判断"
+                  "有定义",
+             bad="**两个 Moran's I 至少有一个算不出来** —— 所以这一轮"
+                 "**没有「平滑是否提高连贯性」这个结论可下**；"
+                 "`spatial_smoothing_improves_coherence=False` 要读作"
+                 "「判不了」，不是「没改善」（见 `morans_I_undefined_note`）"),
+    ]
+    for _pb in _probes:
+        _root = data_dir if _pb["base"] == "data" else res_dir
+        _p = _root / _pb["f"]
+        _v, _found, _parent = None, False, None
+        if _p.exists():
+            try:
+                _doc = json.loads(_p.read_text(encoding="utf-8"))
+                _parent = _doc.get("status") if isinstance(_doc, dict) else None
+                # **用 `_dig_present` 而不是 `_dig`** —— 见它的 docstring：
+                # `hvg_fallback=None` 是"没回退"（好事），不是"字段没了"。
+                _found, _v = _dig_present(_doc, _pb["path"])
+            except Exception as e:  # noqa: BLE001
+                chk(_pb["cid"], _pb["kind"], False, f"读取失败: {e}", severity=_pb["severity"])
+                continue
+        _loc = f"{_pb['f']} 的 `{'.'.join(_pb['path'])}`"
+        if _parent not in _PROBE_PARENT_OK:
+            # 白名单之外：这一步的正文没执行到，字段当然不存在。措辞按
+            # 具体状态给（见 `_PARENT_NOT_EXECUTED`）—— 未知状态也照样跳过，
+            # 但要把状态值原样打出来，便于发现"产生端新增了一个我没见过的
+            # 状态"。**跳过不是"没问题"**，所以 detail 必须说清这一点。
+            _why = _PARENT_NOT_EXECUTED.get(_parent, "本轮该步骤状态不是 `ok`")
+            chk(_pb["cid"], _pb["kind"], True,
+                f"{_why}（{_pb['f']} status={_parent!r}）—— "
+                f"不是「{_loc} 没问题」，是这一步**没有执行到写出该字段的地方**",
+                severity=_pb["severity"])
+            continue
+        if not _found:
+            _ok = bool(_pb["opt"])
+            chk(_pb["cid"], _pb["kind"], _ok,
+                (f"本轮没有这一项（{_loc}）" if _ok else
+                 f"**取不到 {_loc}** —— 这个字段是**无条件写出**的，"
+                 f"取不到说明产生端不再写了（E-69 Form B：只写不读的字段"
+                 f"消失了，没有任何检查看得见）"), severity=_pb["severity"])
+            continue
+        _r = _pb["fn"](_v)
+        _txt = (lambda x: x(_v) if callable(x) else x)
+        if _r is None:
+            chk(_pb["cid"], _pb["kind"], True, f"本轮不适用：{_txt(_pb['good'])}", severity=_pb["severity"])
+        else:
+            chk(_pb["cid"], _pb["kind"], bool(_r),
+                _txt(_pb["good"]) if _r else _txt(_pb["bad"]), severity=_pb["severity"])
+
     # ---- required: 图 -------------------------------------------------------
     #
     # **从"数量够不够"换成"声明过的每张图在不在"。** 旧判据是
@@ -557,12 +795,28 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
                 + (f"，{sd.get('n_genes_run')} 个基因" if st == "ok" else ""))
             cmp_ = json.loads(sp.read_text(encoding="utf-8")) \
                 .get("spatialde_vs_morans_i") or {}
+            # **`bg is not None` 挡不住 nan**（E-69 同族 Form A，与
+            # `content:spatial_traj_comparison` 逐字同形）：`nan is not None`
+            # 为真，于是背景组 rho 算不出来时这条 honesty 检查照样 PASS，
+            # detail 还打印「背景组 rho=nan」—— 读起来像「量化过了，很低」。
+            # 压掉的两种处境**排查方向相反**：①rho 算出来且很低 = 科学结论
+            # （空间结构依赖权重矩阵）②rho 算不出来 = `spearmanr` 输入常量
+            # （`spatial_score` 列退化）。
+            # 产生端已在 `04_svg.py` 用 `finite_round` 收口并落
+            # `<grp>_rho_defined`；这里按「有定义」判，而不是按「不是 None」。
             bg = cmp_.get("background_spearman_rho")
-            chk("svg:spatialde_vs_morans", "honesty", bg is not None,
+            _bg_finite = isinstance(bg, (int, float)) and math.isfinite(bg)
+            _bg_defined = bool(cmp_.get("background_rho_defined", bg is not None))
+            chk("svg:spatialde_vs_morans", "honesty", _bg_finite,
                 (f"与 Moran's I 的一致性：背景组 rho={bg}"
                  f"（top 组 {cmp_.get('top_morans_spearman_rho')}）"
-                 if bg is not None else
-                 f"未量化：{cmp_.get('reason', '缺 spatialde_vs_morans_i')}"))
+                 if _bg_finite else
+                 (f"**背景组 rho 算不出来**（top 组 "
+                  f"{cmp_.get('top_morans_spearman_rho')}）—— 这不是"
+                  f"「一致性低」，是**这个对比没有定义**：`spatial_score` "
+                  f"那一列退化成常量时 Spearman 无定义"
+                  if _bg_defined or bg is not None else
+                  f"未量化：{cmp_.get('reason', '缺 spatialde_vs_morans_i')}")))
         except Exception as e:  # noqa: BLE001
             chk("svg:spatialde", "honesty", False, f"读取失败: {e}")
 
@@ -970,6 +1224,34 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
                 f"({frac:.2f})" if ok else "**没有报可用 LR 对数**",
                 severity="honesty")
 
+            # ---- content: z 的「可判定性」必须有人看（E-69）-----------------
+            #
+            # **`z_score` 此前只被排序、没人判它有没有定义**：零模型退化
+            # （`n_near=0` 或置换标准差为 0）时 `z=nan`，`sort_values` 把它
+            # 排在**最后** —— 与「测出来 z 很低」同一侧。于是「这个量算不出来」
+            # 被读成「这对 LR 最不富集」，而两者处理方式相反：
+            # 前者去查 `max_distance_um` 阈值，后者才是生物学结论。
+            # 判据：`n_z_undefined` 与 `n_z_defined` 必须都在，且**有未定义
+            # 的对时必须说明原因**（不能只报一个数）。
+            _zu = d.get("n_z_undefined")
+            _zd = d.get("n_z_defined")
+            if _zu is None or _zd is None:
+                chk("content:communication_z_defined", "content", False,
+                    "**status 里没有 `n_z_defined` / `n_z_undefined`** —— "
+                    "无法区分『z 算出来很小』与『z 根本没算出来』",
+                    severity="content")
+            elif _zu:
+                chk("content:communication_z_defined", "content", False,
+                    f"**{_zu}/{_zd + _zu} 对 LR 的 z-score 算不出来**"
+                    f"（只有 {_zd} 对有定义）—— 它们在排序里落到最末，"
+                    f"会被误读成「最不富集」；"
+                    f"{str(d.get('z_undefined_note'))[:150]}",
+                    severity="content")
+            else:
+                chk("content:communication_z_defined", "content", True,
+                    f"全部 {_zd} 对 LR 的 z-score 都有定义（无零模型退化）",
+                    severity="content")
+
     # ---- honesty: 解卷积必须标明是不是真解卷积 ----
     p = res_dir / "deconvolution_status.json"
     if p.exists():
@@ -980,6 +1262,50 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
                 f"is_deconvolution={d.get('is_deconvolution')}；{str(d.get('method'))[:90]}"
                 if ok else "**没有标明是真解卷积还是打分法**",
                 severity="honesty")
+
+            # ---- content: 重建误差的「可判定性」必须有人看（E-69）----------
+            #
+            # **`n_unreliable` / `frac_unreliable` 此前在全仓 0 消费者**
+            # （只写不读）—— 于是「一个 spot 都没算出来」与「所有 spot 都
+            # 可靠」在验收层完全一样：两者都是 `n_unreliable=0`。
+            # 这正是 E-68 的形态：**标出来的状态没有消费者等于没标**。
+            #
+            # 判据分三种处境，**不是一句布尔**：
+            #   - 真解卷积 + `error_defined=True`  -> PASS，报中位与不可靠数
+            #   - 真解卷积 + `error_defined=False` -> **红**（全空 spot）
+            #   - 真解卷积 + 没有 `reconstruction_error` 块 -> **红**（没落盘）
+            #   - 打分法（`is_deconvolution=False`）-> 不适用，不判红
+            #     （打分法没有重建误差这个诊断量，是**方法性质**不是缺陷）
+            is_dec = bool(d.get("is_deconvolution"))
+            errb = d.get("reconstruction_error")
+            if not is_dec:
+                chk("content:deconv_error_defined", "content", True,
+                    "打分法（非解卷积）没有重建误差这个诊断量 —— "
+                    "**不适用**，不是缺陷（见 `is_deconvolution=False`）",
+                    severity="honesty")
+            elif not isinstance(errb, dict):
+                chk("content:deconv_error_defined", "content", False,
+                    "**真解卷积却没有 `reconstruction_error` 块** —— "
+                    "重建误差一个数都没落盘，读者无从判断这些比例可不可信",
+                    severity="content")
+            else:
+                _ed = bool(errb.get("error_defined"))
+                _n_ok = errb.get("n_spots_with_error")
+                _n_all = errb.get("n_spots_total")
+                _nu = errb.get("n_unreliable")
+                _fr = errb.get("frac_unreliable")
+                if _ed:
+                    chk("content:deconv_error_defined", "content", True,
+                        f"重建误差可判定 {_n_ok}/{_n_all} 个 spot"
+                        f"（中位 {errb.get('median')}），{_nu} 个不可靠"
+                        f"（占可判定样本 {_fr}）",
+                        severity="content")
+                else:
+                    chk("content:deconv_error_defined", "content", False,
+                        f"**{_n_all} 个 spot 的重建误差全部算不出来** —— "
+                        f"`n_unreliable={_nu}` 不代表都可靠，是**没有可判定的"
+                        f"样本**；{str(errb.get('undefined_note'))[:160]}",
+                        severity="content")
 
     # ---- honesty: §3.3 点名的 cell2location 落地状态必须自洽 ------------------
     #
@@ -1053,15 +1379,29 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
     if p.exists():
         d = json.loads(p.read_text(encoding="utf-8"))
         if d.get("status") == "ok":
-            has_both = (d.get("morans_I_expression_only") is not None
-                        and d.get("morans_I_spatially_smoothed") is not None)
+            # **`is not None` 挡不住 nan**（E-69 同族 Form A）：`nan is not None`
+            # 为真，于是两个 Moran's I 都算不出来时这条检查照样 PASS，
+            # detail 还会打印「Moran's I nan -> nan（增益 nan）」—— 读起来像
+            # 「算了，增益接近 0」，实际是「一个都没算出来」。
+            # 修法：显式 `isfinite`，并**把「算不出来」单独报出来**。
+            _mi_e = d.get("morans_I_expression_only")
+            _mi_s = d.get("morans_I_spatially_smoothed")
+            _mi_ok = (isinstance(_mi_e, (int, float)) and isinstance(_mi_s, (int, float))
+                      and math.isfinite(_mi_e) and math.isfinite(_mi_s))
+            has_both = _mi_ok
+            if _mi_ok:
+                _mi_detail = (f"Moran's I 朴素 {_mi_e} → "
+                              f"空间感知 {_mi_s}（增益 {d.get('morans_I_gain')}）")
+            elif _mi_e is None and _mi_s is None:
+                _mi_detail = ("**没有记录朴素 vs 空间感知的对比数值** —— "
+                              "那就只剩一个排序，说明不了空间感知有没有用")
+            else:
+                _mi_detail = (f"**两个 Moran's I 有一个算不出来**：朴素={_mi_e}、"
+                              f"空间感知={_mi_s} —— 这不是「增益接近 0」，"
+                              f"是**这个对比没有定义**（常数列 / 全零表达会让 "
+                              f"Moran's I 无定义）")
             chk("content:spatial_traj_comparison", "content", has_both,
-                f"Moran's I 朴素 {d.get('morans_I_expression_only')} → "
-                f"空间感知 {d.get('morans_I_spatially_smoothed')}"
-                f"（增益 {d.get('morans_I_gain')}）" if has_both
-                else "**没有记录朴素 vs 空间感知的对比数值** —— "
-                     "那就只剩一个排序，说明不了空间感知有没有用",
-                severity="content")
+                _mi_detail, severity="content")
             # **S3：沿空间拟时序的基因分析也要有人看。**
             # 那段整块包在 `try/except` 里只 `log_warn`，而
             # `spatial_trajectory_genes.csv` 在本文件里没有任何消费者 ——
@@ -1121,10 +1461,35 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
                if msum["inputs_missing_required"] else "，必需项齐全")
             + (f"（可选缺失 {','.join(msum['inputs_missing'])}）"
                if msum["inputs_missing"] else ""))
+        # ---- §0.4 人工复核节点：**判据不能写死 `True`** ---------------------
+        #
+        # 原写法是 `chk("manifest:human_review", "honesty", True, ...)` ——
+        # 第三个位置参数是 `ok`（`chk(cid, kind, ok, detail, severity=)`），
+        # 写死 `True` 就是**一条永远 PASS 的检查**，而 `human_review_pending`
+        # 在全仓**只有这一个读点** ⇒ 这个状态从头到尾没人消费。
+        # 与 `:729-734` 的 `honesty:named_tools_never_probed`（已从写死 True
+        # 改成真实条件）是同一处漏改（E-69 同族：**恒真判据**）。
+        #
+        # 但**也不能直接拿 `pend` 判红**：`record_human_review()` 的默认
+        # status 就是 `pending`（"自动化流水线不能替人签字"），所以任何一轮
+        # 自动化跑完 `pend` 都非空 —— 拿它判红等于给每个 job 判失败，
+        # 那就成了 E-29 的"永远红的门禁等于没有门禁"。
+        #
+        # 判**流水线真的能控制的东西**：节点有没有被登记进清单。
+        # 一个都没登记 = `HUMAN_REVIEW_NODES` 那个循环没跑（被删了 /
+        # 提前 return / 写错了字段名）—— 那是真缺陷，必须红。
+        # 登记了但全是 pending = 设计如此，只报数，不阻断。
         pend = msum["human_review_pending"]
-        chk("manifest:human_review", "honesty", True,
-            f"{len(pend)} 个人工复核节点待确认（不阻断 job）："
-            + (", ".join(pend) if pend else "全部已确认"))
+        _n_hr = msum.get("n_human_review", 0)
+        _n_conf = len(msum.get("human_review_confirmed") or [])
+        chk("manifest:human_review", "honesty", _n_hr > 0,
+            (f"{len(pend)}/{_n_hr} 个人工复核节点待确认"
+             f"（{_n_conf} 个已确认；不阻断 job）："
+             + (", ".join(pend) if pend else "全部已确认"))
+            if _n_hr > 0 else
+            "**清单里一个人工复核节点都没有** —— `HUMAN_REVIEW_NODES` "
+            "那个登记循环没跑到（不是「全部已确认」：已确认会体现在 "
+            "`human_review_confirmed` 里）")
         # ---- §0.2 跨语言转换：**空数组必须被解释** ------------------------
         #
         # 本仓库全程 Python（输入是 10x Cell Ranger 的 h5，Part 2 交接的

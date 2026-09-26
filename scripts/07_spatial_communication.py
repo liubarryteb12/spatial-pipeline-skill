@@ -37,11 +37,76 @@ import scanpy as sc  # noqa: E402
 import scipy.sparse as sp  # noqa: E402
 import yaml  # noqa: E402
 
-from common import (df_to_records, ensure_dirs, load_config, log_info,  # noqa: E402
+from common import (df_to_records, ensure_dirs, finite_round,  # noqa: E402
+                    load_config, log_info,
                     log_warn, parse_args, probe_named_tools, record_step, save_fig,
                     set_seed,
                     write_json, spatial_xy, W_ONE_HALF, mm,
                     PAL,)
+
+
+def _r5(x):
+    """四舍五入到 5 位；**非有限值落 `None`**（E-69 同族 Form C）。
+
+    薄壳，逻辑在 `common.finite_round` —— **全仓只有一份收口实现**。
+    保留本名字是因为调用点较多，且 `_r5` 是 5 位的语义标记。
+    """
+    return finite_round(x, 5)
+
+
+def top_lr_for_plots(lr_df, n: int = 3):
+    """从 LR 打分表里选出用于空间图谱的对：**只取 z 有定义的**（E-69）。
+
+    抽成纯函数有两个理由（AGENTS 规则 30.1 / E-63）：
+
+    1. 自检要能调真代码，不能重写一遍判据；
+    2. 调用点原先直接 `lr_df[lr_df["z_score"].notna()].head(3)` 然后
+       `np.concatenate(...)` —— **全部 z 都算不出来时它返回空表，
+       `np.concatenate([])` 抛 `ValueError: need at least one array to
+       concatenate`**，「一个量算不出来」的处境变成整步崩溃。
+
+    返回的可能是空表，调用方**必须判 `empty`**。这里不抛错：空是合法状态
+    （零模型退化时没有可展示的对），该由调用方决定怎么报。
+    """
+    return lr_df[lr_df["z_score"].notna()].head(n)
+
+
+def spatial_z_score(near_mean: float, perm_means: list) -> tuple:
+    """由近邻均值与零模型置换样本算 z，**并显式报告「算不出来」**（E-69）。
+
+    返回 `(null_mu, null_sd, z, z_reason)`，四态：
+
+    - 置换样本**全是 nan**（`flat` 为空或 `n_near=0`）：`null_sd=None`、
+      `z=None`，原因是「零模型退化」。原实现写
+      `null_sd = float(np.nanstd(perm_means)) or 1e-9` —— **`or` 对 nan 无效**：
+      `bool(nan)` 是 `True`，所以 `nan or 1e-9` 仍是 `nan`，于是
+      `z = (near_mean - null_mu) / nan` 得 nan，四个 `round()` 全部落裸 nan，
+      **「零模型抽不出样本」与「z 恰好很小」在产物里长得一样**。
+    - 置换标准差**恰好为 0**：`null_sd=0.0`、`z=None`。z 没有定义（不是 0）——
+      所有置换给出同一个均值时，分母为 0。
+    - `near_mean` 是 nan（阈值内一个 spot 对都没有）：`z=None`。
+    - 正常：`z` 是有限浮点。
+
+    **抽成纯函数是为了让自检能调真代码**（AGENTS 规则 30.1 / E-63）。
+    """
+    null_mu = (float(np.nanmean(perm_means))
+               if np.isfinite(perm_means).any() else float("nan"))
+    sd_raw = float(np.nanstd(perm_means))
+    if not np.isfinite(sd_raw):
+        return (null_mu, None, None,
+                "零模型的置换样本全部是 nan（`flat` 为空或 `n_near=0`），"
+                "`null_sd` 算不出来 —— 这不是「z 很小」，是「这个量在这里"
+                "没有定义」，排查方向是看 `n_spot_pairs_within_threshold` "
+                "与 `max_distance_um` 是否把阈值设得比最近邻还小")
+    if sd_raw == 0.0:
+        return (null_mu, 0.0, None,
+                "零模型的置换标准差恰好为 0 —— 所有置换给出同一个均值，"
+                "z 没有定义（不是 0）")
+    if not np.isfinite(near_mean):
+        return (null_mu, sd_raw, None,
+                "近邻对均值为 nan（`n_near=0`，阈值内一个 spot 对都没有）—— "
+                "`z` 算不出来")
+    return (null_mu, sd_raw, float((near_mean - null_mu) / sd_raw), None)
 
 
 def load_lr_pairs(cfg: dict):
@@ -190,23 +255,35 @@ def run_07_spatial_communication(cfg: dict) -> dict:
             perm_means = [float(flat[d].mean()) for d in draw]
         else:
             perm_means = [float("nan")] * n_perm
-        null_mu = float(np.nanmean(perm_means))
-        null_sd = float(np.nanstd(perm_means)) or 1e-9
-        z = (near_mean - null_mu) / null_sd
+        null_mu, null_sd, z, z_reason = spatial_z_score(near_mean, perm_means)
         lr_scores.append({
             "ligand": pr["ligand"], "receptor": pr["receptor"],
             "pathway": pr.get("pathway", ""),
-            "near_mean": round(near_mean, 5),
-            "null_mean": round(null_mu, 5),
-            "null_sd": round(null_sd, 5),
-            "z_score": round(float(z), 3),
+            "near_mean": _r5(near_mean),
+            "null_mean": _r5(null_mu),
+            "null_sd": _r5(null_sd),
+            "z_score": None if z is None else round(float(z), 3),
+            "z_defined": z is not None,
+            "z_note": z_reason,
             "frac_ligand": pr["frac_ligand"], "frac_receptor": pr["frac_receptor"],
         })
 
     lr_df = pd.DataFrame(lr_scores).sort_values("z_score", ascending=False)
     lr_df.to_csv(res_dir / "communication_lr_scores.csv", index=False)
-    log_info("空间富集 top5: " + ", ".join(
-        f"{r.ligand}-{r.receptor}(z={r.z_score:.2f})" for r in lr_df.head(5).itertuples()))
+    # **`z_score` 可能是 `None`，格式化前必须判**（E-69 同族 Form A）：
+    # `f"{None:.2f}"` 抛 `TypeError: unsupported format string passed to
+    # NoneType.__format__`，会把整步带崩 —— 一个「算不出来」的诊断信息
+    # 变成一次崩溃，是最不该发生的连锁。
+    _top5_txt = ", ".join(
+        f"{r.ligand}-{r.receptor}(z={r.z_score:.2f})" if r.z_score is not None
+        else f"{r.ligand}-{r.receptor}(z=undefined)"
+        for r in lr_df.head(5).itertuples())
+    log_info("空间富集 top5: " + _top5_txt)
+    if lr_df["z_score"].isna().any():
+        n_undef = int(lr_df["z_score"].isna().sum())
+        log_warn(f"{n_undef}/{len(lr_df)} 对 LR 的 z-score **算不出来**"
+                 f"（零模型退化，见 communication_status.json 的 z_note）"
+                 f"—— 这不是「z 很小」，排序里它们不该被读成「最不富集」")
 
     # ---- 4. 按域/类型的 LR 强度 ---------------------------------------------
     dom_blocks = []
@@ -258,9 +335,16 @@ def run_07_spatial_communication(cfg: dict) -> dict:
     # 压在条形上（20 条时图例正好盖住中段数据）。
     fig.legend(handles=handles, fontsize=5.5, ncol=1,
                loc="outside right center", frameon=False)
-    colors = [c_up if z > 2 else (c_dn if z < -2 else c_ns)
-              for z in top["z_score"]]
-    ax.barh(range(len(top)), top["z_score"], color=colors)
+    # **z 可能是 `None`（E-69 同族 Form A）**：`null_sd` 算不出来时 `z_score`
+    # 是 `None`，而 `None > 2` 会抛 `TypeError`。排序上 `None` 被 pandas 当作
+    # NaN 排在最后 —— 这是想要的（没定义的 z 不该排进 top），但**画图必须
+    # 显式跳过**，不能假设它一定是浮点。
+    z_vals = top["z_score"]
+    n_z_undef = int(z_vals.isna().sum())
+    colors = [c_ns if (z is None or not np.isfinite(z))
+              else (c_up if z > 2 else (c_dn if z < -2 else c_ns))
+              for z in z_vals]
+    ax.barh(range(len(top)), z_vals.fillna(0.0), color=colors)
     ax.set_yticks(range(len(top)))
     ax.set_yticklabels([f"{r.ligand}–{r.receptor}" for r in top.itertuples()],
                        fontsize=7)
@@ -268,34 +352,47 @@ def run_07_spatial_communication(cfg: dict) -> dict:
     ax.axvline(2, color=c_up, ls="--", lw=0.8)
     ax.axvline(-2, color=c_dn, ls="--", lw=0.8)
     ax.set_xlabel("spatial enrichment z-score (near vs random)")
+    # 有 z 没定义时把这件事写在标题里 —— 图上不能只有一根 0 长的灰条。
+    _undef_line = (f"\n{n_z_undef} pair(s) z undefined (see z_note)"
+                   if n_z_undef else "")
     ax.set_title(f"Ligand–receptor spatial enrichment\n"
-                 f"{len(usable)}/{len(pairs)} pairs usable")
+                 f"{len(usable)}/{len(pairs)} pairs usable{_undef_line}")
     save_fig(cfg, "03-07-01-unit1-communication-lr-enrichment", fig)
 
     # 空间表达图：top 3 对
-    sf = float(adata.uns["spatial"][list(adata.uns["spatial"])[0]]
-               ["scalefactors"]["tissue_hires_scalef"])
-    xyp = xy * sf
-    top3 = lr_df.head(3)
     # **单图原则拆分（D-006）**：top3 面板 -> 3 张独立单图（P7 LR 空间图谱
     # 分解链）。共享量程 0->p99 保留，写进各图 title。
+    #
+    # **top3 只从 z 有定义的对里选**（E-69 同族 Form A）：`sort_values` 把
+    # `z_score=None` 排在最后，正常情况下选不到；但如果**有定义的对不足 3 个**，
+    # 未定义的对就会被选进来画一张「z=undefined」的图 —— 那等于把「算不出来」
+    # 当成一个发现展示。
     sf = float(adata.uns["spatial"][list(adata.uns["spatial"])[0]]
                ["scalefactors"]["tissue_hires_scalef"])
     xyp = xy * sf
-    top3 = lr_df.head(3)
-    _prods = []
-    for r in top3.itertuples():
-        _prods.append(X[:, gi[r.ligand]] * X[:, gi[r.receptor]])
-    vmax_lr = float(np.quantile(np.concatenate(_prods), 0.99))
-    DYNAMIC_FIG_BASES = {"02": 3}
-    for ui, r in enumerate(top3.itertuples(), start=1):
-        li, ri_ = gi[r.ligand], gi[r.receptor]
-        prod = X[:, li] * X[:, ri_]
-        fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(62)))
-        s = ax.scatter(xyp[:, 0], xyp[:, 1], c=prod, s=4, cmap="viridis",
-                       vmin=0, vmax=vmax_lr)
-        ax.set_title(f"{r.ligand} × {r.receptor}  z={r.z_score:.2f}\n"
-                     f"shared scale 0 - {vmax_lr:.2f} (ligand × receptor, log1p)")
+    top3 = top_lr_for_plots(lr_df, 3)
+    # **`top3` 可能是空的**（E-69 同族 Form A）：如果**所有** LR 对的 z 都算不出来
+    # （零模型退化），过滤后是 0 行，于是 `np.concatenate([])` 抛
+    # `ValueError: need at least one array to concatenate` —— 「一个量算不出来」
+    # 的处境变成整步崩溃。这不是理论情况：只要 `max_distance_um` 设得比最近邻
+    # 距离还小，`n_near=0` 就会让全部 z 无定义。
+    if top3.empty:
+        log_warn("所有 LR 对的 z-score 都算不出来 —— 跳过 top3 空间图谱"
+                 "（没有可展示的对；见 communication_status.json 的 z_note）")
+    else:
+        _prods = []
+        for r in top3.itertuples():
+            _prods.append(X[:, gi[r.ligand]] * X[:, gi[r.receptor]])
+        vmax_lr = float(np.quantile(np.concatenate(_prods), 0.99))
+        DYNAMIC_FIG_BASES = {"02": 3}
+        for ui, r in enumerate(top3.itertuples(), start=1):
+            li, ri_ = gi[r.ligand], gi[r.receptor]
+            prod = X[:, li] * X[:, ri_]
+            fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(62)))
+            s = ax.scatter(xyp[:, 0], xyp[:, 1], c=prod, s=4, cmap="viridis",
+                           vmin=0, vmax=vmax_lr)
+            ax.set_title(f"{r.ligand} × {r.receptor}  z={r.z_score:.2f}\n"
+                         f"shared scale 0 - {vmax_lr:.2f} (ligand × receptor, log1p)")
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(s, ax=ax, shrink=0.8, pad=0.02, fraction=0.046,
@@ -331,6 +428,16 @@ def run_07_spatial_communication(cfg: dict) -> dict:
             "n_permutations": n_perm,
         },
         "n_spot_pairs_within_threshold": n_near,
+        # **「算不出来」必须与「算出来很小」分开报**（E-69 同族 Form A）。
+        # 原来 `z_score` 一律是浮点，读者无法区分 `z=-0.3`（真测出来）与
+        # `z=nan`（零模型退化）—— 后者在排序里落到最末，被读成「最不富集」。
+        "n_z_defined": int(lr_df["z_score"].notna().sum()),
+        "n_z_undefined": int(lr_df["z_score"].isna().sum()),
+        "z_undefined_note": (
+            "z 未定义的对：零模型 50 次置换全部为 nan（`n_near=0` 或 `flat` 为空）"
+            "或置换标准差恰为 0。逐对的取值与原因见 `top_enriched[].z_note`；"
+            "**这不是「z 很小」，这些对不能参与富集排序**"
+            if int(lr_df["z_score"].isna().sum()) else None),
         "top_enriched": df_to_records(lr_df.head(15)),
         "skipped_examples": skipped[:20],
         "method": ("空间约束的配体-受体共表达强度："

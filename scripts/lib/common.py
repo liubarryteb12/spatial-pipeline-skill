@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import sys
@@ -114,14 +115,78 @@ def set_seed(cfg: dict) -> int:
     return seed
 
 
+def finite_round(x, ndigits: int = 4):
+    """四舍五入到 `ndigits` 位；**非有限值一律落 `None`，不落裸 `NaN`**（E-69）。
+
+    `round(float("nan"), 4)` 是 `nan`，`round(float("inf"), 4)` 是 `inf` ——
+    两者都**不是合法 JSON**。`_scrub_nonfinite` 会把它们换成 `null`，但那是
+    最后一道兜底：**「算不出来」应当在产出它的地方就被标成 `None`**，
+    而不是靠写盘时被悄悄改掉（内存里的消费者读到的还是 `nan`）。
+
+    本函数是**全仓唯一**的收口点。此前 `03_spatial_domains.py` 有 `_r4`、
+    `07_spatial_communication.py` 有 `_r5`，两处各写一遍同样的逻辑 ——
+    这正是 E-68 的教训：**同一条判据在多处各写一遍，就会在某处漏掉**。
+    R 版落地时也必须调同一个语义的函数（见 `R-16`）。
+
+    注意 `x is None` 与 `nan` 都要落 `None`：前者是「没有这个量」，后者是
+    「算出来是 nan」，对 JSON 读者来说都是「空」，但对 Python 调用者
+    仍然要能区分（调用点自己判断 `is None`）。
+    """
+    if x is None:
+        return None
+    x = float(x)
+    return None if not math.isfinite(x) else round(x, ndigits)
+
+
+def _scrub_nonfinite(obj):
+    """把 `NaN` / `Infinity` 递归换成 `None`，并返回 `(新对象, 命中数)`。
+
+    **E-69（跨仓复用，与 scrna 的 M9 同形）**：`json.dump` 默认
+    `allow_nan=True`，会把 `NaN` / `Infinity` **原样写进文件** —— 那不是
+    合法 JSON，`node`/`jq`/R 侧读者一律解析失败。而 Python 自己 `json.load`
+    读得回来，所以**本地看不出来**。
+
+    本仓原先的 `write_json` 正是这样：实测
+    `write_json(p, {"z": float("nan")})` 落盘 `{ "z": NaN }`，
+    `json.loads(raw, parse_constant=<raise>)` 报 `bare constant: NaN`，
+    而 `json.load(raw)` 返回 `{'z': nan}` —— 于是这个缺陷在本机不可见。
+
+    换成 `None`（JSON `null`）而不是删键：**"这个量算不出来"本身是信息**，
+    删掉它读者只会以为没这个字段。同时把命中数报出来，让它可见。
+    """
+    if isinstance(obj, dict):
+        out, hits = {}, 0
+        for k, v in obj.items():
+            nv, h = _scrub_nonfinite(v)
+            out[k], hits = nv, hits + h
+        return out, hits
+    if isinstance(obj, (list, tuple)):
+        out, hits = [], 0
+        for v in obj:
+            nv, h = _scrub_nonfinite(v)
+            out.append(nv)
+            hits += h
+        return (out if isinstance(obj, list) else tuple(out)), hits
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None, 1
+    return obj, 0
+
+
 def write_json(path, obj) -> None:
+    """写 JSON。**保证写出的是合法 JSON**（E-69）—— 非有限浮点先换成 `null`。
+
+    用了 `allow_nan=False` 作为**兜底断言**：即使 `_scrub_nonfinite` 漏了
+    某个非有限值（如藏在自定义对象里），`json.dump` 会抛 `ValueError`
+    而不是**悄悄写出一个非法文件**。宁可这一轮失败，也不要下游读者解析失败。
+    """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
     def default(o):
         if isinstance(o, (np.integer,)):
             return int(o)
         if isinstance(o, (np.floating,)):
-            return float(o)
+            f = float(o)
+            return None if not math.isfinite(f) else f
         if isinstance(o, (np.bool_,)):
             return bool(o)
         if isinstance(o, np.ndarray):
@@ -130,18 +195,50 @@ def write_json(path, obj) -> None:
             return str(o)
         return str(o)
 
+    clean, n_nonfinite = _scrub_nonfinite(obj)
+    if n_nonfinite:
+        log_warn(f"write_json: {path} 有 {n_nonfinite} 个 NaN/Infinity，"
+                 f"已写成 null（非法 JSON 会让 node/jq/R 读者解析失败）")
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump(obj, fh, ensure_ascii=False, indent=2, default=default)
+        json.dump(clean, fh, ensure_ascii=False, indent=2,
+                  default=default, allow_nan=False)
 
 
 def read_json(path):
+    """读 JSON。文件不存在 → `None`；**内容坏了 → 抛异常**（E-69）。
+
+    原实现 `except Exception: return None` 把两种完全不同的情况混成一个
+    `None`：① 这轮没这个文件（正常，可选步骤没跑）；② **文件在、但内容是
+    坏的**（写坏了 / 截断了 / 上次运行留下的半截文件）。
+
+    ② 的后果不是"少一条数据"，而是**静默丢掉一条检查**。本仓的消费点
+    `read_state()` / `read_manifest()` 都写成 `read_json(...) or {...}` ——
+    于是一个损坏的 `state.json` 会让**全部步骤记录**看起来像"一步都没跑"，
+    一个损坏的 `run_manifest.json` 会让清单检查报"缺清单"而不是"清单坏了"。
+    这比"报错"糟得多（E-62/E-63/E-64 同一形态：假阴性把自己藏了起来）。
+
+    所以：**不存在 → None；存在但解析失败 → 抛**。需要"坏也当没有"的
+    调用点显式用 `read_json_or_none()`，让意图在调用处可见。
+    """
     p = Path(path)
     if not p.exists():
         return None
+    with open(p, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def read_json_or_none(path):
+    """`read_json` 的宽容版：**任何**失败都返回 `None`，但会 `log_warn`。
+
+    只给"这一步的可选产物、坏了大不了当没跑"的调用点用。判据产物
+    （`*_status.json`、`state.json`、`run_manifest.json`）一律用
+    `read_json` —— 坏掉必须炸出来。
+    """
     try:
-        with open(p, encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:  # noqa: BLE001
+        return read_json(path)
+    except Exception as e:  # noqa: BLE001
+        log_warn(f"read_json_or_none: {path} 存在但解析失败"
+                 f"（{type(e).__name__}: {e}）—— 当作不存在处理")
         return None
 
 
@@ -638,9 +735,20 @@ def manifest_summary(cfg: dict) -> dict:
             i.get("label") or "?" for i in miss if i.get("required")
         ),
         "n_decisions": len(m.get("decisions") or []),
+        # `human_review_pending` 只给"待确认"的那些。**但"一个都没登记"和
+        # "登记了且全部已确认"在它眼里一模一样**（都是空列表）—— 而这两种
+        # 处境的排查方向完全相反：前者是流水线根本没跑登记（`HUMAN_REVIEW_NODES`
+        # 那个循环被删了 / 提前 return），后者才是"人真的签过字"。
+        # 所以另外给出总数与已确认数，让消费者能分开判（E-69 同族 Form B：
+        # **标出来的状态必须有人消费**）。
+        "n_human_review": len(m.get("human_review") or []),
         "human_review_pending": sorted(
             h["node"] for h in (m.get("human_review") or [])
             if h.get("status") == "pending"
+        ),
+        "human_review_confirmed": sorted(
+            h["node"] for h in (m.get("human_review") or [])
+            if h.get("status") in ("confirmed", "overridden", "not_needed")
         ),
         "n_cross_language": len(m.get("cross_language") or []),
     }
