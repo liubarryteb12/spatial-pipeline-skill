@@ -521,6 +521,90 @@ def try_stagate(adata, cfg: dict, log=log_info) -> tuple:
         return None, info
 
 
+def _r4(x):
+    """四舍五入到 4 位；**非有限值一律落 `None`，不落裸 `NaN`**（E-68 同族）。
+
+    `round(float("nan"), 4)` 是 `nan`，`json.dumps(..., allow_nan=False)` 会抛，
+    而 `allow_nan=True`（默认）会写出裸 `NaN` —— 那不是合法 JSON，
+    `json.loads` 读得回来、别的语言读不回来。同一个数值在「算不出来」时
+    应当是「空」，不是「一个看起来像数字的东西」。
+    （`common.write_json` 的 `_scrub_nonfinite` 是最后一道兜底，但不该
+    指望兜底：本函数返回的字典也会被内存里的消费者直接读。）
+    """
+    x = float(x)
+    return None if not np.isfinite(x) else round(x, 4)
+
+
+def domain_label_from_z(Z, used_ct, M, dom_list) -> tuple:
+    """把「域 × 类型」的 z 分数矩阵翻成域标签表 + 汇总。
+
+    抽成**纯函数**是为了让自检能调真代码（AGENTS 规则 30.1 / E-63 的教训：
+    自检里重实现一遍被测逻辑等于没测）。它不 print、不写盘、不读配置。
+
+    **「不确定」与「算不出来」必须分开报（E-68，2026-09-26）。**
+    旧写法 `second_i = int(order[1]) if len(order) > 1 else int(order[0])`
+    在**只有一个候选类型**时把第二名取成第一名本身 ⇒ `z_margin` 恒为
+    `0.0` ⇒ `0.0 > 0.5` 为假 ⇒ 记成 `assignment_confident: False`，
+    日志于是说「N/M 个域的标签 z_margin <= 0.5 —— 这些标签不该被当结论」，
+    而其中可能一个域的 margin 都没算出来。两种处境被压成同一个 `False`：
+
+    - `low_margin`（有第二名、差距 <= 0.5，两条路真的分不开）
+    - `single_celltype`（**没有第二名可比较**，margin 不存在 —— 不是
+      「不确定」，是「这个指标在这里不适用」）
+
+    **两者排查方向相反**：前者去比对两条注释路，后者去补签名基因。
+
+    返回 `(annot, summary)`；`summary` 含 `margin_state_counts` /
+    `n_low_margin` / `n_margin_undefined`，供日志与验收层消费。
+    """
+    annot = {}
+    for j, dm in enumerate(dom_list):
+        col = Z[:, j]
+        order = np.argsort(-col)
+        top_i = int(order[0])
+        z_top = float(col[top_i])
+        if len(order) > 1:
+            second_i = int(order[1])
+            z_second = float(col[second_i])
+            z_margin = z_top - z_second
+            if not np.isfinite(z_margin):
+                margin_state, margin_out, confident = "margin_undefined", None, None
+            elif z_margin <= 0.5:
+                margin_state, margin_out, confident = "low_margin", round(z_margin, 4), False
+            else:
+                margin_state, margin_out, confident = "ok", round(z_margin, 4), True
+        else:
+            second_i = None
+            z_second = None
+            margin_state, margin_out, confident = "single_celltype", None, None
+        annot[dm] = {
+            "label": used_ct[top_i],
+            "z_score": _r4(z_top),
+            "runner_up": used_ct[second_i] if second_i is not None else None,
+            "runner_up_z": _r4(z_second) if z_second is not None else None,
+            # margin 小时标签不该被当结论（沿用 Part 2 的做法）
+            "z_margin": margin_out,
+            "margin_state": margin_state,
+            "assignment_confident": confident,
+            "raw_mean_expression": _r4(M[top_i, j]),
+            "top5": [{"celltype": used_ct[int(i)],
+                      "z_score": _r4(col[int(i)])}
+                     for i in order[:5]],
+        }
+    counts: dict = {}
+    for v in annot.values():
+        counts[v["margin_state"]] = counts.get(v["margin_state"], 0) + 1
+    summary = {
+        "margin_state_counts": counts,
+        "n_low_margin": counts.get("low_margin", 0),
+        "n_margin_undefined": (counts.get("single_celltype", 0)
+                               + counts.get("margin_undefined", 0)),
+        "n_domains": len(annot),
+        "n_celltypes_used": len(used_ct),
+    }
+    return annot, summary
+
+
 def run_03_spatial_domains(cfg: dict) -> dict:
     ensure_dirs(cfg)
     set_seed(cfg)
@@ -747,32 +831,22 @@ def run_03_spatial_domains(cfg: dict) -> dict:
         sd[sd < 1e-12] = 1.0
         Z = (M - mu) / sd                       # (n_ct, n_dom)
 
-        for j, dm in enumerate(dom_list):
-            col = Z[:, j]
-            order = np.argsort(-col)
-            top_i, second_i = int(order[0]), int(order[1]) if len(order) > 1 else int(order[0])
-            z_top, z_second = float(col[top_i]), float(col[second_i])
-            annot[dm] = {
-                "label": used_ct[top_i],
-                "z_score": round(z_top, 4),
-                "runner_up": used_ct[second_i],
-                "runner_up_z": round(z_second, 4),
-                # margin 小时标签不该被当结论（沿用 Part 2 的做法）
-                "z_margin": round(z_top - z_second, 4),
-                "assignment_confident": bool(z_top - z_second > 0.5),
-                "raw_mean_expression": round(float(M[top_i, j]), 4),
-                "n_spots": int((doms == dm).sum()),
-                "top5": [{"celltype": used_ct[int(i)],
-                          "z_score": round(float(col[int(i)]), 4)}
-                         for i in order[:5]],
-            }
+        annot, _summary = domain_label_from_z(Z, used_ct, M, dom_list)
         log_info("域标签: " + ", ".join(
-            f"{k}->{v['label']}(z {v['z_score']:.2f}, Δ{v['z_margin']:.2f})"
+            f"{k}->{v['label']}(z {v['z_score']:.2f}, "
+            f"Δ{'n/a' if v['z_margin'] is None else format(v['z_margin'], '.2f')})"
             for k, v in annot.items()))
-        n_unc = sum(1 for v in annot.values() if not v["assignment_confident"])
-        if n_unc:
-            log_warn(f"{n_unc}/{len(annot)} 个域的标签 z_margin <= 0.5 —— "
-                     f"这些标签不该被当结论")
+        log_info(f"域标签 margin 状态分布 {_summary['margin_state_counts']}")
+        if _summary["n_low_margin"]:
+            log_warn(f"{_summary['n_low_margin']}/{len(annot)} 个域的标签 "
+                     f"z_margin <= 0.5 —— 这些标签不该被当结论"
+                     f"（见 domain_annotation.json 的 margin_state='low_margin'）")
+        if _summary["n_margin_undefined"]:
+            log_warn(f"{_summary['n_margin_undefined']}/{len(annot)} 个域的 "
+                     f"z_margin **算不出来** —— 这不是「不确定」，是"
+                     f"「这个指标在这里不适用」：候选细胞类型只有一个，"
+                     f"没有第二名可比。处理方式与 low_margin 不同："
+                     f"要补签名基因，不是去比对两条路")
     except Exception as e:  # noqa: BLE001
         # **S2：不再静默吞掉。** 这一段原先整块包在裸 except 里，
         # 失败只 `log_warn`，而 `domain_annotation.json` 在

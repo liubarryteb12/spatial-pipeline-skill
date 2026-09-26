@@ -104,6 +104,22 @@
 > 而近三轮 CI 都是 **11 种 / 8 个**。域标签依赖平滑后的 Leiden 划分，
 > 划分一动它就动 —— **引用前看 `domain_status.json`，不要从文档抄**（规则 21.3）。
 
+> **`z_margin` 空着不等于「不确定」（E-68，2026-09-26）。**
+> `domain_annotation.json` 的每个域现在带一个 `margin_state` 四态：
+> `ok`（差距 > 0.5，可信）/ `low_margin`（有第二名但差距 <= 0.5，
+> 两条路真的分不开，去比对两条注释路）/ `single_celltype`
+> （**候选细胞类型只有一个，没有第二名可比**，`z_margin` 是 `null`）/
+> `margin_undefined`（数值算不出来）。后两者合并计数为
+> `n_margin_undefined`，与 `n_low_margin` **分开报** ——
+> 旧写法在只有一个候选类型时把第二名取成第一名自己，`z_margin` 恒为
+> `0.0` ⇒ `0.0 > 0.5` 为假 ⇒ 记成 `assignment_confident: false`，
+> 于是日志说「N/M 个域的标签 z_margin <= 0.5 —— 这些标签不该被当结论」，
+> **而其中可能一个域的 margin 都没算出来**。两者排查方向相反：
+> 前者去比对两条路，后者去**补签名基因**。
+> `assignment_confident` 因此是三态（`true` / `false` / `null`），
+> 不要再当布尔量用。验收层 `content:domain_annotation` 会把这个分布
+> 打进 `acceptance.json` —— 状态写出来不算数，**有人读**才算（同 L6 第二半）。
+
 ## 8. 没有外部参考时，marker-only NNLS 不是适定问题
 
 `05_deconvolution.py` 的第一版用 NNLS 解 `y ≈ S^T w`，其中 S 的每一行是

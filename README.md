@@ -161,9 +161,12 @@ Visium 的数据是**两半**：表达矩阵 + `spatial.tar.gz`（坐标/缩放/
 其他数字：
 
 - 4035 spot × 36601 基因 → QC 后 **4025 spot**，组织连通性 1 块
-- 域标签 10 种：`B_germinal_center`(z=+3.20)、`T_cell`(+2.78)、
-  `Smooth_muscle`(+2.57)、`Plasma_cell`(+2.50)…；**7/13 个域
-  `z_margin <= 0.5` 被标为不可信**
+- 域标签 11 种：`B_germinal_center`(z=+3.20)、`T_cell`(+2.78)、
+  `Smooth_muscle`(+2.57)、`Plasma_cell`(+2.50)…；**8/13 个域
+  `z_margin <= 0.5` 被标为不可信**（`margin_state='low_margin'`）。
+  每个域还带一个 `margin_state` 四态，把「不确定」与「算不出来」分开：
+  `z_margin` 是 `null` 时**不是「不确定」，是「这个指标在这里不适用」**
+  —— 候选细胞类型只有一个，没有第二名可比（见 `AGENTS.md` 规则 7）
 - SVG：4000 个基因里 **2890 个** BH 校正后 p<0.05
 - 空间通讯：**62/63 对 LR 可用**（用全基因集；Part 2 在 HVG 上只有 3/38）
 - 验收：**26 项检查，required / content / honesty 三类全部 0 失败**

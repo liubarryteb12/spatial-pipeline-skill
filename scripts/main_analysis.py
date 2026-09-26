@@ -872,8 +872,26 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
             d = json.loads(p.read_text(encoding="utf-8"))
             st = d.get("status")
             n_dom = len(d.get("domains") or {})
+            # **`margin_state` 必须有人消费（E-68，2026-09-26）。**
+            # `03_spatial_domains.py` 把域标签的置信度拆成了四态
+            # （`ok` / `low_margin` / `single_celltype` / `margin_undefined`），
+            # 但"标出来"不等于"有人读" —— 一条只写进 JSON、没有任何消费者
+            # 的状态，与没写是一样的（同 E-48/E-58 的教训）。
+            # 这里把它汇成一句能进 `acceptance.json` 的分布，让
+            # "有多少个域的 margin 根本没算出来"在验收产物里可见。
+            _msc: dict = {}
+            for _v in (d.get("domains") or {}).values():
+                _k = (_v or {}).get("margin_state") or "missing"
+                _msc[_k] = _msc.get(_k, 0) + 1
+            _undef = _msc.get("single_celltype", 0) + _msc.get("margin_undefined", 0)
+            _note = f"margin 状态分布 {_msc}"
+            if _undef:
+                _note += (f"；其中 {_undef} 个域的 z_margin **算不出来**"
+                          f"（候选细胞类型只有一个，没有第二名可比）"
+                          f"—— 这不是「不确定」，是「这个指标在这里不适用」，"
+                          f"排查方向是补签名基因")
             chk("content:domain_annotation", "content", st == "ok" and n_dom > 0,
-                (f"域标签: {n_dom} 个域有标签（{d.get('signature_set')}）"
+                (f"域标签: {n_dom} 个域有标签（{d.get('signature_set')}）；{_note}"
                  if st == "ok" and n_dom > 0 else
                  f"**域标签没有产出**：status={st}，{n_dom} 个域，"
                  f"原因 {str(d.get('reason'))[:140]}"),
