@@ -675,9 +675,18 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
     # 只有注入"整组动态图消失"才会暴露。
     declared_set = set(declared)
     dyn_missing = []
+    # **每组的 `产出/槽位` 都要报出来（E-70）。** 这条判据只要求"至少 1 张"，
+    # 而槽位是上限、少出合法 —— 于是"3 个槽位只出 1 张"与"3 个槽位出 3 张"
+    # 在这条判据眼里**完全一样**。E-70 的现场就是这样藏住的：
+    # `03-07-02` 声明 3、实际 1（循环建了图但 `save_fig` 掉到循环外），
+    # 而验收打印的是"各自至少产出 1 张" —— **没人看得出少了 2 张**。
+    # 判据本身不改（少出确实合法），但把比值**摆出来**：状态写出来不算数，
+    # 有人读才算（E-69 Form B）。
+    dyn_report = []
     for base, n_slots in dyn.items():
         got = [nm for nm in fig_names
                if nm.startswith(base + "-") and nm not in declared_set]
+        dyn_report.append(f"{base} {len(got)}/{n_slots}")
         if not got:
             dyn_missing.append(f"{base}（声明 {n_slots} 个槽位，实际 0 张）")
 
@@ -712,9 +721,11 @@ def run_acceptance(cfg: dict, step_results: dict) -> dict:
          + f" —— 实际产出 {len(figs)} 张"),)
     chk("figures:dynamic", "required", not dyn_missing,
         (f"{len(dyn)} 组动态图名共 {dyn_slots} 个槽位，各自至少产出 1 张"
+         f"（产出/槽位：{', '.join(dyn_report)}）"
          if not dyn_missing else
          f"**动态图名整组没产出** {dyn_missing} —— 槽位是上限不是精确值，"
-         f"少出合法，但**一张都没有说明那段循环整段没跑**"),)
+         f"少出合法，但**一张都没有说明那段循环整段没跑**"
+         f"（产出/槽位：{', '.join(dyn_report)}）"),)
     # 保留计数作为**下限兜底**：声明扫描本身失效时（如源码结构大改导致
     # 一条字面量都扫不到）这条还能拦住"一张图都没有"。
     chk("figures:count", "required", len(figs) >= 8,

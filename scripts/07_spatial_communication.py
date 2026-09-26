@@ -393,12 +393,17 @@ def run_07_spatial_communication(cfg: dict) -> dict:
                            vmin=0, vmax=vmax_lr)
             ax.set_title(f"{r.ligand} × {r.receptor}  z={r.z_score:.2f}\n"
                          f"shared scale 0 - {vmax_lr:.2f} (ligand × receptor, log1p)")
-        ax.set_aspect("equal"); ax.invert_yaxis()
-        ax.set_xticks([]); ax.set_yticks([])
-        fig.colorbar(s, ax=ax, shrink=0.8, pad=0.02, fraction=0.046,
-                     label="ligand × receptor (log1p expression)")
-        pair_slug = f"{r.ligand}-{r.receptor}".lower()
-        save_fig(cfg, f"03-07-02-unit{ui}-{pair_slug}", fig)
+            # **保存必须在循环体内（E-70）。** 这几行曾经因为 E-69 加 `else:` 时
+            # 只给 `for` 那一行加了缩进而掉到循环外：循环建了 3 张图、一张都没保存，
+            # 只有最后一次迭代留下的 `ui`/`r` 让循环外那次 save 落了一张
+            # `unit3`，另 2 张 figure 泄漏。**所有门禁都是绿的** ——
+            # 只有跨 artifact 比对图名集合才看得见。
+            ax.set_aspect("equal"); ax.invert_yaxis()
+            ax.set_xticks([]); ax.set_yticks([])
+            fig.colorbar(s, ax=ax, shrink=0.8, pad=0.02, fraction=0.046,
+                         label="ligand × receptor (log1p expression)")
+            pair_slug = f"{r.ligand}-{r.receptor}".lower()
+            save_fig(cfg, f"03-07-02-unit{ui}-{pair_slug}", fig)
 
     # ---- 6. 落盘 ------------------------------------------------------------
     status = {
