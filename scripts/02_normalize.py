@@ -26,7 +26,8 @@ import scanpy as sc  # noqa: E402
 
 from common import (ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, record_step, save_fig, set_seed, write_json,
-                    spatial_xy, PAL, W_ONE_HALF, mm,)
+                    spatial_xy, PAL, W_ONE_HALF, W_ONE_HALF_MM,
+                    fit_fig_to_scatter, mm,)
 
 
 def run_02_normalize(cfg: dict) -> dict:
@@ -185,6 +186,7 @@ def run_02_normalize(cfg: dict) -> dict:
                 "PC2": "03-02-03-unit2-pc2-on-tissue",
                 "PC3": "03-02-03-unit3-pc3-on-tissue"}
     for i in range(3):
+        # 高度只是**初值** —— 下面 fit_fig_to_scatter() 会按数据长宽比重定（E-72）。
         fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(58)))
         s = ax.scatter(xy[:, 0], xy[:, 1], c=work.obsm["X_pca"][:, i],
                        s=4, cmap="RdBu_r", vmin=-_v, vmax=_v)
@@ -194,6 +196,8 @@ def run_02_normalize(cfg: dict) -> dict:
         ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(s, ax=ax, shrink=0.8, pad=0.02, fraction=0.046,
                      label=f"PC{i+1} score")
+        # **必须排在 set_aspect 与 colorbar 之后**（E-72）。
+        fit_fig_to_scatter(fig, ax, W_ONE_HALF_MM)
         save_fig(cfg, PC_NAMES[f"PC{i+1}"], fig)
 
     # ---- 3. 落盘 ------------------------------------------------------------

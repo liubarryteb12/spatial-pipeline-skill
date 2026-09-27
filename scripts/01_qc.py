@@ -29,7 +29,8 @@ import scanpy as sc  # noqa: E402
 
 from common import (ensure_dirs, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, record_step, save_fig, set_seed,
-                    write_json, spatial_xy, W_ONE_HALF, mm,)
+                    write_json, spatial_xy, W_ONE_HALF, W_ONE_HALF_MM,
+                    fit_fig_to_scatter, mm,)
 
 HB_PREFIXES = ("HBA", "HBB", "HBD", "HBE", "HBG", "HBM", "HBQ", "HBZ")
 
@@ -152,6 +153,8 @@ def run_01_qc(cfg: dict) -> dict:
     xy = spatial_xy(adata)
     for key, cmap in zip(("total_counts", "n_genes_by_counts", "pct_counts_mt"),
                          ("viridis", "viridis", "magma")):
+        # 高度只是**初值** —— 下面 fit_fig_to_scatter() 会按数据长宽比重定。
+        # 写死的毫米高在这类"散点地图"上必然留出大片空白（E-72）。
         fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(58)))
         s = ax.scatter(xy[:, 0], xy[:, 1], c=adata.obs[key].astype(float),
                        s=4, cmap=cmap)
@@ -160,6 +163,9 @@ def run_01_qc(cfg: dict) -> dict:
         ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(s, ax=ax, shrink=0.8, pad=0.02, fraction=0.046,
                      label=QC_LABELS[key])
+        # **必须排在 set_aspect 与 colorbar 之后**：前者决定 axes 盒子的比，
+        # 后者占的是绝对宽度、要算进"装饰"里（E-72）。
+        fit_fig_to_scatter(fig, ax, W_ONE_HALF_MM)
         FIG_NAMES = {"total_counts": "03-01-01-unit1-counts-on-tissue",
                       "n_genes_by_counts": "03-01-01-unit2-genes-on-tissue",
                       "pct_counts_mt": "03-01-01-unit3-mito-on-tissue"}
@@ -219,6 +225,7 @@ def run_01_qc(cfg: dict) -> dict:
     AFTER_SPECS = {"03-01-02-unit1-counts-on-tissue-after": ("total_counts", "viridis", "Total counts per spot"),
                    "03-01-02-unit2-mito-on-tissue-after": ("pct_counts_mt", "magma", "Mitochondrial fraction (%)")}
     for _name, (_key, _cmap, _lab) in AFTER_SPECS.items():
+        # 高度只是初值（见上，E-72）。
         fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(72)))
         s = ax.scatter(xy[:, 0], xy[:, 1], c=adata.obs[_key].astype(float),
                        s=5, cmap=_cmap)
@@ -226,6 +233,7 @@ def run_01_qc(cfg: dict) -> dict:
         fig.colorbar(s, ax=ax, shrink=0.8, pad=0.02, fraction=0.046, label=_lab)
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
+        fit_fig_to_scatter(fig, ax, W_ONE_HALF_MM)
         save_fig(cfg, _name, fig)
 
     # ---- 6. 落盘 ------------------------------------------------------------

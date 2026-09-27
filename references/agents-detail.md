@@ -460,3 +460,115 @@ artifact 干跑**，`03-07-02 1/3` 直接印在验收详情里，而 `n_checks` 
 **"检测到了"不等于"有人会知道"**（同规则 28.3）。
 
 台账：`governance/15_ERROR_LEDGER.md` E-70（任务行 `governance/02_TASKLIST.md` R-04h）
+
+## 原规则 33. 画布比内容大太多也是缺陷：等比例散点图的高度不能写死（E-72，2026-09-26）
+
+**规则：凡是 `set_aspect("equal")` 的单面板散点地图，`figsize` 的高不许写死毫米数 ——
+画完（`set_aspect` 与 `colorbar` 之后）调
+`lib/common.py:fit_fig_to_scatter(fig, ax, width_mm)`，让高度由数据长宽比推出。**
+
+规则 29.2 早就为 H&E 叠图定下了"图幅跟着宽高比走"，但只修了那一个函数。
+同形态的 **10 处（6 个脚本）**没跟上：`set_aspect("equal")` 把 axes 锁成数据的真实
+长宽比，而画布高写死成 `mm(58)` / `mm(60)` / `mm(62)` / `mm(72)` —— 宽度档
+（89 / 136 mm）里放不下的部分全变成空白，最差的一张左边 54.8% 是白的。
+
+### 10 个站点（修复前）
+
+| 文件 | `set_aspect` 行 | 原 figsize 行 | 宽度档 | 图名 |
+|---|---|---|---|---|
+| `scripts/01_qc.py` | 159 | 155 `(W_ONE_HALF, mm(58))` | 136 | `03-01-01-unit{1,2,3}` |
+| `scripts/01_qc.py` | 227 | 222 `(W_ONE_HALF, mm(72))` | 136 | `03-01-02-unit{1,2}` |
+| `scripts/02_normalize.py` | 193 | 188 `(W_ONE_HALF, mm(58))` | 136 | `03-02-03-unit{1,2,3}` |
+| `scripts/04_svg.py` | 642 | 638 `(W_SINGLE, mm(58))` | 89 | `03-04-01-unit{1..30}` |
+| `scripts/05_deconvolution.py` | 816 | 811 `(W_SINGLE, mm(58))` | 89 | `03-05-01-unit{1..12}` |
+| `scripts/05_deconvolution.py` | 867 | 865 `(W_SINGLE, mm(76))` | 89 | `03-05-03-unit1` |
+| `scripts/07_spatial_communication.py` | 401 | 391 `(W_ONE_HALF, mm(62))` | 136 | `03-07-02-unit{1,2,3}` |
+| `scripts/08_spatial_trajectory.py` | 333 / 342 / 352 | 327 / 336 / 345 `(W_ONE_HALF, mm(60))` | 136 | `03-08-01-unit{1,2,3}` |
+
+修法取"**宽度档不动、只让高度由长宽比推出**" —— 宽度仍落在 89 / 136 / 183 mm
+三档之内，所以 `governance/figure_captions_draft.csv` 的 `width_mm` / `width_band`
+**一个字都不用改**，爆炸半径最小。已修好的范本是 `scripts/03_spatial_domains.py:139`
+（`fit_fig_to_aspect(fig, ax, width_mm, img.shape[1] / img.shape[0])`，L49 导入）。
+
+### 实测：逐家族数字（CI artifact `spatial-results-68` 的 76 张，修复前）
+
+| 家族 | 张数 | 最大单侧空白 |
+|---|---|---|
+| `03-01-01` | 3 | 52.1%（最差 `03-01-01-unit3-mito-on-tissue.png` L=880/1606 = 54.8%）|
+| `03-01-02` | 2 | 41.7% |
+| `03-02-03` | 3 | 51.2% |
+| `03-04-01`（30 张基因空间图谱）| 30 | 28.8% |
+| `03-05-01`（12 张细胞类型比例）| 12 | 36.7% |
+| `03-07-02`（top3 配体受体对）| 3 | 46.0% |
+| `03-08-01`（拟时序 3 张）| 3 | 53.4% |
+
+⇒ **56 / 76 张判红**，全部在**左边**，最大单侧空白落在 **32.1% ~ 54.8%**；
+其余 **20 张落在 0% ~ 4.2%**（最大 `03-03-02-unit1-domains-*` 4.2%）。
+max fT 全库 3.4% / max fB 4.2%。**中间是空档，阈值取 20%，距两侧各 ≥4 倍余量。**
+
+画布尺寸分布（前几）：1051x685 x42、1606x685 x6、1606x755 x6、1606x708 x4、
+1606x732 x3、1606x1573 x2、1606x1585 x2、2161x755 x2。
+
+### 旧门禁为什么结构上看不见
+
+`check_figures.mjs` 原来只查两件事：**有没有墨**（这类图墨迹占比完全正常，
+18%~35%）、**是不是糊死**；规则 27 加的是**贴不贴边**（`EDGE_MIN_PX = 3`，
+查的是**画布太小**）。**"画布太大"一直没人查** —— 修复前把 76 张全喂进去，
+`exit=0` 全绿。用仓内门禁量像素边距，合成用例的旧版本左边距是
+**830 / 291 / 466 / 961 px**，全部 `exit=0` 通过。
+
+### 新判据
+
+非背景像素外接框到**任一边**的距离 > 该边长度的 `BLANK_MAX_FRAC = 20%` 判红。
+**四边都查**（横向空白 = 画布被撑宽、纵向 = 被撑高，同一根因的两个方向；
+贴边检查只查左右是因为纵向顶边常是布局取舍，20% 的高度空白不可能是取舍）；
+**暗底图跳过**（整幅都是墨，量不出边距）。`[OK]` 行同时打印四边边距
+（`tools/check_figures.mjs:232`，`边距 L/R/T/B ${left}/${right}/${top}/${bottom}`）
+—— 边距是**可读的量**，不是"通过/不通过"一个比特。
+
+### 调用位置约束与函数实现
+
+必须在 `set_aspect("equal")` **和** `fig.colorbar(...)`（以及 `set_xlabel` /
+`set_ylabel`）**之后** —— 前者决定 axes 盒子的比，后者占的是绝对宽度、
+要算进"装饰"里。`fit_fig_to_scatter(fig, ax, width_mm, iters=3, tol_mm=0.01)`
+内部先 `fig.canvas.draw()`，再取 `get_xlim()` / `get_ylim()` 算数据长宽比；
+退化（非有限或 ≤0）直接 `raise ValueError`，否则转调 `fit_fig_to_aspect`。
+
+`lib/common.py` 同时把毫米变成权威值：新增 `W_SINGLE_MM = 89.0` /
+`W_ONE_HALF_MM = 136.0` / `W_DOUBLE_MM = 183.0`，`W_SINGLE` / `W_ONE_HALF` /
+`W_DOUBLE` 改为 `mm(W_*_MM)` 派生。
+
+### 双向标定
+
+**正向**（`D:\tmp\_e72\probe_sites.py`，按 8 个站点的**真实参数**合成渲染）：
+**old 7/8 判红 `exit=1` → new 8/8 全绿 `exit=0`**；axes 占画布宽
+31.8%~74.4% → 78.4%~85.6%，左边距 303~857 px → 10~12 px。
+`03-05-03` 是唯一 old 也通过的站点（旧左空白仅 56/1051 px），仍然修了。
+
+用仓内 `check_figures.mjs` 量像素边距（4 个用例：0.96 组织 x W_ONE_HALF/W_SINGLE、
+横长 1.5、竖长 0.6）：旧 L = **830 / 291 / 466 / 961 px**，新 L =
+**12 / 12 / 23 / 12 px**；画布 136x127.3、89x82.0、136x84.4、136x198.8 mm；
+axes 占画布宽 36.5% / 55.2% / 59.0% / 24.7% → 85.4% / 80.8% / 85.9% / 85.0%。
+
+**反向**（`D:\tmp\_e72\neg_blank.py`）：3 类注入（阈值去掉、阈值抬到 50%、
+只查左右不查上下）**3/3 判红**、带非空摘要，源码已还原。
+
+**自检 13 个用例**（含 4 条 E-72 回归：空白判红 / 填满不判红 / 20.5% 与 19.5%
+的边界 / 纵向空白也判红）。**自检的合成器自己也有一个缺陷被抓出来**：
+`synth()` 在 `frame:false` 时 `y = margin` 那一行索引为负，整行被误判成墨迹。
+
+### 两仓门禁逐字节相同
+
+`tools/check_figures.mjs` 与 `scrna-pipeline-skill/tools/check_figures.mjs`
+**必须逐字节相同**（规则 27 的约定）。实测两仓在改动前同为 **23296 字节**、
+SHA256 相同（此前记的"只差 69 字节"是错的，`git diff --no-index` 无输出）。
+本轮同步后两侧同为 **32140 字节 / SHA256 `A5F5C8824795BEFC43C2AEF31DF2FB052F01E10A98DF2D1F1A79433E14D75C41` / CR=0**。
+scrna 侧实测 39 张**零误报**（最大单侧空白 < 2%），而且 **scrna 全仓没有任何
+`set_aspect` 调用**、也没有 `fit_fig_to_*` 帮助函数 —— 这条判据对它是纯防复发。
+
+### 三仓 `check_figures.mjs` 不是同一份
+
+- `geo-normal-pipeline-skill/tools/check_figures.mjs` 6257 字节（R 侧变体，无 `--selftest`）
+- `scrna-pipeline-skill/tools/check_figures.mjs` = spatial 那份，逐字节相同
+
+台账：`governance/15_ERROR_LEDGER.md` E-72（任务行 `governance/02_TASKLIST.md` R-04j）

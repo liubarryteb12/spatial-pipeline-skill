@@ -50,7 +50,8 @@ from common import (df_to_records, ensure_dirs, finite_round, load_config,  # no
                     log_info, log_warn, parse_args, probe_named_tools,
                     reconstruct_counts_from_raw, record_step,
                     save_fig, set_seed, write_json,
-                    spatial_xy, W_ONE_HALF, W_SINGLE, mm, PAL,)
+                    spatial_xy, W_ONE_HALF, W_SINGLE, W_SINGLE_MM,
+                    fit_fig_to_scatter, mm, PAL,)
 
 
 def build_weights(adata, n_neighbors: int = 6, row_standardize: bool = True):
@@ -635,6 +636,9 @@ def run_04_svg(cfg: dict) -> dict:
     for ui, g in enumerate(top_genes, start=1):
         v = X[:, gi[g]]
         row = res[res["gene"] == g].iloc[0]
+        # 高度只是**初值** —— 下面 fit_fig_to_scatter() 会按数据长宽比重定。
+        # 30 张图原先写死 mm(58)，组织只有 0.96 的比 → 89mm 的栏宽里
+        # 左边 33.2% 全是空白（E-72，实测 349/1051 px）。
         fig, ax = plt.subplots(figsize=(W_SINGLE, mm(58)))
         ax.scatter(xy[:, 0], xy[:, 1], c=v, s=3, cmap=cmap, norm=norm)
         ax.set_title(f"{g}  I={row[stat_name]:.3f}\n"
@@ -644,6 +648,8 @@ def run_04_svg(cfg: dict) -> dict:
         fig.colorbar(mpl.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax,
                      shrink=0.8, pad=0.02, fraction=0.046,
                      label="expression (log1p, shared scale)")
+        # **必须排在 set_aspect 与 colorbar 之后**（E-72）。
+        fit_fig_to_scatter(fig, ax, W_SINGLE_MM)
         save_fig(cfg, f"03-04-01-unit{ui}-{g.lower()}", fig)
 
     # 统计量分布

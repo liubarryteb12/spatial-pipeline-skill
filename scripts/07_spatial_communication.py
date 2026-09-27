@@ -41,7 +41,8 @@ from common import (df_to_records, ensure_dirs, finite_round,  # noqa: E402
                     load_config, log_info,
                     log_warn, parse_args, probe_named_tools, record_step, save_fig,
                     set_seed,
-                    write_json, spatial_xy, W_ONE_HALF, mm,
+                    write_json, spatial_xy, W_ONE_HALF, W_ONE_HALF_MM,
+                    fit_fig_to_scatter, mm,
                     PAL,)
 
 
@@ -388,6 +389,9 @@ def run_07_spatial_communication(cfg: dict) -> dict:
         for ui, r in enumerate(top3.itertuples(), start=1):
             li, ri_ = gi[r.ligand], gi[r.receptor]
             prod = X[:, li] * X[:, ri_]
+            # 高度只是**初值** —— 下面 fit_fig_to_scatter() 会按数据长宽比重定。
+            # 原先写死 mm(62)：136mm 栏宽里左边 48.9% 是空白（E-72，
+            # 实测 786/1606 px）。
             fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(62)))
             s = ax.scatter(xyp[:, 0], xyp[:, 1], c=prod, s=4, cmap="viridis",
                            vmin=0, vmax=vmax_lr)
@@ -402,6 +406,8 @@ def run_07_spatial_communication(cfg: dict) -> dict:
             ax.set_xticks([]); ax.set_yticks([])
             fig.colorbar(s, ax=ax, shrink=0.8, pad=0.02, fraction=0.046,
                          label="ligand × receptor (log1p expression)")
+            # **必须排在 set_aspect 与 colorbar 之后**（E-72）。
+            fit_fig_to_scatter(fig, ax, W_ONE_HALF_MM)
             pair_slug = f"{r.ligand}-{r.receptor}".lower()
             save_fig(cfg, f"03-07-02-unit{ui}-{pair_slug}", fig)
 

@@ -36,7 +36,8 @@ import scipy.sparse as sp  # noqa: E402
 from common import (ensure_dirs, finite_round, load_config, log_info,  # noqa: E402
                     log_warn, parse_args, probe_named_tools, record_step, save_fig,
                     set_seed,
-                    spatial_xy, write_json, W_ONE_HALF, mm,)
+                    spatial_xy, write_json, W_ONE_HALF, W_ONE_HALF_MM,
+                    fit_fig_to_scatter, mm,)
 
 # 复用 03 的空间平滑与 04 的 Moran's I —— 不重复实现。
 # 目录名以数字开头，不能直接 import，所以按文件路径加载。
@@ -324,6 +325,9 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
     # 方法对照链）。unit1/2/3 = A/|A-B| 对照结构（unit3 依赖前两张，
     # 组内阅读顺序 1->2->3）；unit4/5 = 分布对照 + 相关散点（证据链）。
     # Moran's I 各写进各图标题。
+    # 高度只是**初值** —— 下面 fit_fig_to_scatter() 会按数据长宽比重定。
+    # 这三张原先写死 mm(60)：136mm 栏宽里左边 51.6% 是空白（E-72，
+    # 实测 828/1606 px）。
     fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(60)))
     s0 = ax.scatter(xy[:, 0], xy[:, 1], c=expr_pt, s=7, cmap="viridis")
     ax.set_title(f"Expression-only pseudotime\nMoran's I = {I_expr:.3f}")
@@ -331,6 +335,8 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
                  fraction=0.046, pad=0.02, shrink=0.8)
     ax.set_xlabel("x (fullres px)"); ax.set_ylabel("y (fullres px)")
     ax.set_aspect("equal")
+    # **必须排在 set_aspect 与 colorbar（还有轴标签）之后**（E-72）。
+    fit_fig_to_scatter(fig, ax, W_ONE_HALF_MM)
     save_fig(cfg, "03-08-01-unit1-pseudotime-expr-only", fig)
 
     fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(60)))
@@ -340,6 +346,8 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
                  fraction=0.046, pad=0.02, shrink=0.8)
     ax.set_xlabel("x (fullres px)"); ax.set_ylabel("y (fullres px)")
     ax.set_aspect("equal")
+    # **必须排在 set_aspect 与 colorbar（还有轴标签）之后**（E-72）。
+    fit_fig_to_scatter(fig, ax, W_ONE_HALF_MM)
     save_fig(cfg, "03-08-01-unit2-pseudotime-smoothed", fig)
 
     fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(60)))
@@ -350,6 +358,8 @@ def run_08_spatial_trajectory(cfg: dict) -> dict:
                  fraction=0.046, pad=0.02, shrink=0.8)
     ax.set_xlabel("x (fullres px)"); ax.set_ylabel("y (fullres px)")
     ax.set_aspect("equal")
+    # **必须排在 set_aspect 与 colorbar（还有轴标签）之后**（E-72）。
+    fit_fig_to_scatter(fig, ax, W_ONE_HALF_MM)
     save_fig(cfg, "03-08-01-unit3-pseudotime-difference", fig)
 
     fig, ax = plt.subplots(figsize=(W_ONE_HALF, mm(64)))

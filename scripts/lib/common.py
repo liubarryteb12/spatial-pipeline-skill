@@ -880,10 +880,15 @@ def mm(*vals: float):
     return tuple(v / 25.4 for v in vals)
 
 
-# 三种标准宽度，单位英寸。绘图脚本一律用它们，不写裸英寸。
-W_SINGLE = mm(89)      # 单栏
-W_ONE_HALF = mm(136)   # 单栏半（Nature 允许 120-136 mm）
-W_DOUBLE = mm(183)     # 双栏（= 满版宽）
+# 三种标准宽度。**毫米是权威值、英寸是派生的** —— 图幅门禁与
+# `fit_fig_to_aspect()` 都按毫米工作，所以先定 `*_MM` 再换算，
+# 免得「89 / 136 / 183」在仓里存成两份、日后只改一处。
+W_SINGLE_MM = 89.0      # 单栏
+W_ONE_HALF_MM = 136.0   # 单栏半（Nature 允许 120-136 mm）
+W_DOUBLE_MM = 183.0     # 双栏（= 满版宽）
+W_SINGLE = mm(W_SINGLE_MM)
+W_ONE_HALF = mm(W_ONE_HALF_MM)
+W_DOUBLE = mm(W_DOUBLE_MM)
 
 
 def fit_fig_to_aspect(fig, ax, width_mm: float, aspect: float,
@@ -955,6 +960,65 @@ def fit_fig_to_aspect(fig, ax, width_mm: float, aspect: float,
         h_prev = h_mm
     fig.canvas.draw()          # 定稿一次，之后 transData 才可靠
     return h_prev if h_prev is not None else h_in * 25.4
+
+
+def fit_fig_to_scatter(fig, ax, width_mm: float, iters: int = 3,
+                       tol_mm: float = 0.01) -> float:
+    r"""
+    **纯散点地图**版的 `fit_fig_to_aspect`：长宽比取自**数据范围**。
+
+    两者是同一件事的两半，差别只在"长宽比从哪来"：
+
+      - 有 `imshow` 底图（H&E 叠图）→ 取**源图**的
+        `arr.shape[1] / arr.shape[0]`，用 `fit_fig_to_aspect()`；
+      - 没有底图（纯 spot 散点）→ 取**数据范围**，用本函数。
+
+    ---
+    ## 为什么需要它（E-72）
+
+    `ax.set_aspect("equal")` 把 axes 盒子锁成数据范围的长宽比，而**画布高度
+    由 `figsize` 写死** —— 画布宽里放不下的部分全变成空白。
+
+    实测（E-72，CI artifact `spatial-results-68` 的 76 张图）：**56 张**
+    左右某一侧的空白 ≥ 337 px，最差 `03-01-01-unit3-mito-on-tissue.png`
+    是 880/1606 px = **54.8%**。这些图当时都写死了高度
+    （`figsize=(W_ONE_HALF, mm(58))` 一类），而 `set_aspect("equal")` 之后
+    0.96 的组织只用到 58 mm 宽 —— **136 mm 的栏宽白白空着**，图上的
+    spot 与刻度也跟着小三分之一。
+
+    门禁当时**看不见**这件事：`check_figures.mjs` 只查"墨迹贴不贴边"
+    （`margins < 3 px`），"墨迹离边 880 px"结构上不在判据里。
+
+    ---
+    ## 为什么不能直接复用 `fit_fig_to_aspect` 的"取源图"口径
+
+    纯散点没有源图。而 `fit_fig_to_aspect` 的坑 3 已经写明：**加了散点之后
+    axes 的数据范围由散点决定** —— 对叠图这是错的（那要用源图的比），
+    对纯散点恰恰**是对的**（散点的范围就是这张图的全部内容）。所以这里显式
+    取 `get_xlim()/get_ylim()`，把这条差别写成两个函数而不是一个开关。
+
+    ---
+    ## 调用时机（两处都有要求）
+
+    必须在 `set_aspect("equal")` **之后**（否则量到的 axes 盒子还是旧的），
+    并且放在 `fig.colorbar(...)` **之后** —— 色标占的是绝对宽度，要算进
+    "装饰"里才不会被当成可用宽度。
+
+    返回最终画布高（mm），语义与 `fit_fig_to_aspect` 一致。
+    """
+    fig.canvas.draw()          # 让 autoscale 定稿，xlim/ylim 才可信
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    aspect = abs(x1 - x0) / abs(y1 - y0)
+    # 退化数据（单点 / 常量坐标）会给出 0 或 inf 的长宽比，而**非有限值
+    # 不会报错**，只会把画布算成一个荒谬的高度 —— 正是本仓反复踩的那类
+    # 静默缺陷。宁可直接炸。
+    if not (np.isfinite(aspect) and aspect > 0):
+        raise ValueError(
+            f"fit_fig_to_scatter: 数据范围退化了（xlim=({x0}, {x1}), "
+            f"ylim=({y0}, {y1})，长宽比 = {aspect}）。这张图没有可用的"
+            f"空间范围，按它算画布高会得到一个荒谬的尺寸。")
+    return fit_fig_to_aspect(fig, ax, width_mm, aspect, iters, tol_mm)
 
 
 def marker_area_pt2(fig, ax, radius_data: float) -> float:

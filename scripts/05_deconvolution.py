@@ -47,7 +47,8 @@ from common import (ensure_dirs, finite_round, load_config, log_info,  # noqa: E
                     reconstruct_counts_from_raw,
                     record_cross_language, record_decision, record_step,
                     save_fig, set_seed,
-                    write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, W_SINGLE, mm,)
+                    write_json, spatial_xy, W_DOUBLE, W_ONE_HALF, W_SINGLE,
+                    W_SINGLE_MM, fit_fig_to_scatter, mm,)
 
 
 def load_signature(cfg: dict):
@@ -808,6 +809,9 @@ def run_05_deconvolution(cfg: dict) -> dict:
     vmax_shared = float(np.quantile(
         np.concatenate([prop_df[ct].values for ct in show]), 0.99))
     for ui, ct in enumerate(show, start=1):
+        # 高度只是**初值** —— 下面 fit_fig_to_scatter() 会按数据长宽比重定。
+        # 原先写死 mm(58)：0.96 比的组织只用到 58mm，89mm 栏宽里
+        # 左边 32.1%~38.7% 是空白（E-72，实测 337~407/1051 px）。
         fig, ax = plt.subplots(figsize=(W_SINGLE, mm(58)))
         s = ax.scatter(xy[:, 0], xy[:, 1], c=prop_df[ct].values, s=4,
                        cmap="magma", vmin=0, vmax=vmax_shared)
@@ -816,6 +820,8 @@ def run_05_deconvolution(cfg: dict) -> dict:
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(s, ax=ax, shrink=0.75, pad=0.02, fraction=0.046)
+        # **必须排在 set_aspect 与 colorbar 之后**（E-72）。
+        fit_fig_to_scatter(fig, ax, W_SINGLE_MM)
         save_fig(cfg, f"03-05-01-unit{ui}-{ct.lower()}", fig)
 
     # 组成堆叠（按某个域聚合，看域之间的组成差异）
@@ -862,12 +868,16 @@ def run_05_deconvolution(cfg: dict) -> dict:
                       if _n_fin_fig else
                       "Reconstruction error: **all spots undefined**\n"
                       f"({len(errors)} spots with counts row-sum <= 0; nothing to show)")
+        # 高度只是初值（E-72）。这张的空白比其余几张轻（89/76 的画布比
+        # 已经接近数据比），但根因一样：宽度没被用满，量到约 17%，
+        # 就贴着 20% 的判红线 —— **贴着线不是理由**，一并修掉。
         fig, ax = plt.subplots(figsize=(W_SINGLE, mm(76)))
         s = ax.scatter(xy[:, 0], xy[:, 1], c=errors, s=5, cmap="magma")
         ax.set_aspect("equal"); ax.invert_yaxis()
         ax.set_xticks([]); ax.set_yticks([])
         ax.set_title(_err_title)
         fig.colorbar(s, ax=ax, shrink=0.8, label="relative error")
+        fit_fig_to_scatter(fig, ax, W_SINGLE_MM)
         save_fig(cfg, "03-05-03-unit1-deconvolution-error-map", fig)
 
     # ---- 6. 落盘 ------------------------------------------------------------
