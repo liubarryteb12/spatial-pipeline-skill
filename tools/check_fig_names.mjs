@@ -119,6 +119,13 @@ function collectLiterals(src) {
   let m;
   while ((m = re.exec(src)) !== null) {
     if (m[1].includes("{") || m[1].includes("}")) continue;
+    // **R 的 sprintf 占位符模板同样跳过**（R 版脚本双语适配）：`%d`/`%s`
+    // 是运行时拼名（须配 DYNAMIC_FIG_BASES 声明豁免）。
+    if (/%(\d+\$)?[-#0 +]*\d*(?:\.\d+)?[dioxXufeEgGcs]/.test(m[1])) continue;
+    // **拼接前缀跳过**（scrna 门的 R 版双语适配同步，2026-09-26）：
+    // `TF_FIG_BASE <- "03-07-01-unit"` 这类以 `-unit` 结尾、没有 slug 的
+    // 字面量是运行时拼接的前缀（DYNAMIC_FIG_BASES 的配套物），不是完整图名。
+    if (/-unit$/.test(m[1])) continue;
     out.push({ name: m[1].replace(/\.(pdf|png)$/i, ""), line: lineOf(m.index) });
   }
   return out;
@@ -196,22 +203,33 @@ for (const f of scripts) {
     byName.set(item.name, item.line);
     figs.push({ fig: Number(m[2]), unit: Number(m[3]), name: item.name, line: item.line });
 
-    // **跨脚本重名才算问题**（同一脚本内重复是记账引用）
-    if (seen.has(item.name)) {
+    // **跨脚本重名才算问题**（同一脚本内重复是记账引用）。
+    // **语言分域**：仓库同时含 `.py` 与 `.R` 时（两版并存，同名图是设计目标），
+    // 重名判定按语言分域 —— `seen` 的键是 `<lang>:<name>`。
+    const lang = f.endsWith(".R") ? "r" : "py";
+    const seenKey = `${lang}:${item.name}`;
+    if (seen.has(seenKey)) {
       problems.push(
-        `${f}:${item.line} 名字 "${item.name}" 与 ${seen.get(item.name)} 重复 —— 两个脚本写同一个文件`
+        `${f}:${item.line} 名字 "${item.name}" 与 ${seen.get(seenKey)} 重复 —— 两个脚本写同一个文件`
       );
     } else {
-      seen.set(item.name, `${f}:${item.line}`);
+      seen.set(seenKey, `${f}:${item.line}`);
     }
   }
 
-  // **声明式动态名豁免**：脚本可写 DYNAMIC_FIG_BASES = {"<figNo>": <count>}
+  // **声明式动态名豁免**：Python 写 DYNAMIC_FIG_BASES = {"<figNo>": <count>}，
+  // R 写 DYNAMIC_FIG_BASES <- list("<figNo>" = <count>L)。两种写法都认，
   // 声明某图号下有 N 张运行时命名的单图。豁免账目差并把该图号计为存在。
   let dynBases = {};
   const dynM = src.match(/DYNAMIC_FIG_BASES\s*=\s*\{([^}]*)\}/);
   if (dynM) {
     for (const [, k, v] of dynM[1].matchAll(/"(\d{2})"\s*:\s*(\d+)/g)) {
+      dynBases[k] = Number(v);
+    }
+  }
+  const dynMR = src.match(/DYNAMIC_FIG_BASES\s*<-\s*list\(([^)]*)\)/);
+  if (dynMR) {
+    for (const [, k, v] of dynMR[1].matchAll(/"(\d{2})"\s*=\s*(\d+)/g)) {
       dynBases[k] = Number(v);
     }
   }
@@ -270,7 +288,7 @@ for (const f of scripts) {
 }
 
 console.log(`检查 ${repoName}（阶段 ${PART}）`);
-console.log(`  ${scripts.length} 个脚本，${nCallsTotal} 处出图调用，${seen.size} 个唯一图名`);
+console.log(`  ${scripts.length} 个脚本，${nCallsTotal} 处出图调用，${seen.size} 个唯一图名（按语言分域）`);
 const multi = [...seen.keys()].filter((n) => /-unit[2-9]/.test(n));
 console.log(`  多单元图：${multi.length ? multi.join(", ") : "（无）"}`);
 if (notes.length) {
