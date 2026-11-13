@@ -1,0 +1,542 @@
+#!/usr/bin/env bash
+# spatial_composition：line3_spatial 步骤 9 区域组成差异分析。
+#
+# 输入：步骤 8 产物 spatial_cooccurrence_mouse.h5ad / spatial_cooccurrence_human.h5ad
+#       （obs 带 domain 列与步骤 8 两列，uns 带 cooccurrence 口径键）。
+#
+# 口径定稿依据（服务器探针实测，2026-10-13，cn_debug/s4_composition_probe.py）：
+#   - domain 身份样本私有（obs['domain'] = "<sample_id>_d<n>"，步骤 5 命名空间
+#     隔离设计）：任意两样本的 domain 集合不重叠，按域身份直接比组成向量
+#     Bray-Curtis 全 1.0、逐域 KW 无意义（探针实测）。故本步骤比的是
+#     **rank 对齐的域规模谱**（每样本内各域 spot 占比降序序列）与样本级
+#     多样性指标，而不是域内容本身。
+#   - 分组：condition_class 级（mouse stst 6 vs nafld 4；human steatotic 3
+#     vs non_steatotic 2，均 >=2 可检验）。condition 原始值级 mouse
+#     StSt 6 / SD 1 / WD 3，SD 单样本不可检验，如实记录跳过不硬做。
+#   - 小样本显著性口径（line2 DEG 教训同款）：显著性只作参考，重点报效应量
+#     （KW eta^2）与精确置换 p；阈值固定 0.05 不随结果调整。human 2v3
+#     只有 C(5,2)=10 种标签分配，精确置换 p 最小可能值 0.1，永远不可能
+#     p<0.05，这是数据设计属性（2 vs 3 样本）不是方法缺陷，报告如实写明。
+#
+# 做法：
+#   1. 每样本域规模谱：各域 spot 占比降序（rank 1..K），样本级指标
+#      n_domains / Shannon H / 有效域数 exp(H) / top1 占比 / top3 集中度；
+#   2. 组间比较：逐 rank 占比 KW 检验（k=2 即 Wilcoxon）+ eta^2 效应量；
+#      样本级指标同样 KW + eta^2；
+#   3. 组成谱距离置换检验：rank 对齐谱（不足 max_K 补 0）的两两 L1 距离，
+#      统计量 T = 组间均值 - 组内均值；2 组时精确枚举全部 C(n,n1) 种标签
+#      分配（mouse 210 / human 10，可全枚举无需蒙特卡洛，结果与 seed 无关），
+#      非 2 组回退 seed 注入的 10000 次随机置换；
+#   4. spot 级贴回 domain_rank / domain_prop 两列 obs。
+#
+# 自校验内建：输入契约（步骤 8 键集合 + cooccurrence 口径键 + 未做过组成）、
+# 每样本组成行和=1、每样本 domain 数与步骤 8 uns 记录一致、每样本 spot 数
+# 与步骤 8 uns 记录一致、rank 1..K 完整、H 在 [0, log K]、domain_prop 在
+# [0,1]、spot 级 rank 与所属域一致、X/counts/X_pca/domain/obs/var 不变量。
+# 任一不过非零退出。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：两个 h5ad（步骤 8 产物，小鼠 / 人源）。模式前后都带 *：拿到的是绝对路径，
+# 前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+mouse_h5ad=""
+human_h5ad=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *mouse*.h5ad) mouse_h5ad="$path" ;;
+    *human*.h5ad) human_h5ad="$path" ;;
+    *.h5ad) echo "无法识别的输入文件: $path（文件名需含 mouse/human 物种标识）" >&2; exit 2 ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 8 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$mouse_h5ad" ] && [ -z "$human_h5ad" ]; then
+  # 单物种数据集（GSE233814 只有小鼠 GPL24247）不再要求两份都提供。
+  # 判据改为「至少一份」：两份都缺才报错；实际提供哪份，下游按文件名分流。
+  echo "缺少必需输入：至少需要一份物种 h5ad（mouse 或 human）" >&2
+  exit 2
+fi
+for path in "$mouse_h5ad" "$human_h5ad"; do
+  [ -n "$path" ] || continue
+  if [ ! -f "$path" ]; then
+    echo "输入文件不存在: $path"
+    exit 2
+  fi
+done
+
+echo "step_executed=spatial_composition"
+echo "bioanalys_seed=${seed}"
+echo "input_mouse=${mouse_h5ad}"
+echo "input_human=${human_h5ad}"
+
+COMP_INPUTS="$mouse_h5ad
+$human_h5ad"
+export COMP_INPUTS
+export COMP_OUTDIR="${COMP_OUTDIR:-$(pwd)}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import sys
+import time
+from itertools import combinations
+from math import comb
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+from scipy.stats import kruskal
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+N_PERM_FALLBACK = 10000   # 非 2 组时的随机置换次数（seed 注入）
+EXACT_LIMIT = 20000       # 精确枚举上限：C(n, n1) 不超过此值才全枚举
+SEED = int(os.environ["BIOANALYS_SEED"])
+ALPHA = 0.05              # 显著性阈值，固定不随结果调整
+
+
+def fail(message):
+    sys.stderr.write("spatial_composition 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+# 步骤 8 产物键集合（= 步骤 7 键集合 + obs 加 2 列共现 + uns 加 cooccurrence）
+REQUIRED_OBS = ["barcode", "sample_id", "gsm", "species", "platform_id", "strain",
+                "condition", "condition_class", "group", "tissue", "in_tissue",
+                "array_row", "array_col", "pxl_row_fullres", "pxl_col_fullres",
+                "ncount", "nfeature", "total_counts", "n_genes_by_counts", "pct_mito",
+                "domain", "domain_same_frac", "domain_same_z"]
+REQUIRED_VAR = ["gene_symbol", "genome", "feature_type", "means", "dispersions",
+                "dispersions_norm", "highly_variable", "morans_i_mean", "morans_i_min",
+                "morans_i_max", "morans_z_mean", "gearys_c_mean", "gearys_c_min",
+                "gearys_c_max", "autocorr_n_valid_samples"]
+REQUIRED_UNS = ["coord_note", "dimred", "domains", "gene_id_type", "genome",
+                "grouping_check", "hvg", "image_note", "log1p", "markers",
+                "autocorr", "cooccurrence", "normalization", "pca", "qc", "samples",
+                "seed", "source_h5ad", "source_soft_human", "source_soft_mouse",
+                "source_tar", "spatial", "species", "warnings"]
+
+
+def shannon(p):
+    """组成 Shannon 多样性（nat）。p 为占比向量，内部剔除 0。"""
+    q = p[p > 0]
+    return float(-(q * np.log(q)).sum())
+
+
+def kw_test(values_by_group, group_names):
+    """KW 检验 + eta^2 效应量。全组同值（scipy 报 ValueError）时记 skipped。
+
+    返回值全部为可 h5ad 序列化的标量：缺失数值用 nan、跳过原因为空串或说明串
+    （uns 里禁 None：anndata 写 list-of-dicts / None 会炸，见本脚本落盘段）。
+    """
+    groups = [np.asarray(v, dtype=float) for v in values_by_group]
+    names = list(group_names)
+    n = int(sum(len(g) for g in groups))
+    k = len(groups)
+    try:
+        res = kruskal(*groups)
+    except ValueError:
+        return {"groups": names, "n": n, "k": k, "h": float("nan"), "p": float("nan"),
+                "eta2": float("nan"), "skipped": "all_values_identical"}
+    h = float(res.statistic)
+    p = float(res.pvalue)
+    eta2 = (h - k + 1) / (n - k) if n > k else float("nan")
+    return {"groups": names, "n": n, "k": k, "h": round(h, 4), "p": p,
+            "eta2": round(float(eta2), 4), "skipped": ""}
+
+
+def pairwise_l1(P):
+    """rank 对齐谱的两两 L1 距离矩阵（谱已 padded 到同宽）。"""
+    n = P.shape[0]
+    D = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            D[i, j] = D[j, i] = float(np.abs(P[i] - P[j]).sum())
+    return D
+
+
+def between_minus_within(D, labels):
+    """T = 组间平均 L1 - 组内平均 L1。"""
+    n = len(labels)
+    w, b = [], []
+    for i in range(n):
+        for j in range(i + 1, n):
+            (w if labels[i] == labels[j] else b).append(D[i, j])
+    if not w or not b:
+        return float("nan")
+    return float(np.mean(b) - np.mean(w))
+
+
+def permutation_test(P, labels, rng):
+    """组标签置换检验 T = 组间均值 - 组内均值。
+
+    恰好 2 组且 C(n, n1) <= EXACT_LIMIT 时精确枚举全部分配（结果与 seed 无关，
+    可复现性更强）；否则 seed 注入随机置换 N_PERM_FALLBACK 次。
+    """
+    labels = list(labels)
+    uniq = sorted(set(labels))
+    n = len(labels)
+    D = pairwise_l1(P)
+    t_obs = between_minus_within(D, labels)
+    if len(uniq) == 2:
+        ga = uniq[0]
+        idx_a = [i for i, g in enumerate(labels) if g == ga]
+        n_a = len(idx_a)
+        total = comb(n, n_a)
+        if total <= EXACT_LIMIT:
+            ge = abs(t_obs)
+            count = 0
+            null = []
+            for choice in combinations(range(n), n_a):
+                cs = set(choice)
+                perm_labels = [ga if i in cs else uniq[1] for i in range(n)]
+                t = between_minus_within(D, perm_labels)
+                null.append(t)
+                if abs(t) >= ge - 1e-12:
+                    count += 1
+            null = np.asarray(null)
+            return {
+                "mode": "exact_enumeration", "n_assignments": int(total),
+                "t_obs": round(t_obs, 6), "p": count / total,
+                "null_mean": round(float(null.mean()), 6),
+                "null_sd": round(float(null.std(ddof=1)), 6) if total > 1 else float("nan"),
+                "note": "2 组精确枚举全部标签分配，无蒙特卡洛误差，结果与 seed 无关",
+            }
+    # 回退：随机置换
+    null = np.empty(N_PERM_FALLBACK)
+    ge = abs(t_obs)
+    count = 0
+    for i in range(N_PERM_FALLBACK):
+        perm = list(labels)
+        rng.shuffle(perm)
+        t = between_minus_within(D, perm)
+        null[i] = t
+        if abs(t) >= ge - 1e-12:
+            count += 1
+    return {
+        "mode": "random_permutation", "n_perm": N_PERM_FALLBACK,
+        "t_obs": round(t_obs, 6), "p": (count + 1) / (N_PERM_FALLBACK + 1),
+        "null_mean": round(float(null.mean()), 6),
+        "null_sd": round(float(null.std(ddof=1)), 6),
+        "note": "seed 注入随机置换（add-one 校正）",
+    }
+
+
+report_sections = []
+rng = np.random.default_rng(SEED)
+
+for path in os.environ["COMP_INPUTS"].splitlines():
+    path = path.strip()
+    if not path:
+        continue
+    species = "mouse" if "mouse" in os.path.basename(path) else "human"
+    adata = ad.read_h5ad(path)
+    log("loaded %s spots=%d genes=%d" % (species, adata.shape[0], adata.shape[1]))
+
+    # --- 1. 输入契约：必须是步骤 8 产物且未做过组成分析 ---
+    missing_obs = [col for col in REQUIRED_OBS if col not in adata.obs.columns]
+    if missing_obs:
+        fail("%s 缺少 obs 列 %s（不是 spatial_cooccurrence 产物？）" % (path, missing_obs))
+    missing_var = [col for col in REQUIRED_VAR if col not in adata.var.columns]
+    if missing_var:
+        fail("%s 缺少 var 列 %s" % (path, missing_var))
+    missing_uns = [key for key in REQUIRED_UNS if key not in adata.uns]
+    if missing_uns:
+        fail("%s 缺少 uns 键 %s（不是 spatial_cooccurrence 产物？）" % (path, missing_uns))
+    if "counts" not in adata.layers:
+        fail("%s 缺少 layers['counts']" % path)
+    for key in ["X_pca", "X_umap", "spatial"]:
+        if key not in adata.obsm:
+            fail("%s 缺少 obsm['%s']" % (path, key))
+    if "composition" in adata.uns:
+        fail("%s 已含组成结果（重复执行？）" % path)
+    x_nnz_before = adata.X.nnz
+    counts_nnz_before = adata.layers["counts"].nnz
+    pca_before = adata.obsm["X_pca"].copy()
+    domain_before = adata.obs["domain"].copy()
+    obs_cols_before = list(adata.obs.columns)
+    var_cols_before = list(adata.var.columns)
+    cooccur_uns = adata.uns["cooccurrence"]
+    cooccur_samples = cooccur_uns["samples"]
+
+    samples = sorted(adata.obs["sample_id"].unique())
+    log("%s samples=%d" % (species, len(samples)))
+
+    # --- 2. 逐样本域规模谱 + 样本级指标 ---
+    t0 = time.time()
+    spot_rank = np.zeros(adata.shape[0], dtype=int)
+    spot_prop = np.zeros(adata.shape[0], dtype=float)
+    sample_rows = []
+    uns_samples = {}
+    spectra = []          # rank 对齐谱（稍后 pad 到同宽）
+    sample_conds = []
+    sample_ccls = []
+    for sample in samples:
+        mask = (adata.obs["sample_id"] == sample).to_numpy()
+        # categorical 的 value_counts 会把未观测类别（其他样本的域）也以 count 0
+        # 列出来，先转 str 只保留本样本观测到的域（步骤 8 同位置用 astype("category")
+        # 重建规避，此处等价）。
+        dom = adata.obs.loc[mask, "domain"].astype(str)
+        counts = dom.value_counts()
+        # 与步骤 8 uns 记录对账（独立记录，防口径漂移）
+        rec = cooccur_samples.get(sample)
+        if rec is None:
+            fail("%s %s 不在步骤 8 uns['cooccurrence'] 样本记录中" % (species, sample))
+        if len(counts) != len(rec["domains"]):
+            fail("%s %s domain 数 %d 与步骤 8 记录 %d 不一致"
+                 % (species, sample, len(counts), len(rec["domains"])))
+        if int(mask.sum()) != int(rec["n_spots"]):
+            fail("%s %s spot 数 %d 与步骤 8 记录 %d 不一致"
+                 % (species, sample, int(mask.sum()), int(rec["n_spots"])))
+        # 规模降序谱（ties 按域名排序保证确定性）
+        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        props = np.array([c for _, c in ordered], dtype=float) / float(mask.sum())
+        rank_of = {d: r + 1 for r, (d, _) in enumerate(ordered)}
+        h = shannon(props)
+        k = len(props)
+        top3 = float(props[: min(3, k)].sum())
+        if abs(float(props.sum()) - 1.0) > 1e-9:
+            fail("%s %s 未舍入组成谱行和 %.9f != 1" % (species, sample, float(props.sum())))
+        if h < -1e-9 or h > np.log(k) + 1e-9:
+            fail("%s %s Shannon %.6f 越界 [0, log %d]" % (species, sample, h, k))
+        for d, r in rank_of.items():
+            sel = mask & (adata.obs["domain"] == d).to_numpy()
+            spot_rank[sel] = r
+            spot_prop[sel] = props[r - 1]
+        spectra.append(props)
+        sample_conds.append(str(adata.obs.loc[mask, "condition"].iloc[0]))
+        sample_ccls.append(str(adata.obs.loc[mask, "condition_class"].iloc[0]))
+        row = {
+            "sample_id": sample,
+            "condition": sample_conds[-1],
+            "condition_class": sample_ccls[-1],
+            "n_spots": int(mask.sum()),
+            "n_domains": int(k),
+            "shannon": round(h, 4),
+            "effective_domains": round(float(np.exp(h)), 4),
+            "top1_frac": round(float(props[0]), 4),
+            "top3_frac": round(top3, 4),
+        }
+        for r in range(k):
+            row["prop_rank%d" % (r + 1)] = round(float(props[r]), 4)
+        sample_rows.append(row)
+        uns_samples[sample] = {
+            "n_spots": int(mask.sum()),
+            "domains": [d for d, _ in ordered],
+            "domain_props": [round(float(p), 4) for p in props],
+            "domain_rank_map": rank_of,
+            "n_domains": int(k),
+            "shannon": round(h, 4),
+            "effective_domains": round(float(np.exp(h)), 4),
+            "top1_frac": round(float(props[0]), 4),
+            "top3_frac": round(top3, 4),
+        }
+        log("  %s cond=%s spots=%d domains=%d H=%.3f top1=%.3f"
+            % (sample, sample_conds[-1], int(mask.sum()), k, h, float(props[0])))
+    elapsed = time.time() - t0
+    log("composition profiles done %.1fs" % elapsed)
+
+    # rank 对齐谱矩阵（不足 max_K 补 0）
+    max_k = max(len(s) for s in spectra)
+    P = np.zeros((len(samples), max_k))
+    for i, s in enumerate(spectra):
+        P[i, : len(s)] = s
+
+    # --- 3. 组间检验 ---
+    group_tests = {}
+    for level, label_arr in (("condition_class", sample_ccls), ("condition", sample_conds)):
+        uniq = sorted(set(label_arr))
+        sizes = {g: int(label_arr.count(g)) for g in uniq}
+        if any(sizes[g] < 2 for g in uniq) or len(uniq) < 2:
+            group_tests[level] = {
+                "groups": sizes,
+                "skipped": "有组样本数 < 2（%s），组间检验不可做，如实记录不硬做"
+                           % {g: sizes[g] for g in uniq if sizes[g] < 2},
+            }
+            log("%s 级分组 %s：有组 <2 样本，跳过组间检验" % (level, sizes))
+            continue
+        per_rank = {}
+        for r in range(max_k):
+            vals = P[:, r]
+            n_nz = int((vals > 0).sum())
+            res = kw_test([vals[[i for i, g in enumerate(label_arr) if g == gu]]
+                           for gu in uniq], uniq)
+            res["rank"] = r + 1
+            res["n_nonzero"] = n_nz
+            # 键控 dict 而非 list-of-dicts：anndata 写 uns 的 list 会按数值数组
+            # 推断，list-of-dicts 转 object 数组再当 vlen 字符串写直接 TypeError。
+            per_rank["rank%d" % (r + 1)] = res
+        metric_tests = {}
+        for metric in ("shannon", "effective_domains", "top1_frac", "top3_frac", "n_domains"):
+            vals = np.array([row[metric] for row in sample_rows], dtype=float)
+            metric_tests[metric] = kw_test(
+                [vals[[i for i, g in enumerate(label_arr) if g == gu]] for gu in uniq], uniq)
+        perm = permutation_test(P, label_arr, rng)
+        group_tests[level] = {
+            "groups": sizes,
+            "skipped": "",
+            "per_rank": per_rank,
+            "sample_metrics": metric_tests,
+            "permutation": perm,
+        }
+        n_sig = sum(1 for r in per_rank.values()
+                    if not np.isnan(r["p"]) and r["p"] < ALPHA)
+        log("%s 级分组 %s：逐 rank p<%.2f 的 %d/%d；置换 p=%.4f（%s）"
+            % (level, sizes, ALPHA, n_sig, len(per_rank), perm["p"], perm["mode"]))
+
+    # --- 4. 自校验 ---
+    for i, row in enumerate(sample_rows):
+        # 落盘值是 4 位小数舍入，K 个 rank 累计偏差可达 K*5e-5，容差按 1e-3
+        # （未舍入谱的精确行和=1 已在逐样本循环内紧容差校验）。
+        s = sum(v for k, v in row.items() if k.startswith("prop_rank"))
+        if abs(s - 1.0) > 1e-3:
+            fail("%s %s 组成行和 %.6f != 1（舍入后仍超 1e-3）" % (species, row["sample_id"], s))
+    if not np.all((spot_prop >= -1e-9) & (spot_prop <= 1.0 + 1e-9)):
+        fail("%s domain_prop 超出 [0,1]" % species)
+    if not np.all(spot_rank >= 1):
+        fail("%s 有 spot 的 domain_rank < 1（未被赋值？）" % species)
+    for i, sample in enumerate(samples):
+        mask = (adata.obs["sample_id"] == sample).to_numpy()
+        k = uns_samples[sample]["n_domains"]
+        if spot_rank[mask].max() != k:
+            fail("%s %s spot 级 rank 最大值 %d != 域数 %d"
+                 % (species, sample, int(spot_rank[mask].max()), k))
+    if adata.X.nnz != x_nnz_before:
+        fail("%s X nnz 被改变" % species)
+    if adata.layers["counts"].nnz != counts_nnz_before:
+        fail("%s counts 层 nnz 被改变" % species)
+    if not np.array_equal(adata.obsm["X_pca"], pca_before):
+        fail("%s X_pca 被改动" % species)
+    if not adata.obs["domain"].equals(domain_before):
+        fail("%s domain 列被改动" % species)
+    for col in REQUIRED_OBS:
+        if col not in adata.obs.columns:
+            fail("%s obs 列丢失: %s" % (species, col))
+    for col in REQUIRED_VAR:
+        if col not in adata.var.columns:
+            fail("%s var 列丢失: %s" % (species, col))
+
+    # --- 5. 落盘 ---
+    adata.obs["domain_rank"] = spot_rank
+    adata.obs["domain_prop"] = spot_prop
+    adata.uns["composition"] = {
+        "method": "per_sample_domain_size_spectrum_rank_aligned_group_comparison",
+        "note": "domain 身份样本私有（<sample_id>_d<n>），按域身份跨样本比组成无意义"
+                "（探针实测 Bray-Curtis 全 1.0）；本步骤比 rank 对齐域规模谱与样本级多样性",
+        "alpha": ALPHA,
+        "seed": SEED,
+        "samples_total": len(samples),
+        "samples": uns_samples,
+        "group_tests": group_tests,
+        "source_h5ad": path,
+    }
+    h5ad_name = "spatial_composition_%s.h5ad" % species
+    adata.write_h5ad(h5ad_name)
+
+    tsv_name = "sample_composition_%s.tsv" % species
+    tsv_df = pd.DataFrame(sample_rows)
+    tsv_df.to_csv(tsv_name, sep="\t", index=False)
+    log("%s wrote %s (%d spots) + %s (%d 行)"
+        % (species, h5ad_name, adata.shape[0], tsv_name, len(tsv_df)))
+
+    cc = group_tests.get("condition_class", {})
+    lines = [
+        "[%s]" % species,
+        "spots=%d genes=%d samples=%d" % (adata.shape[0], adata.shape[1], len(samples)),
+        "seconds=%.1f" % elapsed,
+        "grouping=condition_class %s / condition %s"
+        % (cc.get("groups"), group_tests.get("condition", {}).get("groups")),
+        "shannon_mean=%.4f effective_domains_mean=%.4f top1_mean=%.4f"
+        % (float(np.mean([r["shannon"] for r in sample_rows])),
+           float(np.mean([r["effective_domains"] for r in sample_rows])),
+           float(np.mean([r["top1_frac"] for r in sample_rows]))),
+    ]
+    for level in ("condition_class", "condition"):
+        gt = group_tests.get(level, {})
+        if gt.get("skipped"):
+            lines.append("%s_skipped=%s" % (level, gt["skipped"]))
+            continue
+        perm = gt["permutation"]
+        lines.append("%s_groups=%s" % (level, gt["groups"]))
+        lines.append("%s_permutation mode=%s p=%.4f t_obs=%.4f null_mean=%.4f"
+                     % (level, perm["mode"], perm["p"], perm["t_obs"], perm["null_mean"]))
+        for rk, r in gt["per_rank"].items():
+            if np.isnan(r["p"]):
+                lines.append("  %s n_nonzero=%d KW skipped(%s)"
+                             % (rk, r["n_nonzero"], r["skipped"]))
+            else:
+                lines.append("  %s n_nonzero=%d KW H=%.3f p=%.4f eta2=%.3f"
+                             % (rk, r["n_nonzero"], r["h"], r["p"], r["eta2"]))
+        for m, res in gt["sample_metrics"].items():
+            if np.isnan(res["p"]):
+                lines.append("  metric %s KW skipped(%s)" % (m, res["skipped"]))
+            else:
+                lines.append("  metric %-18s KW H=%.3f p=%.4f eta2=%.3f"
+                             % (m, res["h"], res["p"], res["eta2"]))
+    lines.append("small_sample_note=显著性只作参考，重点看效应量与置换 p；human 2v3 "
+                 "精确枚举仅 10 种分配，p 最小可能值 0.1，永远不可能 p<0.05（数据设计属性）")
+    report_sections.append("\n".join(lines))
+
+report_lines = [
+    "step=spatial_composition",
+    "seed=%d" % SEED,
+    "method=逐样本域规模谱（spot 占比降序 rank 对齐）+ 样本级多样性；组间逐 rank KW + eta2 + 组成谱 L1 距离置换检验",
+    "domain_identity_note=domain 身份样本私有（<sample_id>_d<n>），按域身份跨样本比组成无意义，比的是规模结构不是域内容",
+    "grouping_note=condition_class 级（ingest CONDITION_CLASS 设计，SD/WD 并 nafld）；condition 原始值级有单样本组则跳过并记录",
+    "outputs=spatial_composition_mouse.h5ad, spatial_composition_human.h5ad, "
+    "sample_composition_mouse.tsv, sample_composition_human.tsv, composition_report.txt",
+] + report_sections + [
+    "elapsed_seconds=%.0f" % (time.time() - START),
+]
+with open("composition_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'composition_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('composition_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("spatial_composition_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "${COMP_OUTDIR:-$(pwd)}" "composition_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

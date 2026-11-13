@@ -1,0 +1,25 @@
+# line3_spatial 分析环境声明（正本，分析中途不更换）
+
+台账 environment 字段由 BioanalysDesktop 从本文件读取；服务器侧副本由
+tools/ops/06_deploy_scripts.ps1 部署到 /mnt/ssd/bio_data/envs/line3_spatial/（全局一份，所有项目共用），
+步骤脚本在服务器上读到的就是这份声明。改版本号 = 新分析项目，不做热切换。
+
+language=Python
+version=3.12.3
+env_name=line3_spatial_env
+container_image=proot-ubuntu24.04-aarch64
+
+# 关键分析依赖（2026-10-13 步骤 1 起生效；空间分析栈后续步骤按需新增，
+# 安装前先 dry-run 证实不动核心栈，参考线2 scTenifoldpy/liana 的安装纪律）
+scanpy=1.12.4
+anndata=0.13.4
+pandas=2.3.3
+numpy=2.5.4
+scipy=1.18.1
+scikit-learn=1.9.1
+matplotlib=3.11.2
+h5py=3.16.0
+pillow=13.0.0
+liana=1.10.0
+sctenifoldpy=0.5.1
+gseapy=1.3.1

@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# normalize_hvg：line3_spatial 步骤 3 归一化 / 高变基因。
+#
+# 输入：步骤 2 产物 spatial_qc_mouse.h5ad / spatial_qc_human.h5ad
+#   （spots x genes 稀疏计数矩阵，obs 带样本元数据 + ncount/nfeature/total_counts/
+#   n_genes_by_counts/pct_mito 列，var 带 gene_symbol/genome/feature_type，
+#   uns 带 spatial 图与 scalefactors、seed、species、samples、qc 等口径键）。
+#
+# 做两件事（按物种分别处理，基因宇宙不同禁止跨物种）：
+#   1. 归一化：scanpy normalize_total(target_sum=1e4) + log1p（Scanpy 流程标准口径，
+#      与 Seurat LogNormalize 数值等价：每 spot 缩到 1e4 后取 log）。
+#      原始整数计数存 layers['counts']，不丢（下游差异/敲除分析要用）。
+#   2. 高变基因：seurat flavor，n_top_genes=2000（dispersion 口径，与 line2 步骤 3
+#       同口径），按物种在全数据集选取，未分样本 batch。矩阵保留全基因归一化结果，
+#       HVG 清单单独落 tsv 供步骤 4 降维聚类用（空间表达分析仍用全基因）。
+#       mito 基因为内源基因不剔除（与 line2 剔除 ERCC spike-in 不同），
+#       入选 HVG 的数量如实进报告（小鼠 10 / 人源 5，原型实测）。
+#
+# 自校验内建：输入契约（obs/var/uns 必备列键 + spatial 双在位 + CSR 整数矩阵）、
+# 归一化后每 spot 库大小 == 1e4（1e-4 容差）、log1p 后 X 全有限非负、
+# HVG 数精确 2000、layers['counts'] 为整数且与 X 同形同 nnz、counts 层 spot
+# 合计与 obs['total_counts'] 一致（归一化没碰原始计数）、obs 20 列不丢、
+# obs_names 唯一、uns['samples'] 与 obs 一致。任一不过非零退出。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：每个 .h5ad 输入各是一个物种的步骤 2 产物，物种从 uns 读，
+# 不靠文件名猜。模式前后都带 *：拿到的是绝对路径（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ "${#INPUTS[@]}" -eq 0 ]; then
+  echo "缺少必需输入：需要步骤 2 产物 h5ad（spatial_qc_mouse/human.h5ad）" >&2
+  exit 2
+fi
+for path in "${INPUTS[@]}"; do
+  case "$path" in
+    *.h5ad) ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad）" >&2; exit 2 ;;
+  esac
+  if [ ! -f "$path" ]; then
+    echo "输入文件不存在: $path" >&2
+    exit 2
+  fi
+done
+
+echo "step_executed=normalize_hvg"
+echo "bioanalys_seed=${seed}"
+
+# 输入列表与输出目录经环境变量进 python（换行分隔，避免参数长度与引号问题）
+inputs_newline=""
+for path in "${INPUTS[@]}"; do
+  inputs_newline="${inputs_newline}${path}"$'\n'
+done
+export NORM_INPUTS="$inputs_newline"
+export NORM_OUTDIR="${NORM_OUTDIR:-$(pwd)}"
+
+export BIOANALYS_SEED="$seed"
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import os
+import sys
+import time
+
+import anndata as ad
+import numpy as np
+import scanpy as sc
+
+# pandas 3 与 2 的 infer_string 默认值不同，写 obs 字符串列时会因 nullable strings
+# 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+SEED = os.environ["BIOANALYS_SEED"]
+
+# 口径（与 line2 步骤 3 对齐；改口径 = 新分析项目，不做热切换）
+TARGET_SUM = 1e4
+N_TOP_GENES = 2000
+
+SPECIES_TAG = {"Mus musculus": "mouse", "Homo sapiens": "human"}
+MITO_PREFIX = {"Mus musculus": "mt-", "Homo sapiens": "MT-"}
+
+REQUIRED_OBS = ["barcode", "sample_id", "gsm", "species", "platform_id", "strain",
+                "condition", "condition_class", "group", "tissue", "in_tissue",
+                "array_row", "array_col", "pxl_row_fullres", "pxl_col_fullres",
+                "ncount", "nfeature", "total_counts", "n_genes_by_counts", "pct_mito"]
+REQUIRED_VAR = ["gene_symbol", "genome", "feature_type"]
+REQUIRED_UNS = ["seed", "source_tar", "source_soft_mouse", "source_soft_human",
+                "grouping_check", "species", "genome", "gene_id_type", "samples",
+                "coord_note", "image_note", "qc"]
+
+started = time.time()
+
+
+def fail(msg):
+    print("FAIL: %s" % msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+# --- 1. 输入契约校验：必须是步骤 2 产物 ---
+inputs = [p for p in os.environ["NORM_INPUTS"].split("\n") if p.strip()]
+if not inputs:
+    fail("NORM_INPUTS 环境变量为空")
+
+loaded = {}
+for path in inputs:
+    a = ad.read_h5ad(path)
+    missing_obs = [c for c in REQUIRED_OBS if c not in a.obs.columns]
+    if missing_obs:
+        fail("%s 缺少 obs 列: %s" % (path, missing_obs))
+    missing_var = [c for c in REQUIRED_VAR if c not in a.var.columns]
+    if missing_var:
+        fail("%s 缺少 var 列: %s" % (path, missing_var))
+    missing_uns = [k for k in REQUIRED_UNS if k not in a.uns]
+    if missing_uns:
+        fail("%s 缺少 uns 键: %s" % (path, missing_uns))
+    if "spatial" not in a.obsm or "spatial" not in a.uns:
+        fail("%s 缺少 obsm/uns spatial（空间数据必需）" % path)
+    species = a.uns["species"]
+    if species not in MITO_PREFIX:
+        fail("%s 未知物种: %s" % (path, species))
+    if species in loaded:
+        fail("物种 %s 出现两次输入（%s 与 %s），每个物种只应有一个矩阵" %
+             (species, loaded[species][0], path))
+    if a.X.getformat() != "csr":
+        fail("%s X 不是 csr（步骤 2 产物应为 csr）" % path)
+    if not np.issubdtype(a.X.dtype, np.integer):
+        fail("%s X 不是整数计数 dtype: %s" % (path, a.X.dtype))
+    if a.X.min() < 0:
+        fail("%s 输入矩阵含负值" % path)
+    loaded[species] = (path, a)
+    log("input=%s species=%s spots=%d genes=%d nnz=%d"
+        % (path, species, a.n_obs, a.n_vars, a.X.nnz))
+
+if not loaded:
+    fail("没有可用输入")
+
+# --- 2. 逐物种归一化 + HVG ---
+report_lines = [
+    "step=normalize_hvg",
+    "seed=%s" % SEED,
+    "normalization=scanpy normalize_total(target_sum=%g) + log1p（与 Seurat LogNormalize 数值等价）" % TARGET_SUM,
+    "hvg_method=seurat flavor, n_top_genes=%d（dispersion 口径，按物种全数据集选取未分 batch）" % N_TOP_GENES,
+    "counts_layer=layers['counts'] 原始整数计数已保留",
+    "mito_note=mito 基因为内源基因不剔除（不同于 line2 剔除 ERCC spike-in），入选 HVG 数如实报告",
+]
+
+for species in sorted(loaded):
+    path, a = loaded[species]
+    tag = SPECIES_TAG[species]
+    log("=== %s (%s) ===" % (species, path))
+
+    # 2a. 原始计数存层（normalize_total 原地改 X，必须先存）
+    counts_layer = a.X.copy()
+    a.layers["counts"] = counts_layer
+    nnz_before = a.X.nnz
+
+    # 2b. 归一化 + log
+    sc.pp.normalize_total(a, target_sum=TARGET_SUM)
+    lib_after = np.asarray(a.X.sum(axis=1)).ravel()
+    if not np.allclose(lib_after, TARGET_SUM, rtol=1e-4, atol=1e-2):
+        fail("%s 归一化后库大小不都等于 %g（min=%.6f max=%.6f）"
+             % (path, TARGET_SUM, lib_after.min(), lib_after.max()))
+    sc.pp.log1p(a)
+    if not np.isfinite(a.X.data).all():
+        fail("%s log1p 后 X 含非有限值" % path)
+    if a.X.data.size and a.X.data.min() < 0:
+        fail("%s log1p 后 X 含负值" % path)
+    if a.X.nnz != nnz_before:
+        fail("%s 归一化改变了稀疏结构 nnz %d -> %d" % (path, nnz_before, a.X.nnz))
+    log("normalize_total+log1p OK lib=%.4f nnz=%d"
+        % (float(np.median(lib_after)), a.X.nnz))
+
+    # 2c. HVG（seurat flavor，dispersion 口径，无随机性）
+    sc.pp.highly_variable_genes(a, flavor="seurat", n_top_genes=N_TOP_GENES)
+    hvg_mask = a.var["highly_variable"].to_numpy(dtype=bool)
+    hvg_count = int(hvg_mask.sum())
+    if hvg_count != N_TOP_GENES:
+        fail("%s HVG 数量 %d != 预期 %d" % (path, hvg_count, N_TOP_GENES))
+    mito_in_hvg = int(a.var.loc[hvg_mask, "gene_symbol"]
+                      .str.startswith(MITO_PREFIX[species]).sum())
+    log("hvg=%d / %d (mito_in_hvg=%d)" % (hvg_count, a.n_vars, mito_in_hvg))
+
+    # 2d. 落盘前自校验
+    if a.layers["counts"].shape != a.X.shape:
+        fail("%s layers['counts'] 与 X 形状不一致" % path)
+    if not np.issubdtype(a.layers["counts"].dtype, np.integer):
+        fail("%s layers['counts'] dtype 非整数" % path)
+    if a.layers["counts"].nnz != nnz_before:
+        fail("%s layers['counts'] nnz 与原始矩阵不一致" % path)
+    # counts 层 spot 合计必须等于步骤 2 落的 total_counts 列（归一化没碰原始计数）
+    layer_totals = np.asarray(a.layers["counts"].sum(axis=1)).ravel()
+    if not (layer_totals == a.obs["total_counts"].to_numpy()).all():
+        fail("%s counts 层 spot 合计与 obs['total_counts'] 不一致" % path)
+    lost_obs = [c for c in REQUIRED_OBS if c not in a.obs.columns]
+    if lost_obs:
+        fail("%s 归一化后丢失 obs 列: %s" % (path, lost_obs))
+    if not a.obs_names.is_unique:
+        fail("%s obs_names 不唯一" % path)
+    if set(a.uns["samples"]) != set(a.obs["sample_id"].unique()):
+        fail("%s uns['samples'] 与 obs sample_id 不一致" % path)
+    if set(a.uns["spatial"].keys()) != set(a.obs["sample_id"].unique()):
+        fail("%s uns['spatial'] 样本集与 obs 不一致" % path)
+
+    # 2e. 落盘（全基因归一化矩阵 + 本物种 HVG 清单）
+    a.uns["normalization"] = {"method": "scanpy_normalize_total_log1p",
+                              "target_sum": TARGET_SUM}
+    a.uns["hvg"] = {"method": "scanpy_seurat_flavor", "n_top_genes": N_TOP_GENES,
+                    "batch_key": None}
+    a.uns["seed"] = int(SEED)
+    a.uns["source_h5ad"] = path
+    out_h5ad = os.path.join(os.environ["NORM_OUTDIR"], "spatial_norm_%s.h5ad" % tag)
+    a.write_h5ad(out_h5ad)
+
+    hvg_table = a.var.loc[hvg_mask, ["gene_symbol", "genome", "means",
+                                     "dispersions", "dispersions_norm"]].copy()
+    hvg_table = hvg_table.sort_values("dispersions_norm", ascending=False)
+    out_tsv = os.path.join(os.environ["NORM_OUTDIR"], "hvg_genes_%s.tsv" % tag)
+    hvg_table.to_csv(out_tsv, sep="\t")
+
+    report_lines.append("[%s] input=%s spots=%d genes=%d nnz=%d"
+                        % (tag, path, a.n_obs, a.n_vars, a.X.nnz))
+    report_lines.append("[%s] lib_size_after=全部 spot %g（min=%.6f max=%.6f）"
+                        % (tag, TARGET_SUM, lib_after.min(), lib_after.max()))
+    report_lines.append("[%s] hvg_count=%d / %d（mito_in_hvg=%d，内源基因未剔除）"
+                        % (tag, hvg_count, a.n_vars, mito_in_hvg))
+    report_lines.append("[%s] hvg_dispersions_norm_range=%.4f - %.4f"
+                        % (tag, float(a.var["dispersions_norm"][hvg_mask].min()),
+                           float(a.var["dispersions_norm"][hvg_mask].max())))
+    report_lines.append("[%s] top20_hvg=%s"
+                        % (tag, " ".join(list(hvg_table["gene_symbol"][:20]))))
+    log("wrote %s spots=%d genes=%d" % (out_h5ad, a.n_obs, a.n_vars))
+
+report_lines.append("elapsed_seconds=%.0f" % (time.time() - started))
+report_lines.append("outputs=spatial_norm_mouse.h5ad, spatial_norm_human.h5ad, "
+                    "hvg_genes_mouse.tsv, hvg_genes_human.tsv, norm_report.txt")
+with open(os.path.join(os.environ["NORM_OUTDIR"], "norm_report.txt"), "w",
+          encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+log("normalize_hvg_all_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "${NORM_OUTDIR:-$(pwd)}" "norm_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

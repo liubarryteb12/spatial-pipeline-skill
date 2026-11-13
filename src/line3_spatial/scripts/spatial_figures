@@ -1,0 +1,1044 @@
+#!/usr/bin/env bash
+# PROVENANCE: INDEPENDENT  本脚本出图代码为独立实现，未派生自 reference/05.可参考出图代码 的源码；
+# spatial_figures：line3_spatial 出图脚本（读步骤 13 产物，产 PNG 供目视审核）。
+#
+# 输入：spatial_knockout_mouse.h5ad / spatial_knockout_human.h5ad
+# 输出（写到 ../figures/，独立出图目录，每物种 7 张）：
+#   l3_{sp}_01_domains.png / 02_target_gene.png / 03_ko_dr.png /
+#   04_morans_top.png / 05_knockout_dr.png / 06_umap_sample.png /
+#   07_domain_composition.png
+# 口径：docs/figure_spec.md（Agg/300dpi/英文标签/逐样本空间图因像素坐标不可比；
+#       图注置于图幅左下角，图例统一在轴框外右侧）。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+declare -a INPUTS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+mouse_h5ad=""
+human_h5ad=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *mouse*.h5ad) mouse_h5ad="$path" ;;
+    *human*.h5ad) human_h5ad="$path" ;;
+    *.h5ad) echo "无法识别的输入文件: $path（文件名需含 mouse/human）" >&2; exit 2 ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad）" >&2; exit 2 ;;
+  esac
+done
+# 单物种数据必须能出图（生信代码专项审核修复）。
+# 原实现强制要求 mouse 与 human 双份 knockout，，但本项目是纯小鼠 Visium（GPL24247），
+# 根本没有 human 产物，于是空间线永远出不了任何图。正确口径是：
+#   mouse 为必需（缺它确实无从出图）；human 为可选，缺席时跳过 human 专属图并如实报告。
+# 不伪造 human 文件来骗过校验，那会让「有 human 数据」变成谎言。
+if [ -z "$mouse_h5ad" ]; then
+  echo "缺少必需输入：spatial_knockout_mouse.h5ad（human 可缺席，mouse 不可）" >&2
+  exit 2
+fi
+if [ -z "$human_h5ad" ]; then
+  echo "human_h5ad=(absent) 单物种模式：human 专属图跳过，仅产 mouse 图"
+fi
+
+echo "step_executed=spatial_figures"
+echo "bioanalys_seed=${seed}"
+echo "input_mouse=${mouse_h5ad}"
+echo "input_human=${human_h5ad}"
+
+FIG_MOUSE="$mouse_h5ad"
+FIG_HUMAN="$human_h5ad"
+export FIG_MOUSE FIG_HUMAN
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import json
+import os
+import sys
+import time
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import anndata as ad
+
+ad.settings.allow_write_nullable_strings = False
+plt.rcParams.update({
+    # 只保留 figure.dpi：落盘 dpi 由 save() 显式传 fig.dpi 钉死，
+    # 再留一个 savefig.dpi 就是同一含义的两个真源，容易改一处忘一处。
+    "figure.dpi": 300, "font.size": 8, "font.family": "sans-serif", "font.sans-serif": ["Arial", "Helvetica", "Liberation Sans", "DejaVu Sans"], "axes.labelsize": 8, "xtick.labelsize": 8, "ytick.labelsize": 8, "legend.fontsize": 8, "legend.title_fontsize": 8,
+    "axes.titlesize": 9, "axes.grid": False,
+    "figure.autolayout": True, "savefig.bbox": "tight",
+    "image.cmap": "viridis",
+})
+
+START = time.time()
+OUT = "../figures"
+os.makedirs(OUT, exist_ok=True)
+made = []
+render_ms = []   # 逐图渲染耗时 (name, ms)，写进 figures_manifest 供超时审计
+
+
+def fail(m):
+    """自校验失败：stderr 写明原因并以非零退出（零产物拒绝正常退出时会用到）。"""
+    sys.stderr.write("spatial_figures 自校验失败: %s\n" % m)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(m):
+    print(m, flush=True)
+
+
+def save(fig, name):
+    # 逐图计时（Argon 第 65 轮 Q3/Q4）：单图 30s 设计目标 / 60s 硬上限。
+    # 计时进 manifest，超时从「不可见」变成「回执可查」，不必为查超时连 K40 真跑。
+    # _SAVE_NAME 让比例尺自检能把结果挂到具体图名上：否则 manifest 里一串
+    # scalebar_check 无法与任何一张 PNG 对应，外部量测也就无从比对。
+    global _SAVE_NAME
+    _SAVE_NAME = name
+    # 落盘 dpi 显式钉死到 figure dpi（DeepSeek 第 73 轮审计建议）。
+    # 为什么：manifest 的 bar_px 是 figure 显示像素（transData 的像素体系由 figure.dpi 决定），
+    # 而落盘像素由 savefig.dpi 决定。两者若不等，bar_px 与 PNG 实测就会脱钩，
+    # 比例尺的第三方交叉验证会静默失效。显式传参把这条依赖从「配置恰好相等」变成「结构性相等」。
+    _dpi_at_save = float(fig.dpi)
+    # DeepSeek 第 73 轮审计：量测时的 dpi 与落盘 dpi 必须显式相等，
+    # 否则 bar_px（figure 显示像素）与 PNG 像素脱钩，交叉验证会静默失效。
+    # 断言而不是依赖「两处 rcParams 恰好相等」。
+    for _rec in reversed(SCALEBAR_LOG):
+        if _rec.get("figure") == name:
+            _dpi_at_measure = _rec.get("dpi_at_measure")
+            if _dpi_at_measure is not None and abs(float(_dpi_at_measure) - _dpi_at_save) > 1e-9:
+                fail("比例尺量测 dpi (%.3f) 与落盘 dpi (%.3f) 不一致：bar_px 与 PNG 像素已脱钩"
+                     % (float(_dpi_at_measure), _dpi_at_save))
+            break
+    _t0 = time.perf_counter()
+    fig.savefig(os.path.join(OUT, name), dpi=_dpi_at_save)
+    plt.close(fig)
+    _ms = (time.perf_counter() - _t0) * 1000.0
+    made.append(name)
+    render_ms.append((name, _ms))
+    log("wrote %s render_ms=%.1f" % (name, _ms))
+
+
+def caption(fig, *parts):
+    """图注默认置于图幅左下角、轴框之外（y<0），靠 savefig(bbox="tight")
+    向下扩边容纳，因此不占用、也不挤压主图数据区（2026-11-06 用户裁定）。
+    不再按图幅横竖分支选位置：旧规范把竖版图注放右上，会与图例列抢空间。"""
+    parts = [str(p) for p in parts if p not in (None, "")]
+    if not parts:
+        return
+    text = "\n".join(parts)
+    fig.text(0.01, -0.02, text, ha="left", va="top", fontsize=8, linespacing=1.5)
+def wrap_label(text, width=18):
+    """长标签换行：超宽标签优先按 _ 边界折行，仍超宽再按字符折行，防溢出图框。"""
+    import textwrap
+
+    s = str(text)
+    if len(s) <= width:
+        return s
+    lines, cur = [], ""
+    for part in s.split("_"):
+        joined = part if not cur else cur + "_" + part
+        if cur and len(joined) > width:
+            lines.append(cur)
+            cur = part
+        else:
+            cur = joined
+    if cur:
+        lines.append(cur)
+    if max(len(x) for x in lines) <= width:
+        return "\n".join(lines)
+    out = []
+    for line in lines:
+        out.extend(textwrap.wrap(line, width=width) or [line])
+    return "\n".join(out)
+
+
+def fit_text_edges(fig, ax, gap=6.0, rounds=5):
+    """把越出坐标轴框的轴内文本收进框内：右缘/顶缘/左缘/下缘越界时自动扩 xlim/ylim。
+    实测像素宽度迭代收敛（至少留 6px 边距，比审计容差 3px 更严），柱顶数值标注与条形
+    末端外挂标注都按同一规则留位；若扩一轮越界没有改善（文本框锚在轴坐标而非数据坐标）
+    就停手，防无意义放大把主图压扁。"""
+    prev = None
+    for _ in range(rounds):
+        fig.canvas.draw()
+        rend = fig.canvas.get_renderer()
+        bb = ax.get_window_extent()
+        boxes = [t.get_window_extent(renderer=rend) for t in ax.texts
+                 if t.get_text().strip()]
+        if not boxes:
+            return
+        bw = max(bb.width, 1e-6)
+        bh = max(bb.height, 1e-6)
+        right = max(b.x1 for b in boxes) - bb.x1
+        top = max(b.y1 for b in boxes) - bb.y1
+        left = bb.x0 - min(b.x0 for b in boxes)
+        bottom = bb.y0 - min(b.y0 for b in boxes)
+        if max(right, top, left, bottom) <= gap:
+            return
+        worst = max(right / bw, top / bh, left / bw, bottom / bh)
+        if prev is not None and worst >= prev * 0.98:
+            return
+        prev = worst
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+        if right > gap:
+            ax.set_xlim(x0, x1 + (x1 - x0) * (right / bw) * 1.15)
+            x0, x1 = ax.get_xlim()
+        if left > gap:
+            ax.set_xlim(x0 - (x1 - x0) * (left / bw) * 1.15, x1)
+            x0, x1 = ax.get_xlim()
+        if top > gap:
+            ax.set_ylim(y0, y1 + (y1 - y0) * (top / bh) * 1.15)
+            y0, y1 = ax.get_ylim()
+        if bottom > gap:
+            ax.set_ylim(y0 - (y1 - y0) * (bottom / bh) * 1.15, y1)
+
+
+def legend_out(ax, fig, leg, slot=0):
+    """图例统一置坐标轴框外右侧、纵向排列（用户 2026-11-07 定稿）。
+    多组图例按 slot 依次向右横排（每组各自纵向单列），互不重叠。
+    所有图幅方向统一放到轴框外右侧。"""
+    handles = list(leg.legend_handles)
+    labels = [t.get_text() for t in leg.get_texts()]
+    title = leg.get_title().get_text() or None
+    fig.set_layout_engine("none")
+    x = 1.02 + 0.30 * slot
+    ax.legend(handles, labels, loc="upper left", bbox_to_anchor=(x, 1.0),
+              ncol=1, fontsize=8, frameon=False, title=title)
+    fig.subplots_adjust(right=max(0.60, 0.80 - 0.06 * slot))
+
+
+def layout_fix(fig):
+    """落盘前统一收口（docs/figure_spec.md v2.2 §三之三）：
+    1) 单坐标轴图的图例外置：一律置轴框外右侧，纵向排布、不压数据；
+    2) 轴内文本右缘/顶缘/左缘/下缘越出坐标轴框时自动扩 xlim/ylim 收进框内。
+    多子图（分面）图不做图例搬迁：分面各有自己的图例，统一外移会互相压扁。
+    tick 标签一律不动：它本就在轴框外，savefig.bbox="tight" 会把画布扩到装下它；
+    强行换行反而让多行标签在密集类目轴上互相压字（实测见踩坑台账）。"""
+    from matplotlib.colorbar import Colorbar
+
+    axes = [a for a in fig.get_axes() if not isinstance(a, Colorbar)]
+    if not axes:
+        return
+    if len(axes) == 1:
+        ax0 = axes[0]
+        # 手动布局豁免（2026-11-06）：出图母版可以用 ax._manual_legend = True 声明
+        # 「本图的图例与图注位置是我自己排好的」。守卫随后只做文字收边，不再搬图例。
+        # 为什么需要：01_domains 用 subplots_adjust 预留右栏，图例锚在右栏顶部；
+        # 而 legend_out() 按「横版 -> 轴框下方」重排，会把已排好的右栏布局推翻，
+        # 造成图例跑到左下、图注孤零零留在右边的新的错位。
+        leg = ax0.get_legend()
+        if leg is not None and not getattr(ax0, "_manual_legend", False):
+            legend_out(ax0, fig, leg)
+        fit_text_edges(fig, ax0)
+    # 比例尺必须在所有布局动作（图例搬迁、文字收边扩轴）都做完之后再画：
+    # 它画在数据坐标系里，任何后续对 xlim/ylim 的改动都会改变它的显示长度，
+    # 于是「标注 500um、实际 470um」。实测见第 69 轮量测。
+    _draw_deferred_scalebars(fig)
+
+
+def _install_layout_guard():
+    """装一次全局收口：脚本内任何 fig.savefig 落盘前先走 layout_fix()，
+    以后新增图自动套版式规则，不靠人记得调用（docs/figure_spec.md v2.2 §三之三）。"""
+    from matplotlib.figure import Figure
+
+    if getattr(Figure.savefig, "_layout_guard", False):
+        return
+    orig = Figure.savefig
+
+    def guarded(self, fname, *a, **kw):
+        layout_fix(self)
+        return orig(self, fname, *a, **kw)
+
+    guarded._layout_guard = True
+    guarded._orig_savefig = orig
+    Figure.savefig = guarded
+
+
+_install_layout_guard()
+
+
+def _build_cat_palette():
+    """离散分类色板：Okabe-Ito 八色打底（色盲友好、灰度可辨），
+    类别数超过 8 时用 Paired 平滑扩充并去重。
+
+    为什么必须去重并足够长：域数可达 57（mouse），旧实现 i%20 会循环撞色，
+    同色不同域会让图例失效（规范明令禁止）。"""
+    okabe = ["#E69F00", "#56B4E9", "#009E73", "#F0E442",
+             "#0072B2", "#D55E00", "#CC79A7", "#000000"]
+    seen, out = set(), []
+    for c in (okabe
+              + [matplotlib.colors.to_hex(x) for x in plt.get_cmap("Paired").colors]
+              + [matplotlib.colors.to_hex(x) for x in plt.get_cmap("tab20b").colors]
+              + [matplotlib.colors.to_hex(x) for x in plt.get_cmap("tab20c").colors]):
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+CAT_PALETTE = _build_cat_palette()
+
+
+def cat_colors(labels):
+    cats = sorted(set(labels))
+    if len(cats) > len(CAT_PALETTE):
+        fail("分类数 %d 超过可用色板 %d 色，拒绝循环撞色"
+             % (len(cats), len(CAT_PALETTE)))
+    return {c: CAT_PALETTE[i] for i, c in enumerate(cats)}, cats
+
+
+# spot_diameter_fullres 的语义在官方文档里只写到「theoretical 65um spot」，
+# 没有 PSF / 弥散 / 间隙的明确定义（第 73 轮元宝调研）。55um 是捕获孔径。
+# 该字段逐图波动（本数据集 87.06~90.19 px，3.6%），所以只用来做平台护栏，
+# 不作标定基准；标定基准是下面的晶格常量。
+SPOT_ENVELOPE_UM = 65.0
+# 平台护栏带：以 65 µm 光斑包络为锚，下浮 15、上浮 5，得 [50, 70]。
+# 实测本数据集反推光斑直径 66.0~68.3 µm，全部落在带内；非 Visium 平台会远离此带。
+# 把带宽从常量推出来，避免 65 变成「定义了但没人用」的死常量。
+SPOT_DIAMETER_MIN_UM = SPOT_ENVELOPE_UM - 15.0
+SPOT_DIAMETER_MAX_UM = SPOT_ENVELOPE_UM + 5.0
+
+# Visium 相邻 spot 中心距的官方规格常量（v1 与 v2 均为 100 µm）。
+# 它比 spot_diameter_fullres 更适合当标定基准：后者是 Space Ranger 对光斑直径的
+# 逐图估计，会随曝光与聚焦波动；前者是载玻片阵列的物理常量。
+SPOT_PITCH_UM = 100.0
+
+
+def _spot_um_per_px(a, sample):
+    """按 Visium 晶格 pitch 反算 um/px；晶格不可用时 fail-closed（不回退）。
+
+    为什么以晶格为准（2026-11-07 实测改判）：
+    spot_diameter_fullres 在本数据集 5 个样本上是 87.06~90.19 px（波动 3.6%），
+    而相邻 spot 中心距在所有样本上恒为 132.0 数据单位（平台常量）。
+    用 65/d_px 会得到 0.7207~0.7466 的分散值，使标注 500 µm 的条实际画出
+    507.9~525.5 µm（系统性偏长 1.5~5.1%）。
+    以 100/nn 标定后，比例尺的物理长度与平台规格严格一致（500.0 µm）。
+
+    返回 um/px；晶格与光斑两条路都不可用时返回 None（调用方跳过比例尺）。
+    """
+    try:
+        sf = a.uns["spatial"][sample]["scalefactors"]
+        d_px = float(sf["spot_diameter_fullres"])
+    except (KeyError, TypeError, ValueError, IndexError):
+        d_px = None
+
+    nn = None
+    try:
+        mask = (a.obs["sample_id"].astype(str) == str(sample)).to_numpy()
+        xy = np.asarray(a.obsm["spatial"], dtype=float)[mask]
+        if len(xy) >= 2:
+            from scipy.spatial import cKDTree
+            kq = int(min(7, len(xy)))
+            dist, _ = cKDTree(xy).query(xy, k=kq)
+            nn = float(np.median(dist[:, 1]))
+            # 与 ops/spatial_calibration._first_shell_pitch 同一算法：
+            # 只取「前 6 个邻居全部落在第一壳层（<1.2×中位）」的内部点再取中位，
+            # 避免组织边缘的 spot（最近邻跳到第二壳层，约 1.73 倍）把 pitch 抬高。
+            # 两处若用不同算法，图上的 500um 与代码里的 200um 就会在不同切片上分叉。
+            if kq >= 7 and len(xy) >= 10:
+                interior = (dist[:, 1:7] < 1.2 * nn).all(axis=1)
+                if int(interior.sum()) >= 10:
+                    nn = float(np.median(dist[interior, 1]))
+    except (KeyError, TypeError, ValueError, IndexError):
+        nn = None
+
+    if nn is not None and np.isfinite(nn) and nn > 0:
+        # 破碎阵列护栏：正常 Visium 切片里几乎所有 spot 的第一壳层邻居都在 1.2 倍中位距内
+        # （实测 5 个样本该比例为 0.00%，p99 只比中位大 1 px）。若显著偏离的 spot 超过 5%，
+        # 说明切片破碎或阵列不完整，中位最近邻会被边缘点抬高，um/px 被压小，比例尺随之偏长。
+        far_frac = float((dist[:, 1] > 1.2 * nn).mean())
+        if far_frac > 0.05:
+            fail("样本 %s 有 %.1f%% 的 spot 最近邻超过中位的 1.2 倍（阈值 5%%）："
+                 "切片破碎或阵列不完整，晶格 pitch 不可信，拒绝标定。" % (sample, far_frac * 100.0))
+        um_per_px = SPOT_PITCH_UM / nn
+        # 平台护栏：晶格按 100 µm 标定后，反推的光斑直径必须落在 Visium 的 50~70 µm 带内。
+        # 这道拦的是「把 Visium 的 100 µm 常量套到别的平台上」：
+        # Visium HD 是 2x2 µm 连续方格，MERFISH/CosMx/Xenium 是单分子或分割细胞中心，
+        # Slide-seq 是随机 bead 阵列，套用后反推直径会远离 50~70 µm 带，当场失败而不是静默出错图。
+        if d_px is not None and np.isfinite(d_px) and d_px > 0:
+            implied_spot_um = d_px * um_per_px
+            if not (SPOT_DIAMETER_MIN_UM <= implied_spot_um <= SPOT_DIAMETER_MAX_UM):
+                fail("样本 %s 的晶格标定反推光斑直径 %.1f µm 不在 Visium 的 50~70 µm 带内："
+                     "当前输入可能不是 Visium（HD 是 2x2 µm 连续方格，Slide-seq 是随机 bead，"
+                     "MERFISH/CosMx/Xenium 无全局等距晶格）。拒绝按 100 µm 常量出图。"
+                     % (sample, implied_spot_um))
+        return um_per_px
+
+    # 走到这里说明晶格不可用。DeepSeek 第 73 轮裁定：默认必须 fail，不能静默回退。
+    # 理由：65/d_px 与晶格口径相差 1.5~5.1%，静默回退等于「出一张自己知道偏 5% 的图」，
+    # 而且下游无从判断。若确有「元数据缺失但必须出图」的例外，应由调用方显式开启并留痕，
+    # 不走这里。
+    fail("样本 %s 无法计算晶格 pitch（spot 少于 2 个或 spatial 坐标缺失）："
+         "比例尺标定不可信，拒绝出图。若确需在元数据缺失时出图，"
+         "须显式声明 calib_method=fallback 并在图上标注，不能静默降级。" % sample)
+
+
+SCALEBAR_LOG = []
+_SAVE_NAME = ""
+
+
+def add_scalebar(ax, x, y, um_per_px, um=500.0):
+    """登记一条比例尺，实际绘制推迟到布局定稿后（见 layout_fix）。"""
+    if um_per_px is None:
+        return False
+    _PENDING_SCALEBARS.append((ax, x, y, um_per_px, um))
+    return True
+
+
+_PENDING_SCALEBARS = []
+
+
+def _draw_deferred_scalebars(fig):
+    """绘制属于该 figure 的全部待画比例尺。长度自检在 _draw_scalebar_now 内完成。"""
+    mine = [i for i in _PENDING_SCALEBARS if i[0].figure is fig]
+    for i in mine:
+        _PENDING_SCALEBARS.remove(i)
+    for ax, x, y, um_per_px, um in mine:
+        _draw_scalebar_now(ax, x, y, um_per_px, um)
+
+
+def _draw_scalebar_now(ax, x, y, um_per_px, um=500.0):
+    """在轴内右下角画物理比例尺（端点刻度 + 数值标注），返回其真实微米长度。
+
+    位置与长度都按该样本数据范围自适应：不同样本的坐标跨度不同，
+    写死像素偏移会在小样本上跑到框外、在大样本上细到看不见。
+    比例尺长度超过数据宽度 30% 时退到 200um，避免喧宾夺主。"""
+    if um_per_px is None:
+        return None
+    x0, x1 = float(np.min(x)), float(np.max(x))
+    y0, y1 = float(np.min(y)), float(np.max(y))
+    span_x = max(x1 - x0, 1.0)
+    span_y = max(y1 - y0, 1.0)
+    bar = um / um_per_px
+    if bar > 0.30 * span_x:
+        um = 200.0
+        bar = um / um_per_px
+    margin_x = 0.045 * span_x
+    margin_y = 0.045 * span_y
+    yb = y0 + margin_y
+    tick = 0.018 * span_y
+    label = "%d um" % int(um)
+
+    # 比例尺与它的文字标注互相牵制：文字偏右会触发 fit_text_edges 扩 xlim，
+    # 而扩 xlim 又缩短比例尺。这里迭代「画 -> 收边 -> 重画」直到轴限稳定。
+    #
+    # 为什么必须收敛而不是固定轮数：实测真实图件里 xlim 被扩了约 6%，
+    # 两轮写完最后一轮收边仍可能再扩，条就停在扩张前的坐标上（短 5%）。
+    # 判据是「本轮收边后 xlim 与上轮一致」，不是「跑够几轮」。
+    art = []
+    xlim_prev = None
+    for _round in range(8):
+        for a in art:
+            a.remove()
+        art = []
+        x1_cur = float(ax.get_xlim()[1])
+        xa = x1_cur - margin_x - bar
+        xb = x1_cur - margin_x
+        art.append(ax.plot([xa, xb], [yb, yb], color="black", lw=1.8,
+                           solid_capstyle="butt", zorder=10)[0])
+        art.append(ax.plot([xa, xa], [yb - tick / 2.0, yb + tick / 2.0],
+                           color="black", lw=1.2, zorder=10)[0])
+        art.append(ax.plot([xb, xb], [yb - tick / 2.0, yb + tick / 2.0],
+                           color="black", lw=1.2, zorder=10)[0])
+        art.append(ax.text((xa + xb) / 2.0, yb + tick * 1.5, label,
+                           ha="center", va="bottom", fontsize=8, zorder=10,
+                           bbox=dict(boxstyle="round,pad=0.12", fc="white",
+                                     ec="none", alpha=0.75)))
+        fit_text_edges(ax.figure, ax)
+        x1_after = float(ax.get_xlim()[1])
+        if xlim_prev is not None and abs(x1_after - xlim_prev) <= 1e-9 * max(1.0, abs(xlim_prev)):
+            break
+        xlim_prev = x1_after
+
+    # 反算真实微米长度：必须读**真实 artist 的端点**，不能拿 bar 重算。
+    # 拿 bar 重算时 dxb-dxa 恒等于 bar 的像素长度，自检在数学上必然通过，
+    # 无论条被后续收边压缩成什么样（本轮实测踩到：xlim 扩 6% 而自检仍报 500.000）。
+    fig_canvas = ax.figure.canvas
+    fig_canvas.draw()
+    xd = [float(v) for v in art[0].get_xdata()]
+    dxa = float(ax.transData.transform((xd[0], yb))[0])
+    dxb = float(ax.transData.transform((xd[1], yb))[0])
+    bar_disp_px = abs(dxb - dxa)
+    e0 = float(ax.transData.transform((0.0, 0.0))[0])
+    e1 = float(ax.transData.transform((1.0, 0.0))[0])
+    px_per_data = abs(e1 - e0)
+    if px_per_data <= 0:
+        fail("比例尺自检无法进行：每数据单位像素数为 0（轴限退化）")
+    bar_data = bar_disp_px / px_per_data
+    actual_um = bar_data * um_per_px
+    if not np.isfinite(actual_um) or abs(actual_um - um) / um > 0.03:
+        fail("比例尺自检不通过：标注 %d um，实际 %.1f um（要求误差 <=3%%）。"
+             "通常是轴限被后续布局改动或 um/px 换算口径不一致。" % (um, actual_um))
+    SCALEBAR_LOG.append({"figure": _SAVE_NAME, "label_um": um,
+                         "actual_um": round(float(actual_um), 3),
+                         "um_per_px": round(float(um_per_px), 6),
+                         "bar_px": round(float(bar_disp_px), 2),
+                         "px_per_data": round(float(px_per_data), 8),
+                         "dpi_at_measure": float(ax.figure.dpi),
+                         "calib_method": "lattice"})
+    return float(actual_um)
+
+
+
+def _uns_dict(adata, key):
+    """取 uns[key] 并归一成 dict。
+
+    本链写入端用 json.dumps 把嵌套结构存成字符串（h5ad 不接受嵌套 dict），
+    所以读端必须兼容 str 形态；直接 .get() 会 AttributeError: 'str' object has no attribute 'get'。
+    """
+    val = adata.uns.get(key)
+    if isinstance(val, str):
+        try:
+            val = json.loads(val)
+        except ValueError:
+            return {}
+    return val if isinstance(val, dict) else {}
+
+
+for species, env_key in [("mouse", "FIG_MOUSE"), ("human", "FIG_HUMAN")]:
+    path = (os.environ.get(env_key) or "").strip()
+    # 单物种模式：human 缺席时跳过整段，而不是拿空串去 read_h5ad（那会抛异常）。
+    # 如实打印跳过原因，让"没出 human 图"这件事在日志里是可见的事实而非静默缺失。
+    if not path:
+        log("=== %s: 无输入（单物种模式，跳过该物种专属图）===" % species)
+        continue
+    a = ad.read_h5ad(path)
+    log("=== %s spots=%d genes=%d ===" % (species, a.shape[0], a.shape[1]))
+    obs = a.obs
+    xy = np.asarray(a.obsm["spatial"], dtype=float)
+    samples = sorted(obs["sample_id"].astype(str).unique().tolist())
+    dom = obs["domain"].astype(str).to_numpy()
+    samp = obs["sample_id"].astype(str).to_numpy()
+    pre = "l3_%s" % species
+
+    # --- 01 spatial domain map（逐样本单图，不拼面板） ---
+    for s in samples:
+        m = samp == s
+        d = dom[m]
+        colors, _ = cat_colors(d)
+        # 域用分类色，必须给图例（规范：颜色=分类标签时图例可读）。
+        # 版式（2026-11-06 二次修正）：横向画布 + 右栏固定布局。
+        # 首版 figsize=(6.8,5.5) 是横版声明却渲染成竖版，图例图注落到左下；
+        # 二版改竖版声明后锚点对了，但等比例坐标锁方形，画布右上留大片空白。
+        # 现在改为：数据区占左 58%，右 42% 自上而下依次放图例与图注，
+        # 显式 subplots_adjust 定位，不依赖 caption() 的横竖自动分支。
+        fig, ax = plt.subplots(figsize=(9.6, 5.8))
+        for dd in sorted(set(d)):
+            mm = d == dd
+            ax.scatter(xy[m][mm, 0], xy[m][mm, 1], s=4, color=colors[dd],
+                       label=dd, linewidths=0)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        # 物理比例尺（sci.md：空间切片图必须内嵌 µm 标尺）
+        add_scalebar(ax, xy[m][:, 0], xy[m][:, 1], _spot_um_per_px(a, s))
+        # 关掉 figure.autolayout：它是全局 rcParam，会覆盖 subplots_adjust，
+        # 导致等比例数据区被重新居中、左侧留大片空白。
+        fig.set_layout_engine("none")
+        fig.subplots_adjust(left=0.04, right=0.58, top=0.97, bottom=0.03)
+        # 声明手动布局，阻止 layout_fix 守卫改写右侧图例位置
+        ax._manual_legend = True
+        leg = ax.legend(markerscale=5, fontsize=8, loc="upper left",
+                        bbox_to_anchor=(1.02, 1.0), borderaxespad=0,
+                        frameon=False, title="domain")
+        leg.get_title().set_fontsize(8)
+        # 图注默认放图幅左下角、轴框外（y<0），由 bbox="tight" 向下扩边容纳，
+        # 因此不占用也不挤压主图数据区（2026-11-06 用户裁定）。
+        # 右栏只留给图例，图注不再与图例争同一列。
+        fig.text(0.01, -0.02,
+                 "line3 %s: %s spatial domains\n" % (species, s)
+                 + "coords = sample-local (obsm['spatial'])\n"
+                 + "n=%d domains, n=%d spots" % (len(set(d)), len(d)),
+                 ha="left", va="top", fontsize=8, linespacing=1.5)
+        save(fig, "%s_01_domains_%s.png" % (pre, s))
+
+    # --- 02 target gene expression（逐样本单图） ---
+    tgt = obs["target_gene_expr"].to_numpy(dtype=float)
+    # uns["localization"] 在本链里是 JSON 字符串（写入端用 json.dumps 存，h5ad 不接受
+    # 嵌套 dict）。直接 .get() 会 AttributeError: 'str' object has no attribute 'get'。
+    # 两种形态都兼容：dict 直接取，str 先 json.loads，解析失败则回落空字典。
+    # 靶基因名解析（三候选，按可信度降序）：
+    #   1) uns['localization'].top_target_gene ，， 但该字段历史上存的是 Ensembl ID，
+    #      直接标注会让图上出现 ENSMUSG… 而非读者认得的 symbol；
+    #   2) uns['localization'].targets 里第一个目标的 gene_symbol（新实现形态，dict）；
+    #      targets 也可能是旧实现的字符串列表，此时第一个元素本身就是 symbol；
+    #   3) 兜底读 obs['target_gene_expr'] 的来源列名（不可得则给 ?，但绝不编造）。
+    _loc = _uns_dict(a, "localization")
+    top_gene = "?"
+    _tgt = _loc.get("targets")
+    if isinstance(_tgt, dict):
+        for _k in sorted(_tgt):
+            _sym = str(_tgt[_k].get("gene_symbol") or "").strip()
+            if _sym:
+                top_gene = _sym
+                break
+    elif isinstance(_tgt, list) and _tgt:
+        top_gene = str(_tgt[0])
+    if top_gene == "?":
+        # 旧实现：top_target_gene 为 Ensembl ID，用 var 表反查 symbol
+        _eid = str(_loc.get("top_target_gene") or "").strip()
+        if _eid and "gene_symbol" in a.var.columns:
+            _hit = a.var["gene_symbol"][a.var_names == _eid]
+            if len(_hit):
+                top_gene = str(_hit.iloc[0])
+    vmax = np.percentile(tgt, 99) if len(tgt) else 1
+    for s in samples:
+        m = samp == s
+        # 版式（2026-11-06 按用户反馈二次优化）：等比例数据区 + **贴轴 colorbar**。
+        # 原写法用 fig.add_axes 把 colorbar 钉在右栏上半部（y 0.55~0.93），
+        # 右栏下半截全空，tight 裁切后整张图重心偏上、右侧大片留白，不达出图标准。
+        # 改为 fig.colorbar(sc, ax=ax)：colorbar 与轴框等高对齐，
+        # 画布按内容自动收边，不再出现「上方一根条、下方一片空」。
+        fig, ax = plt.subplots(figsize=(6.6, 6.0))
+        sc = ax.scatter(xy[m, 0], xy[m, 1], c=tgt[m], s=4, cmap="viridis",
+                        vmin=0, vmax=vmax, linewidths=0)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        # 物理比例尺
+        add_scalebar(ax, xy[m][:, 0], xy[m][:, 1], _spot_um_per_px(a, s))
+        # colorbar 是连续量的图例，必须带 label 说明它是什么（规范：图例可读）
+        _cb = fig.colorbar(sc, ax=ax, shrink=0.82, fraction=0.046, pad=0.02)
+        _cb.set_label("expr", fontsize=8)
+        _cb.ax.tick_params(labelsize=7)
+        ax._manual_legend = True
+        fig.text(0.01, -0.02,
+                 "line3 %s: %s target gene\n" % (species, s)
+                 + "coords = sample-local (obsm['spatial'])\n"
+                 + "gene=%s, colour = expr" % top_gene,
+                 ha="left", va="top", fontsize=8, linespacing=1.5)
+        save(fig, "%s_02_target_gene_%s.png" % (pre, s))
+
+    # --- 02b target gene by domain（域统计视图：规范要求表达值 + 域统计两个视图） ---
+    # 域身份样本私有（形如 <sample>_d<k>，坑 #114），故用横向条形图容纳全部域标签
+    dom_order = sorted(set(dom))
+    tgt_dom = [float(tgt[dom == d].mean()) for d in dom_order]
+    fig, ax = plt.subplots(figsize=(8, max(6, len(dom_order) * 0.22)))
+    y = np.arange(len(dom_order))
+    ax.barh(y, tgt_dom, color="#4C72B0")
+    ax.set_yticks(y)
+    ax.set_yticklabels(dom_order, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("mean expression")
+    caption(fig, "line3 %s: target gene (%s) mean by spatial domain"
+            % (species, top_gene),
+            "domain-level statistic view (paired with per-sample spatial map)")
+    save(fig, "%s_08_target_gene_by_domain.png" % pre)
+
+    # --- 03 ko_dr_expr（逐样本单图） ---
+    # knockout 是可选上游（spatial_knockout 步骤）。本项目未跑该步，obs 里没有
+    # ko_dr_expr 列。硬读会 KeyError 打断整条出图，让已经产出的域图/target 图白费。
+    # 缺列时跳过全部 KO 相关图并如实打印，不伪造数据充数。
+    has_ko = "ko_dr_expr" in obs.columns
+    if not has_ko:
+        log("  KO 图跳过：obs 无 ko_dr_expr（未跑 spatial_knockout 步骤）")
+    koe = obs["ko_dr_expr"].to_numpy(dtype=float) if has_ko else None
+    if has_ko:
+        vmax = np.percentile(koe, 99) if len(koe) else 1
+        ko_gene = _uns_dict(a, "knockout").get("ko_gene", "?")
+        for s in samples:
+            m = samp == s
+            # 版式与 02 同法（2026-11-06 二次优化）：贴轴 colorbar，
+            # 避免固定 add_axes 造成右栏下半截空白、整图重心偏上。
+            fig, ax = plt.subplots(figsize=(6.6, 6.0))
+            sc = ax.scatter(xy[m, 0], xy[m, 1], c=koe[m], s=4, cmap="magma",
+                            vmin=0, vmax=vmax, linewidths=0)
+            ax.set_aspect("equal")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            # 物理比例尺
+            add_scalebar(ax, xy[m][:, 0], xy[m][:, 1], _spot_um_per_px(a, s))
+            _kcb = fig.colorbar(sc, ax=ax, shrink=0.82, fraction=0.046, pad=0.02)
+            _kcb.set_label("KO DR expr", fontsize=8)
+            _kcb.ax.tick_params(labelsize=7)
+            ax._manual_legend = True
+            fig.text(0.01, -0.02,
+                     "line3 %s: %s KO(%s) DR mean expr\n" % (species, s, ko_gene)
+                     + "coords = sample-local (obsm['spatial'])",
+                     ha="left", va="top", fontsize=8, linespacing=1.5)
+            save(fig, "%s_03_ko_dr_%s.png" % (pre, s))
+
+        # --- 03b KO DR by domain（域统计视图：规范要求表达值 + 域统计两个视图） ---
+        koe_dom = [float(koe[dom == d].mean()) for d in dom_order]
+        fig, ax = plt.subplots(figsize=(8, max(6, len(dom_order) * 0.22)))
+        y = np.arange(len(dom_order))
+        ax.barh(y, koe_dom, color="#C44E52")
+        ax.set_yticks(y)
+        ax.set_yticklabels(dom_order, fontsize=8)
+        ax.invert_yaxis()
+        ax.set_xlabel("mean KO DR expr")
+        caption(fig, "line3 %s: KO(%s) DR mean expression by spatial domain"
+                % (species, ko_gene),
+                "domain-level statistic view (paired with per-sample spatial map)")
+        save(fig, "%s_09_ko_dr_by_domain.png" % pre)
+
+    # --- 04 Moran's I top ---
+    if "morans_i_mean" in a.var.columns:
+        mi = a.var[["gene_symbol", "morans_i_mean", "morans_z_mean"]].copy()
+        mi = mi.dropna().sort_values("morans_i_mean", ascending=False).head(20)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.barh(range(len(mi))[::-1], mi["morans_i_mean"].to_numpy(),
+                color="#4C72B0")
+        ax.set_yticks(range(len(mi))[::-1])
+        ax.set_yticklabels(mi["gene_symbol"].astype(str).tolist(), fontsize=8)
+        ax.set_xlabel("Moran's I (mean over samples)")
+        caption(fig, "line3 %s: top-20 spatially autocorrelated genes" % species)
+        save(fig, "%s_04_morans_top.png" % pre)
+
+    # --- 04b Top SVG 逐基因空间表达（任务 1.2） ---
+    # 复用步骤 7 已算好的 gene_autocorr_<sp>.tsv，不重算 Moran's I。
+    # 每基因一张单栏图，取第一个样本（升序）作代表并在图注写明，便于追溯。
+    _svg_n = int(os.environ.get("BIO_SVG_TOP_N", "4"))
+    _ac_path = "gene_autocorr_%s.tsv" % species
+    if os.path.isfile(_ac_path):
+        try:
+            _ac = pd.read_csv(_ac_path, sep="\t")
+            _ac = _ac[np.isfinite(_ac["morans_i_mean"].to_numpy(dtype=float))]
+            # 只取在所有样本上都算过 Moran's I 的基因，避免单样本偶然高值入选
+            if "autocorr_n_valid_samples" in _ac.columns:
+                _ac = _ac[_ac["autocorr_n_valid_samples"] >= len(samples)]
+            _ac = _ac.sort_values("morans_i_mean", ascending=False).head(_svg_n)
+            _sym = a.var["gene_symbol"].astype(str).to_numpy()
+            _rep = samples[0]
+            _mrep = samp == _rep
+            _rx = xy[_mrep][:, 0]
+            _ry = xy[_mrep][:, 1]
+            for _, _row in _ac.iterrows():
+                _g = str(_row["gene_symbol"])
+                _hit = np.where(_sym == _g)[0]
+                if _hit.size == 0:
+                    log("skip 04b %s: 不在表达矩阵" % _g)
+                    continue
+                _col = a.X[:, int(_hit[0])]
+                _v = (np.asarray(_col.todense()).ravel() if hasattr(_col, "todense")
+                      else np.asarray(_col).ravel())
+                fig, ax = plt.subplots(figsize=(6.6, 6.0))
+                _sc = ax.scatter(_rx, _ry, c=_v[_mrep], s=4, cmap="viridis",
+                                 linewidths=0)
+                ax.set_aspect("equal")
+                ax.set_xticks([])
+                ax.set_yticks([])
+                add_scalebar(ax, _rx, _ry, _spot_um_per_px(a, _rep))
+                _cb = fig.colorbar(_sc, ax=ax, shrink=0.82, fraction=0.046, pad=0.02)
+                _cb.set_label("log-normalized expr", fontsize=8)
+                _cb.ax.tick_params(labelsize=6.5)
+                fig.text(0.01, -0.02,
+                         "line3 %s: top SVG slice, %s\n" % (species, _g)
+                         + "Moran's I mean = %.3f (n_valid_samples=%s)\n"
+                         % (float(_row["morans_i_mean"]),
+                            _row.get("autocorr_n_valid_samples", "?"))
+                         + "sample=%s (first ascending), n=%d spots"
+                         % (_rep, int(_mrep.sum())),
+                         ha="left", va="top", fontsize=8, linespacing=1.5)
+                save(fig, "%s_04_morans_slice_%s.png" % (pre, _g))
+        except Exception as _e:
+            log("skip 04b svg slices: %s" % _e)
+    else:
+        log("skip 04b svg slices: 缺 %s" % _ac_path)
+
+
+    # --- 05 knockout top DR ---
+    # 同 uns["localization"]：knockout 也可能是 JSON 字符串，直接 .get() 会 AttributeError。
+    ko = a.uns.get("knockout")
+    if isinstance(ko, str):
+        try:
+            ko = json.loads(ko)
+        except ValueError:
+            ko = {}
+    if not isinstance(ko, dict):
+        ko = {}
+    top = ko.get("top_dr") or {}
+    if top:
+        genes, nss, pads = [], [], []
+        for i in range(1, 11):
+            e = top.get("dr%d" % i)
+            if not e:
+                break
+            genes.append(e["gene"])
+            nss.append(e["n_sig_samples"])
+            pads.append(-np.log10(max(e["adj_p"], 1e-300)))
+        fig, ax = plt.subplots(figsize=(9, 5))
+        x = np.arange(len(genes))
+        ax.bar(x, pads, color="#C44E52")
+        ax.set_xticks(x)
+        ax.set_xticklabels(genes, rotation=45, ha="right", fontsize=8)
+        ax.set_ylabel("-log10 adj p (min over samples)")
+        caption(fig, "line3 %s: KO(%s) top-10 significant DR genes"
+                % (species, ko.get("ko_gene", "?")),
+                "n = significant samples")
+        for i, (n, p) in enumerate(zip(nss, pads)):
+            ax.text(i, p, "n=%d" % n, ha="center", va="bottom", fontsize=8)
+        save(fig, "%s_05_knockout_dr.png" % pre)
+
+    # --- 06 UMAP by sample (spatial X_umap) ---
+    if "X_umap" in a.obsm:
+        um = np.asarray(a.obsm["X_umap"])
+        labels = samp
+        colors, cats = cat_colors(labels)
+        fig, ax = plt.subplots(figsize=(8, 6))
+        for c in cats:
+            m = labels == c
+            ax.scatter(um[m, 0], um[m, 1], s=3, color=colors[c], label=c, linewidths=0)
+        # 源级外置：统一落轴框外右侧，避免布局守卫二次搬迁
+        ax.legend(markerscale=3, fontsize=8, ncol=1, frameon=False,
+                  loc="upper left", bbox_to_anchor=(1.02, 1.0))
+        caption(fig, "line3 %s: UMAP (colored by sample)" % species,
+                "X_umap from step4 dim_reduce",
+                "n=%d samples" % len(cats))
+        ax.set_xticks([])
+        ax.set_yticks([])
+        save(fig, "%s_06_umap_sample.png" % pre)
+
+    # --- 07 domain composition per sample ---
+    dom_counts = pd.crosstab(pd.Series(samp, name="sample"),
+                             pd.Series(dom, name="domain"))
+    prop = dom_counts.div(dom_counts.sum(axis=1), axis=0)
+    # 域数可达 57（mouse），统一用模块级 CAT_PALETTE（Okabe-Ito 打底 + 平滑扩充去重），
+    # 保证每域颜色唯一，并给完整图例。
+    # 图例项多，放轴框外右侧两列，该图单独关 autolayout 显式留位。
+    palette = CAT_PALETTE
+    plt.rcParams["figure.autolayout"] = False
+    fig, ax = plt.subplots(figsize=(13, 8))
+    bottom = np.zeros(len(prop))
+    for j, dcol in enumerate(prop.columns):
+        ax.bar(range(len(prop)), prop[dcol].to_numpy(), bottom=bottom,
+               color=palette[j % len(palette)], width=0.7, label=dcol)
+        bottom += prop[dcol].to_numpy()
+    ax.set_xticks(range(len(prop)))
+    ax.set_xticklabels(prop.index.tolist(), rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("domain proportion")
+    caption(fig, "line3 %s: spatial domain composition per sample" % species,
+            "n=%d samples, %d domains" % (len(prop), len(prop.columns)))
+    ax.legend(fontsize=8, ncol=1, loc="upper left",
+              bbox_to_anchor=(1.02, 1.0), borderaxespad=0, frameon=False)
+    fig.subplots_adjust(left=0.07, right=0.70, top=0.97, bottom=0.16)
+    save(fig, "%s_07_domain_composition.png" % pre)
+    plt.rcParams["figure.autolayout"] = True
+
+    # 16 domain panel 组图已退役（figure_spec v2.3）：生产母版只出单图，
+    # 域图 01、域组成 07、域内目标基因 08 各自独立产出。
+
+
+    # --- 17 域 × 细胞类型组成热图（2026-11-06 补：celltype_annotation 跑了却没配图） ---
+    # 数据形状（实测）：celltype_annotation_<sp>.tsv = 逐 spot 长表，
+    #   cols = spot, domain, primary_celltype, secondary_celltype, primary_proportion, confidence
+    # 直接画 spot 级会得到 12097 行的巨图（实测渲染 136s，超 60s 上限），
+    # 故按「域 × primary_celltype」交叉表聚合，行归一化为组成比例，图幅小且可读。
+    _ct_path = "celltype_annotation_%s.tsv" % species
+    if os.path.isfile(_ct_path):
+        try:
+            _ct = pd.read_csv(_ct_path, sep="\t")
+            if _ct.shape[0] and {"domain", "primary_celltype"} <= set(_ct.columns):
+                _cross = pd.crosstab(_ct["domain"].astype(str),
+                                     _ct["primary_celltype"].astype(str))
+                _frac = _cross.div(_cross.sum(axis=1).replace(0, 1), axis=0)
+                _keep = _frac.sum(axis=0).sort_values(ascending=False).head(12).index
+                _frac = _frac[_keep]
+                fig, ax = plt.subplots(figsize=(7.5, 5.2))
+                im = ax.imshow(_frac.to_numpy(), aspect="auto", cmap="cividis", vmin=0, vmax=1)
+                ax.set_yticks(np.arange(_frac.shape[0]))
+                ax.set_yticklabels([str(x)[:20] for x in _frac.index], fontsize=8)
+                ax.set_xticks(np.arange(_frac.shape[1]))
+                ax.set_xticklabels([str(x)[:18] for x in _frac.columns], rotation=45,
+                                   ha="right", fontsize=8)
+                cb = fig.colorbar(im, ax=ax, fraction=0.036, pad=0.02)
+                cb.set_label("fraction of spots in domain")
+                caption(fig, "line3 %s: dominant cell type per spatial domain" % species,
+                        "colour = fraction of spots in that domain with this primary cell type",
+                        "n=%d domains, top %d cell types" % (_frac.shape[0], _frac.shape[1]))
+                save(fig, "%s_17_celltype_composition.png" % pre)
+        except Exception as _e:
+            log("skip 17_celltype_composition: %s" % _e)
+    else:
+        log("skip 17_celltype_composition: 缺 %s" % _ct_path)
+
+    # --- 18 域空间连贯性（2026-11-06 补：spatial_cooccurrence 跑了却没配图） ---
+    # 数据形状（实测）：domain_cooccurrence_<sp>.tsv = 长表 52 行，
+    #   cols = sample_id, domain, n_spots, same_frac, same_z, top_partner_domain, top_partner_frac
+    # 不是方阵，故不画共现矩阵，改画逐域空间连贯性（same_z 与 same_frac）。
+    _co_path = "domain_cooccurrence_%s.tsv" % species
+    if os.path.isfile(_co_path):
+        try:
+            _co = pd.read_csv(_co_path, sep="\t")
+            if _co.shape[0] and "same_z" in _co.columns:
+                _co = _co.sort_values("same_z", ascending=True).tail(40)
+                fig, ax = plt.subplots(figsize=(7.5, max(4.5, len(_co) * 0.20)))
+                ax.barh(np.arange(len(_co)), _co["same_z"].to_numpy(dtype=float),
+                        color="#4C72B0")
+                ax.set_yticks(np.arange(len(_co)))
+                ax.set_yticklabels([str(x)[:20] for x in _co["domain"]], fontsize=8)
+                ax.axvline(0, color="#BEBEBE", linewidth=0.8)
+                ax.set_xlabel("spatial coherence z-score (same-domain neighbour enrichment)")
+                caption(fig, "line3 %s: domain spatial coherence" % species,
+                        "bar = z-score of same-domain neighbour fraction vs permutation null",
+                        "top %d domains by coherence" % len(_co))
+                save(fig, "%s_18_cooccur_domain_coherence.png" % pre)
+        except Exception as _e:
+            log("skip 18_domain_coherence: %s" % _e)
+    else:
+        log("skip 18_domain_coherence: 缺 %s" % _co_path)
+
+    # --- 19 逐样本细胞通讯（2026-11-06 补：spatial_communication 跑了却没配图） ---
+    # 数据形状（实测）：sample_communication_<sp>.tsv = 5 行 × 11 列逐样本汇总，
+    #   cols 含 n_lr_pairs / lr_top_score / lr_mean_score / lr_n_active
+    # 故画逐样本三项指标的分组条形，而不是热图。
+    _cm_path = "sample_communication_%s.tsv" % species
+    if os.path.isfile(_cm_path):
+        try:
+            _cm = pd.read_csv(_cm_path, sep="\t")
+            _want = [c for c in ("lr_n_active", "n_lr_pairs") if c in _cm.columns]
+            if _cm.shape[0] and _want:
+                _lab = "sample_id" if "sample_id" in _cm.columns else _cm.columns[0]
+                fig, ax = plt.subplots(figsize=(7.5, 4.2))
+                _x = np.arange(len(_cm))
+                _w = 0.8 / max(1, len(_want))
+                for _i, _c in enumerate(_want):
+                    ax.bar(_x + _i * _w - 0.4 + _w / 2,
+                           _cm[_c].to_numpy(dtype=float), width=_w, label=_c)
+                ax.set_xticks(_x)
+                ax.set_xticklabels([str(x)[:16] for x in _cm[_lab]], rotation=30,
+                                   ha="right", fontsize=8)
+                ax.set_ylabel("ligand-receptor pairs")
+                ax.legend(fontsize=8, frameon=False, loc="upper left",
+                          bbox_to_anchor=(1.02, 1.0), borderaxespad=0)
+                caption(fig, "line3 %s: cell-cell communication per sample" % species,
+                        "bar = active ligand-receptor pairs (n_lr_pairs = detected pairs)")
+                save(fig, "%s_19_communication.png" % pre)
+        except Exception as _e:
+            log("skip 19_communication: %s" % _e)
+    else:
+        log("skip 19_communication: 缺 %s" % _cm_path)
+
+    # --- 20 目标基因空间定位（2026-11-06 补：spatial_localization 跑了却没配图） ---
+    # 数据形状（实测）：gene_localization_<sp>.tsv = 474 行 × 9 列逐基因，
+    #   cols 含 gene_symbol / n_expr / frac_all / n_marker_domains / best_enrich
+    # 故画 top25 基因的定位广度条形，而不是热图。
+    _lc_path = "gene_localization_%s.tsv" % species
+    if os.path.isfile(_lc_path):
+        try:
+            _lc = pd.read_csv(_lc_path, sep="\t")
+            _mcol = next((c for c in ("n_marker_domains", "n_samples_top", "frac_all")
+                          if c in _lc.columns), None)
+            if _lc.shape[0] and _mcol and "gene_symbol" in _lc.columns:
+                _lc = _lc.sort_values(_mcol, ascending=True).tail(25)
+                fig, ax = plt.subplots(figsize=(7.0, max(4.5, len(_lc) * 0.28)))
+                ax.barh(np.arange(len(_lc)), _lc[_mcol].to_numpy(dtype=float),
+                        color="#55A868")
+                ax.set_yticks(np.arange(len(_lc)))
+                ax.set_yticklabels([str(x)[:20] for x in _lc["gene_symbol"]], fontsize=8)
+                ax.set_xlabel(_mcol)
+                caption(fig, "line3 %s: top localized genes" % species,
+                        "bar = %s (higher = localized to more domains/samples)" % _mcol,
+                        "top %d of %d genes" % (len(_lc), _lc.shape[0]))
+                save(fig, "%s_20_localization.png" % pre)
+        except Exception as _e:
+            log("skip 20_localization: %s" % _e)
+    else:
+        log("skip 20_localization: 缺 %s" % _lc_path)
+
+# 输入数据溯源（Argon 第 65 轮 B4）：只记产物清单时，「这张图由哪份数据渲染」不可证。
+# 大文件分级：超 500MB 全量读哈希会把 K40 的 I/O 拖死，改为 size + 首尾各 1MB 采样。
+LARGE_FILE_BYTES = 500 * 1024 * 1024
+SAMPLE_WINDOW = 1024 * 1024
+
+
+def _sha256_of(p):
+    """常规文件全量 sha256；超大文件退回「size + 首尾各 1MB」指纹。"""
+    import hashlib
+    size = os.path.getsize(p)
+    h = hashlib.sha256()
+    if size <= LARGE_FILE_BYTES:
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(SAMPLE_WINDOW), b""):
+                h.update(chunk)
+        return "full:" + h.hexdigest()
+    h.update(("size=%d;" % size).encode("utf-8"))
+    with open(p, "rb") as fh:
+        h.update(fh.read(SAMPLE_WINDOW))
+        if size > 2 * SAMPLE_WINDOW:
+            fh.seek(-SAMPLE_WINDOW, os.SEEK_END)
+            h.update(fh.read(SAMPLE_WINDOW))
+    return "sampled:" + h.hexdigest()
+
+
+def input_fingerprints(paths):
+    """把本步读取的输入文件算成指纹，键按文件名稳定排序。"""
+    rows = []
+    for p in sorted(x for x in paths if x and os.path.isfile(x)):
+        try:
+            rows.append((os.path.basename(p), _sha256_of(p)))
+        except OSError as exc:
+            rows.append((os.path.basename(p), "unreadable:" + type(exc).__name__))
+    return rows
+
+
+log("figures_done count=%d elapsed=%.1fs" % (len(made), time.time() - START))
+if not made:
+    fail("未生成任何图件；拒绝以零产物正常退出")
+
+# 产物清单落盘：只打 stdout 的话，任务重跑与事后核对时清单就沦了。
+try:
+    _man = os.path.join(OUT, "figures_manifest.txt")
+    with open(_man, "w", encoding="utf-8") as _fh:
+        _fh.write("step=%s seed=%s out=%s count=%d elapsed=%.1fs%s" % (
+            os.path.basename(sys.argv[0]),
+            os.environ.get("BIOANALYS_SEED", "UNSET"),
+            OUT, len(made), time.time() - START, chr(10)))
+        for _rn, _rms in render_ms:
+            _fh.write("render_ms=%s=%.1f%s" % (_rn, _rms, chr(10)))
+        # 比例尺自检留痕：标注微米数与实际反算微米数逐条写入 manifest，
+        # 让「图上的物理尺度是否可信」成为可离线核对的事实，而不是肉眼判断。
+        for _sb in SCALEBAR_LOG:
+            # bar_px 是绘制的显示像素长度，供成品 PNG 逐像素复核：
+            # 只看 actual_um 是图内自证，bar_px 让外部量测有可比对的锚。
+            # 硬判据是物理量（actual / label），bar_px 与 dpi 只是追溯字段：
+            # 物理量在任何 dpi 下都守恒，像素量只在特定 dpi 下成立（DeepSeek 第 73 轮）。
+            _fh.write("scalebar_check=figure=%s label=%s actual=%.3f um_per_px=%s bar_px=%.2f px_per_data=%.8f dpi=%.1f calib=%s%s" % (
+                _sb["figure"] or "-", _sb["label_um"], _sb["actual_um"], _sb["um_per_px"],
+                _sb["bar_px"], _sb["px_per_data"], _sb["dpi_at_measure"],
+                _sb.get("calib_method", "lattice"), chr(10)))
+        for _name, _digest in input_fingerprints([(os.environ.get(k) or "").strip() for k in ("FIG_MOUSE", "FIG_HUMAN")]):
+            _fh.write("input_sha256=%s=%s%s" % (_name, _digest, chr(10)))
+        for _n in made:
+            _p = os.path.join(OUT, _n)
+            _sz = os.path.getsize(_p) if os.path.exists(_p) else -1
+            _fh.write("%s%s%d%s" % (_n, chr(9), _sz, chr(10)))
+    log("wrote figures_manifest.txt (%d entries)" % len(made))
+    try:
+        with open(_man, "a", encoding="utf-8") as _fh:
+            _fh.write("outputs=%s\n" % ", ".join(["figures_manifest.txt"] + list(made)))
+    except OSError as _exc:
+        log("WARN outputs append failed: %s" % _exc)
+except OSError as _exc:
+    log("WARN 产物清单落盘失败: %s" % _exc)
+    # 句柄兜底（figure_spec 第 3 节 / Argon 第 65 轮 Q3）：逐图 close(fig) 已在 save() 内执行，
+    # 这里再 close("all") 兜住异常分支的残留图，防单步跑多图时峰值内存叠加。
+    plt.close("all")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD/../figures" "figures_manifest.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

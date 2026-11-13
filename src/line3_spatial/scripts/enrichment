@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+# enrichment：line3_spatial 空间域 marker 功能富集（KEGG + GO BP/CC/MF + GSEA）。
+#   aims 线3 下游第 2 项"空间域 marker/空间差异表达"的功能解读扩展。
+#
+# 输入（cwd 下）：spatial_marker_mouse.h5ad / spatial_marker_human.h5ad
+#   （步骤 6 产物，uns['domain_markers'] 为 scanpy rank_genes_groups 全量 top200）。
+#   全量 marker 只在 h5ad（tsv 仅导 top20），故读 h5ad 而非 domain_markers_*.tsv。
+#
+# 做法（gseapy，离线缓存 gmt）：
+#   1. 基因集：分物种取库，不混用。
+#      - mouse：KEGG_2019_Mouse / WikiPathways_2019_Mouse（小鼠专属通路库）；
+#        GO BP/CC/MF 用 Enrichr 人源 GO 库 + 小鼠 symbol 大写化匹配
+#        （Enrichr 无小鼠 GO 库，同源基因 symbol 仅差大小写，属近似，报告内标注）。
+#      - human：KEGG_2021_Human / Reactome_Pathways_2024 + GO BP/CC/MF。
+#   2. ORA：每域 marker（pvals_adj<0.05，最多 top100；不足 10 则退 top50）为前景，
+#      背景 = 该物种检出全基因（var['gene_symbol']）。
+#   3. prerank GSEA：每域全 top200 marker 按 logfoldchanges 排序。
+#   4. 落 tsv：enrichment_ora_{species}.tsv / enrichment_gsea_{species}.tsv / enrichment_report.txt
+#
+# 口径：docs/figure_spec.md（Agg/300dpi/英文标签；富集条形 NES/富集比 + 校正 p 双标注；
+#       图注置坐标轴框外；图例不压数据）。出图由 enrichment_figures 步骤负责。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+declare -a INPUTS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+echo "step_executed=enrichment"
+echo "bioanalys_seed=${seed}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+import scanpy as sc
+import gseapy
+
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+SEED = int(os.environ["BIOANALYS_SEED"])
+np.random.seed(SEED)
+ALPHA = 0.05
+FOREGROUND_MAX = 100       # ORA 前景上限（每域）
+FOREGROUND_MIN = 10        # 不足则退 top50
+FALLBACK_TOP = 50
+# BIO_GMT_CACHE 可覆盖 gmt 缓存目录（默认 <cwd>/../references/gmt_cache，见 SPEC_DECISIONS D-22）
+CACHE = os.environ.get("BIO_GMT_CACHE", os.path.join("..", "references", "gmt_cache"))
+os.makedirs(CACHE, exist_ok=True)
+
+# 物种 -> 库配置：pathway = 物种专属通路库；go = Enrichr GO 三本体（人库）
+# mouse 的 GO 库需把 query 基因大写化后匹配（Enrichr 无小鼠 GO 库，同源近似）
+SPECIES_CFG = {
+    "mouse": {
+        "pathway": [("KEGG_2019_Mouse", "mouse"), ("WikiPathways_2019_Mouse", "mouse")],
+        "go": ["GO_Biological_Process_2023", "GO_Cellular_Component_2023",
+               "GO_Molecular_Function_2023"],
+        "go_upper": True,
+    },
+    "human": {
+        "pathway": [("KEGG_2021_Human", "human"), ("Reactome_Pathways_2024", "human")],
+        "go": ["GO_Biological_Process_2023", "GO_Cellular_Component_2023",
+               "GO_Molecular_Function_2023"],
+        "go_upper": False,
+    },
+}
+
+
+def fail(m):
+    sys.stderr.write("enrichment 自校验失败: %s\n" % m)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(m):
+    print(m, flush=True)
+
+
+def load_lib(name, organism):
+    """取基因集：优先本地 gmt 缓存，缺失则联网下载并缓存（离线可复用）。"""
+    path = os.path.join(CACHE, "%s.gmt" % name)
+    if os.path.exists(path):
+        try:
+            return gseapy.read_gmt(path)
+        except Exception:
+            pass
+    try:
+        gs = gseapy.get_library(name=name, organism=organism)
+        with open(path, "w", encoding="utf-8") as fh:
+            for term, genes in gs.items():
+                fh.write("%s\tna\t%s\n" % (term, "\t".join(genes)))
+        return gs
+    except Exception as e:
+        log("  gene set %s 不可用：%s（跳过）" % (name, str(e)[:100]))
+        return None
+
+
+report_lines = [
+    "step=enrichment",
+    "seed=%d" % SEED,
+    "method=ORA(gseapy.enrich, hypergeometric) + prerank GSEA(gseapy.prerank, nperm=1000)",
+    "note=前景=每域 marker(pvals_adj<%.2f, 最多 top%d; 不足 %d 退 top%d); GSEA 排序=logfoldchanges"
+    % (ALPHA, FOREGROUND_MAX, FOREGROUND_MIN, FALLBACK_TOP),
+    "note_go_mouse=小鼠 GO 用 Enrichr 人源库 + symbol 大写化（Enrichr 无小鼠 GO 库，同源近似）",
+    "",
+]
+
+# 物种集合由实际存在的 marker 产物推导（GSE233814 只有小鼠）。
+SPECIES_CANDIDATES = ["mouse", "human"]
+species_present = []
+for sp in SPECIES_CANDIDATES:
+    if os.path.exists("spatial_marker_%s.h5ad" % sp):
+        species_present.append(sp)
+if not species_present:
+    fail("spatial_marker_{mouse,human}.h5ad 全部缺席（步骤 6 产物未生成？）")
+log("species_present=%s" % ",".join(species_present))
+
+for species in species_present:
+    h5ad = "spatial_marker_%s.h5ad" % species
+    if not os.path.exists(h5ad):
+        fail("缺少输入 %s（步骤 6 产物）" % h5ad)
+    a = ad.read_h5ad(h5ad)
+    if "domain_markers" not in a.uns:
+        fail("%s 缺 uns['domain_markers']" % h5ad)
+    if "gene_symbol" not in a.var.columns:
+        fail("%s 缺 var['gene_symbol']" % h5ad)
+
+    df = sc.get.rank_genes_groups_df(a, group=None, key="domain_markers")
+    df = df[df["names"].notna()].copy()
+    symbol_map = a.var["gene_symbol"].to_dict()
+    df["gene_symbol"] = df["names"].map(symbol_map)
+    df = df[df["gene_symbol"].notna()].copy()
+    df["gene_symbol"] = df["gene_symbol"].astype(str)
+    n_domains = int(df["group"].nunique())
+    log("=== %s: %d domains, %d marker rows ===" % (species, n_domains, len(df)))
+
+    background = sorted(set(a.var["gene_symbol"].astype(str)))
+    log("%s background genes=%d" % (species, len(background)))
+
+    cfg = SPECIES_CFG[species]
+    # 组装库：pathway（物种专属）+ go（人库，mouse 需大写化）
+    libs = {}          # lib_name -> gene set dict
+    lib_upper = {}     # lib_name -> 是否需 query 大写化
+    for name, org in cfg["pathway"]:
+        gs = load_lib(name, org)
+        if gs:
+            libs[name] = gs
+            lib_upper[name] = False
+    for name in cfg["go"]:
+        gs = load_lib(name, "human")
+        if gs:
+            libs[name] = gs
+            lib_upper[name] = bool(cfg["go_upper"])
+    if not libs:
+        fail("%s 无可用基因集" % species)
+    log("%s libraries=%s" % (species, ",".join(sorted(libs.keys()))))
+
+    # --- 1. ORA per domain ---
+    ora_rows = []
+    for dom, sub in df.groupby("group"):
+        sig = sub[sub["pvals_adj"] < ALPHA]
+        if len(sig) >= FOREGROUND_MIN:
+            fg = sig.sort_values("scores", ascending=False).head(FOREGROUND_MAX)
+        else:
+            fg = sub.sort_values("scores", ascending=False).head(FALLBACK_TOP)
+        genes = fg["gene_symbol"].astype(str).tolist()
+        if len(genes) < 5:
+            continue
+        for lib, gs in libs.items():
+            query = [g.upper() for g in genes] if lib_upper[lib] else genes
+            bg = [g.upper() for g in background] if lib_upper[lib] else background
+            try:
+                res = gseapy.enrich(gene_list=query, gene_sets=gs, background=bg,
+                                    outdir=None, verbose=False)
+                rdf = res.results
+                if rdf is None or not len(rdf):
+                    continue
+                rdf = rdf.copy()
+                rdf["domain"] = dom
+                rdf["library"] = lib
+                rdf["n_foreground"] = len(genes)
+                ora_rows.append(rdf)
+            except Exception as e:
+                log("  [%s/%s] ORA 失败：%s" % (dom, lib, str(e)[:80]))
+    if ora_rows:
+        ora = pd.concat(ora_rows, ignore_index=True)
+        keep = [c for c in ["domain", "library", "Term", "Overlap", "P-value",
+                            "Adjusted P-value", "Odds Ratio", "Combined Score",
+                            "Genes", "n_foreground"] if c in ora.columns]
+        ora = ora[keep].sort_values(["domain", "Adjusted P-value"])
+        ora.to_csv("enrichment_ora_%s.tsv" % species, sep="\t", index=False)
+        log("wrote enrichment_ora_%s.tsv (%d 行)" % (species, len(ora)))
+    else:
+        log("%s ORA 无结果" % species)
+        pd.DataFrame(columns=["domain", "library", "Term"]).to_csv(
+            "enrichment_ora_%s.tsv" % species, sep="\t", index=False)
+
+    # --- 2. prerank GSEA per domain ---
+    gsea_rows = []
+    for dom, sub in df.groupby("group"):
+        sub = sub.dropna(subset=["logfoldchanges", "gene_symbol"])
+        if len(sub) < 20:
+            continue
+        rnk = sub[["gene_symbol", "logfoldchanges"]].drop_duplicates("gene_symbol")
+        rnk = rnk.set_index("gene_symbol")["logfoldchanges"].astype(float)
+        rnk = rnk.sort_values(ascending=False)
+        for lib, gs in libs.items():
+            if lib_upper[lib]:
+                rnk_lib = pd.Series(rnk.to_numpy(), index=[g.upper() for g in rnk.index])
+                rnk_lib = rnk_lib[~rnk_lib.index.duplicated(keep="first")]
+            else:
+                rnk_lib = rnk
+            try:
+                res = gseapy.prerank(rnk=rnk_lib, gene_sets=gs, min_size=5, max_size=500,
+                                     permutation_num=1000, seed=SEED, outdir=None,
+                                     verbose=False)
+                rdf = res.res2d
+                if rdf is None or not len(rdf):
+                    continue
+                rdf = rdf.copy()
+                rdf["domain"] = dom
+                rdf["library"] = lib
+                gsea_rows.append(rdf)
+            except Exception as e:
+                log("  [%s/%s] GSEA 失败：%s" % (dom, lib, str(e)[:80]))
+    if gsea_rows:
+        gsea = pd.concat(gsea_rows, ignore_index=True)
+        keep = [c for c in ["domain", "library", "Term", "ES", "NES", "NOM p-val",
+                            "FDR q-val", "Lead_genes"] if c in gsea.columns]
+        gsea = gsea[keep]
+        gsea["NES"] = pd.to_numeric(gsea["NES"], errors="coerce")
+        gsea["FDR q-val"] = pd.to_numeric(gsea["FDR q-val"], errors="coerce")
+        gsea = gsea.dropna(subset=["NES", "FDR q-val"])
+        if not np.all(np.isfinite(gsea["NES"])):
+            fail("%s GSEA NES 含非有限值" % species)
+        gsea = gsea.sort_values(["domain", "FDR q-val"])
+        gsea.to_csv("enrichment_gsea_%s.tsv" % species, sep="\t", index=False)
+        log("wrote enrichment_gsea_%s.tsv (%d 行)" % (species, len(gsea)))
+    else:
+        log("%s GSEA 无结果" % species)
+        pd.DataFrame(columns=["domain", "library", "Term"]).to_csv(
+            "enrichment_gsea_%s.tsv" % species, sep="\t", index=False)
+
+    # --- 报告段 ---
+    n_ora_sig = 0
+    if ora_rows:
+        ora_all = pd.concat(ora_rows, ignore_index=True)
+        if "Adjusted P-value" in ora_all.columns:
+            n_ora_sig = int((pd.to_numeric(ora_all["Adjusted P-value"], errors="coerce") < ALPHA).sum())
+    n_gsea_sig = 0
+    if gsea_rows:
+        g_all = pd.concat(gsea_rows, ignore_index=True)
+        if "FDR q-val" in g_all.columns:
+            n_gsea_sig = int((pd.to_numeric(g_all["FDR q-val"], errors="coerce") < ALPHA).sum())
+    report_lines += [
+        "=== %s ===" % species,
+        "domains=%d marker_rows=%d background=%d" % (n_domains, len(df), len(background)),
+        "libraries=%s" % ",".join(sorted(libs.keys())),
+        "ora_rows=%d ora_significant(adj p<%.2f)=%d" % (len(ora_rows), ALPHA, n_ora_sig),
+        "gsea_rows=%d gsea_significant(FDR q<%.2f)=%d" % (len(gsea_rows), ALPHA, n_gsea_sig),
+    ]
+    if ora_rows:
+        ora_all = pd.concat(ora_rows, ignore_index=True)
+        sig = ora_all[pd.to_numeric(ora_all["Adjusted P-value"], errors="coerce") < ALPHA]
+        if len(sig):
+            top = sig.sort_values("Adjusted P-value").head(8)
+            for _, r in top.iterrows():
+                report_lines.append("  ORA [%s] %s (%s) adj p=%.3g"
+                                    % (r["domain"], r["Term"], r["library"], r["Adjusted P-value"]))
+    report_lines.append("")
+
+report_lines += [
+    "limitations:",
+    "  1. GSEA 每域仅 top200 marker，基因空间有限，NES 覆盖度低于全转录组 GSEA，作探索性参考。",
+    "  2. 小鼠 GO 用 Enrichr 人源库 + symbol 大写化匹配（Enrichr 无小鼠 GO 库），属同源近似。",
+    "  3. ORA 背景为该物种检出全基因（非全基因组），富集解释限于检出空间。",
+    "  4. 域身份样本私有（<sample>_d<n>），跨样本不可比，域间结果只作本样本内解读。",
+    "",
+    "elapsed_seconds=%.1f" % (time.time() - START),
+    "outputs=enrichment_ora_mouse.tsv, enrichment_ora_human.tsv, enrichment_gsea_mouse.tsv, enrichment_gsea_human.tsv, enrichment_report.txt",
+]
+with open("enrichment_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'enrichment_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('enrichment_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("enrichment_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "enrichment_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

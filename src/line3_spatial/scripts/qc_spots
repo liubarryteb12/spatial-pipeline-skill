@@ -1,0 +1,439 @@
+#!/usr/bin/env bash
+# qc_spots：line3_spatial 步骤 2 spot 级 QC（按指标过滤 spot 与噪声基因）。
+#
+# 输入：步骤 1 产物 spatial_counts_mouse.h5ad / spatial_counts_human.h5ad
+#   （spots x genes 稀疏计数矩阵，obs 带 sample_id/group/condition 等元数据 +
+#   ncount/nfeature 预计算列，var 带 gene_symbol/genome，uns 带 spatial 图与
+#   scalefactors、seed、species、samples 等口径键）。
+#
+# 阈值口径（2026-10-13 服务器两轮探针实测定稿，固定不随结果调整）：
+#   ncount >= 100（spot 总计数，低于此视为空点/残点）
+#   nfeature >= 50（spot 检出基因数）
+#   pct_mito <= 50（线粒体计数占比，仅滤病态 spot）
+#   基因表达 spot 数 >= 3（噪声基因）
+# 原型实测（GSE192741，17290 小鼠 + 6889 人源 spot）：
+#   沉积数据已由 Space Ranger 预过滤（仅组织下 spot 进 filtered 矩阵），
+
+#   低指标 spot 极少：ncount<100 或 nfeature<50 小鼠 7 个 / 人源 10 个；
+#   pct_mito>50 小鼠 1 个 / 人源 2 个（>20% 人源 283 个，但二探针证实其
+#   不聚在捕获区边缘且集中在 JBO014 单样本掉 19.63%，是样本级质量特征
+#   而非边缘损伤，滤了会在组织上打洞破坏邻域分析，故阈值定 50 只滤病态，
+#   样本级偏高记 warning 不过滤）。
+#   基因 <3 spot：小鼠 2 个 / 人源 0 个。
+#
+# 处置：全部 spot（含被滤）指标与去留原因落 spot_qc_metrics.tsv，可审计；
+# 保留矩阵落 spatial_qc_<species>.h5ad；uns['spatial'] 图与 scalefactors
+# 随矩阵保留（下游空间作图要用；只丢 spot 不丢样本，图不受影响）。
+#
+# 自校验内建：输入契约（obs/var/uns 必备列与键）、指标重算与 ingest 列一致、
+# 每样本保留比例 >= 75%（阈值设计失误早炸而非静默毁数据）、保留矩阵无负值、
+# obs 列不丢、obs_names 唯一、uns['spatial'] 样本集与 obs 一致。任一不过
+# 非零退出，让台账记 failed。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：每个 .h5ad 输入各是一个物种的步骤 1 产物，物种从 uns 读，
+# 不靠文件名猜。模式前后都带 *：拿到的是绝对路径（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ "${#INPUTS[@]}" -eq 0 ]; then
+  echo "缺少必需输入：需要步骤 1 产物 h5ad（spatial_counts_mouse/human.h5ad）" >&2
+  exit 2
+fi
+for path in "${INPUTS[@]}"; do
+  case "$path" in
+    *.h5ad) ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad）" >&2; exit 2 ;;
+  esac
+  if [ ! -f "$path" ]; then
+    echo "输入文件不存在: $path" >&2
+    exit 2
+  fi
+done
+
+echo "step_executed=qc_spots"
+echo "bioanalys_seed=${seed}"
+
+# 输入列表与输出目录经环境变量进 python（换行分隔，避免参数长度与引号问题）
+inputs_newline=""
+for path in "${INPUTS[@]}"; do
+  inputs_newline="${inputs_newline}${path}"$'\n'
+done
+export QC_INPUTS="$inputs_newline"
+export QC_OUTDIR="${QC_OUTDIR:-$(pwd)}"
+
+export BIOANALYS_SEED="$seed"
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import os
+import sys
+import time
+
+import anndata as ad
+import numpy as np
+import pandas as pd
+from scipy.sparse import csr_matrix
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+SEED = os.environ["BIOANALYS_SEED"]
+
+# 阈值（2026-10-13 两轮探针定稿）。改阈值 = 新分析项目，不做热切换。
+MIN_COUNTS = 100
+MIN_FEATURES = 50
+MAX_MITO_PCT = 50.0
+GENE_MIN_SPOTS = 3
+MIN_KEEP_FRACTION = 0.75  # 每样本保留比例下限，防阈值设计失误毁数据
+
+MITO_PREFIX = {"Mus musculus": "mt-", "Homo sapiens": "MT-"}
+SPECIES_TAG = {"Mus musculus": "mouse", "Homo sapiens": "human"}
+
+REQUIRED_OBS = ["barcode", "sample_id", "gsm", "species", "platform_id", "strain",
+                "condition", "condition_class", "group", "tissue", "in_tissue",
+                "array_row", "array_col", "pxl_row_fullres", "pxl_col_fullres",
+                "ncount", "nfeature"]
+REQUIRED_VAR = ["gene_symbol", "genome", "feature_type"]
+REQUIRED_UNS = ["seed", "source_tar", "source_soft_mouse", "source_soft_human",
+                "grouping_check", "species", "genome", "gene_id_type", "samples",
+                "coord_note", "image_note"]
+
+started = time.time()
+warnings_list = []
+
+
+def fail(msg):
+    print("FAIL: %s" % msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+# --- 1. 输入契约校验：必须是步骤 1 产物，列/键不齐即失败（防喂错文件）---
+inputs = [p for p in os.environ["QC_INPUTS"].split("\n") if p.strip()]
+if not inputs:
+    fail("QC_INPUTS 环境变量为空")
+
+loaded = {}
+for path in inputs:
+    a = ad.read_h5ad(path)
+    missing_obs = [c for c in REQUIRED_OBS if c not in a.obs.columns]
+    if missing_obs:
+        fail("%s 缺少 obs 列: %s" % (path, missing_obs))
+    missing_var = [c for c in REQUIRED_VAR if c not in a.var.columns]
+    if missing_var:
+        fail("%s 缺少 var 列: %s" % (path, missing_var))
+    missing_uns = [k for k in REQUIRED_UNS if k not in a.uns]
+    if missing_uns:
+        fail("%s 缺少 uns 键: %s" % (path, missing_uns))
+    if "spatial" not in a.obsm or "spatial" not in a.uns:
+        fail("%s 缺少 obsm/uns spatial（空间数据必需）" % path)
+    species = a.uns["species"]
+    if species not in MITO_PREFIX:
+        fail("%s 未知物种: %s" % (path, species))
+    if species in loaded:
+        fail("物种 %s 出现两次输入（%s 与 %s），每个物种只应有一个矩阵" %
+             (species, loaded[species][0], path))
+    # X 必须是 csr 计数矩阵
+    if a.X.getformat() != "csr":
+        fail("%s X 不是 csr（步骤 1 产物应为 csr）" % path)
+    if a.X.min() < 0:
+        fail("%s 输入矩阵含负值" % path)
+    loaded[species] = (path, a)
+    log("input=%s species=%s spots=%d genes=%d" % (path, species, a.n_obs, a.n_vars))
+
+if not loaded:
+    fail("没有可用输入")
+
+# --- 2. 逐物种 QC ---
+metric_frames = []
+results = []
+for species in sorted(loaded):
+    path, a = loaded[species]
+    log("=== %s (%s) ===" % (species, path))
+
+    # 2a. 指标重算（判定唯一口径，不信落盘列）
+    X = a.X
+    ncount = np.asarray(X.sum(axis=1)).ravel()
+    nfeature = np.diff(X.indptr)
+    if not np.issubdtype(ncount.dtype, np.integer):
+        fail("%s ncount 不是整数" % path)
+    # 与 ingest 落盘列对账（口径漂移即失败）
+    if not (ncount == a.obs["ncount"].to_numpy()).all():
+        fail("%s ncount 重算与落盘列不一致" % path)
+    if not (nfeature == a.obs["nfeature"].to_numpy()).all():
+        fail("%s nfeature 重算与落盘列不一致" % path)
+
+    mito_mask = a.var["gene_symbol"].str.startswith(MITO_PREFIX[species]).to_numpy()
+    n_mito_genes = int(mito_mask.sum())
+    if n_mito_genes == 0:
+        fail("%s 未找到线粒体基因（前缀 %s）" % (path, MITO_PREFIX[species]))
+    mito_counts = X.dot(mito_mask.astype(np.float64))
+    pct_mito = mito_counts / np.maximum(ncount, 1) * 100.0
+
+    # 2b. 阈值判定（严格阈值，边界值判失败）
+    low = (ncount < MIN_COUNTS) | (nfeature < MIN_FEATURES)
+    high_mito = pct_mito > MAX_MITO_PCT
+    keep = ~(low | high_mito)
+    drop_reason = np.where(low & high_mito, "low_metrics+high_mito",
+                           np.where(low, "low_metrics",
+                                    np.where(high_mito, "high_mito", "")))
+    log("threshold: ncount>=%d nfeature>=%d pct_mito<=%.0f gene_spots>=%d"
+        % (MIN_COUNTS, MIN_FEATURES, MAX_MITO_PCT, GENE_MIN_SPOTS))
+    log("dropped: low=%d high_mito=%d union=%d of %d (%.2f%%)"
+        % (int(low.sum()), int(high_mito.sum()), int((~keep).sum()),
+           a.n_obs, (~keep).mean() * 100))
+
+    # 2c. 每样本保留比例下限（阈值设计失误早炸）
+    per_sample_keep = {}
+    for sf in a.uns["samples"]:
+        m = (a.obs["sample_id"] == sf).to_numpy()
+        frac = float(keep[m].mean())
+        per_sample_keep[sf] = frac
+        if frac < MIN_KEEP_FRACTION:
+            fail("样本 %s 保留比例 %.3f 低于下限 %.2f（阈值设计失误？）" %
+                 (sf, frac, MIN_KEEP_FRACTION))
+
+    # 2d. 样本级质量警告（不过滤，如实报告）
+    sample_med_mito = float(np.median(pct_mito))
+    for sf in a.uns["samples"]:
+        m = (a.obs["sample_id"] == sf).to_numpy()
+        med = float(np.median(pct_mito[m]))
+        if med > 3 * sample_med_mito and med > 5.0:
+            msg = ("样本 %s 线粒体中位占比 %.2f%% 显著高于本物种整体 %.2f%%"
+                   "（样本级质量特征，未过滤，下游解释需注意）" % (sf, med, sample_med_mito))
+            warnings_list.append(msg)
+            log("WARN: %s" % msg)
+
+    # 2e. 基因过滤：保留 spot 数 >= GENE_MIN_SPOTS
+    # 每基因表达 spot 数 = 非零元数按列计数（CSR 的 indices 即列下标，
+    # bincount 一次 O(nnz) 算完，避免 tocsr/tocsc 全量转换）
+    kept = a[keep].copy()
+    gene_spots = np.bincount(kept.X.indices, minlength=kept.n_vars)
+    gene_keep = gene_spots >= GENE_MIN_SPOTS
+    n_gene_dropped = int((~gene_keep).sum())
+    kept = kept[:, gene_keep].copy()
+    log("kept spots=%d genes=%d (gene filter dropped %d)"
+        % (kept.n_obs, kept.n_vars, n_gene_dropped))
+
+    # 2e2. 双细胞过滤（可选，读预计算表；不在管线内跑 scrublet）
+    # 口径：Visium spot 直径约 55um，本身可能含多个细胞，此处 doublet 指
+    # 「表达谱像两群混合」的 spot（多细胞 / 粘连 / ambient RNA），
+    # 不等同于单细胞意义上的真双细胞。
+    # 为什么读表而不在管线里跑 scrublet（2026-11-06 实测）：本步主进程持约 2.7 GB
+    # 输入与约 2.2 GB 过滤副本，再起 scrublet 子进程（约 1 GB），写输出时可用内存
+    # 跌破 600 MB，Android 的 LMK 会杀掉整个 Termux（当天实测 5 次）。
+    # 因此 scrublet 拆到 ops/doublet_score.py 单独跑，本步只应用判定。
+    doublet_info = {
+        "enabled": False,
+        "source": None,
+        "n_predicted": 0,
+        "overall_rate": 0.0,
+        "rate_by_sample": {},
+        "note": ("Visium spot 为多细胞单元，doublet 指表达谱混合，"
+                 "不等同于单细胞意义上的真双细胞"),
+    }
+    _tbl_path = (os.environ.get("BIO_DOUBLET_TABLE") or "").strip()
+    if _tbl_path and os.path.isfile(_tbl_path):
+        _tbl = pd.read_csv(_tbl_path, sep="\t")
+        _pred_orig = np.zeros(int(a.n_obs), dtype=bool)
+        _score_orig = np.full(int(a.n_obs), np.nan)
+        _ri = _tbl["row_index"].to_numpy(dtype=int)
+        _pred_orig[_ri] = _tbl["predicted_doublet"].to_numpy(dtype=int).astype(bool)
+        _score_orig[_ri] = _tbl["doublet_score"].to_numpy(dtype=float)
+        # kept 是 a[keep] 的顺序子集，用同一个布尔掩码对齐
+        _pred = _pred_orig[keep]
+        _score = _score_orig[keep]
+        kept.obs["doublet_score"] = _score
+        kept.obs["predicted_doublet"] = _pred
+        for _sf in list(kept.uns["samples"]):
+            _m = kept.obs["sample_id"].to_numpy() == _sf
+            _r = float(_pred[_m].mean())
+            doublet_info["rate_by_sample"][_sf] = round(_r, 4)
+            log("doublet %s: predicted=%d/%d (%.2f%%) [预计算表]"
+                % (_sf, int(_pred[_m].sum()), int(_m.sum()), _r * 100))
+        doublet_info["enabled"] = True
+        doublet_info["source"] = os.path.basename(_tbl_path)
+        doublet_info["n_predicted"] = int(_pred.sum())
+        doublet_info["overall_rate"] = round(float(_pred.mean()), 4)
+        if _pred.any():
+            kept = kept[~_pred].copy()
+        log("doublet filter: dropped %d, kept %d"
+            % (int(_pred.sum()), kept.n_obs))
+    else:
+        log("doublet filter: 未提供预计算表（BIO_DOUBLET_TABLE 未设或文件不存在），跳过")
+    kept.uns["qc_doublet_disposition"] = doublet_info
+
+
+    # 2f. 落盘前自校验
+    if kept.n_obs == 0:
+        fail("%s 过滤后无剩余 spot" % species)
+    if kept.X.min() < 0:
+        fail("%s 保留矩阵含负值" % species)
+    if not kept.obs_names.is_unique:
+        fail("%s 保留后 obs_names 不唯一" % species)
+    lost_obs = [c for c in REQUIRED_OBS if c not in kept.obs.columns]
+    if lost_obs:
+        fail("%s 保留矩阵丢失 obs 列: %s" % (species, lost_obs))
+    lost_var = [c for c in REQUIRED_VAR if c not in kept.var.columns]
+    if lost_var:
+        fail("%s 保留矩阵丢失 var 列: %s" % (species, lost_var))
+    uns_samples = set(kept.uns["samples"])
+    obs_samples = set(kept.obs["sample_id"].unique())
+    if uns_samples != obs_samples:
+        fail("%s uns['samples'] 与 obs sample_id 不一致: %s vs %s"
+             % (species, sorted(uns_samples), sorted(obs_samples)))
+    if set(kept.uns["spatial"].keys()) != obs_samples:
+        fail("%s uns['spatial'] 样本集与 obs 不一致" % species)
+    # 保留矩阵指标与阈值一致（过滤生效证明）
+    kn = np.asarray(kept.X.sum(axis=1)).ravel()
+    kf = np.diff(kept.X.indptr)
+    if kn.min() < MIN_COUNTS or kf.min() < MIN_FEATURES:
+        fail("%s 保留矩阵仍有低于阈值的 spot" % species)
+    kmask = kept.var["gene_symbol"].str.startswith(MITO_PREFIX[species]).to_numpy()
+    kpct = kept.X.dot(kmask.astype(np.float64)) / np.maximum(kn, 1) * 100.0
+    if kpct.max() > MAX_MITO_PCT:
+        fail("%s 保留矩阵仍有超过线粒体阈值的 spot" % species)
+
+    # 2g. obs 追加 QC 指标列（下游直接用）
+    kept.obs["total_counts"] = kn
+    kept.obs["n_genes_by_counts"] = kf
+    kept.obs["pct_mito"] = kpct
+    kept.uns["qc"] = {
+        "step": "qc_spots",
+        "seed": SEED,
+        "min_counts": MIN_COUNTS,
+        "min_features": MIN_FEATURES,
+        "max_mito_pct": MAX_MITO_PCT,
+        "gene_min_spots": GENE_MIN_SPOTS,
+        "spots_before": int(a.n_obs),
+        "spots_after": int(kept.n_obs),
+        "genes_before": int(a.n_vars),
+        "genes_after": int(kept.n_vars),
+        "dropped_low_metrics": int(low.sum()),
+        "dropped_high_mito": int(high_mito.sum()),
+        "dropped_union": int((~keep).sum()),
+        "genes_dropped_by_spot_filter": n_gene_dropped,
+        "n_mito_genes": n_mito_genes,
+        "median_pct_mito_before": sample_med_mito,
+        "warnings": list(warnings_list),
+    }
+
+    tag = SPECIES_TAG[species]
+    out_path = os.path.join(os.environ["QC_OUTDIR"], "spatial_qc_%s.h5ad" % tag)
+    kept.write_h5ad(out_path)
+    log("wrote %s spots=%d genes=%d" % (out_path, kept.n_obs, kept.n_vars))
+
+    # 2h. 全量 spot 指标表（含被滤，带去留原因，可审计）
+    mf = pd.DataFrame({
+        "obs_name": a.obs_names,
+        "species": species,
+        "sample_id": a.obs["sample_id"].to_numpy(),
+        "group": a.obs["group"].to_numpy(),
+        "condition": a.obs["condition"].to_numpy(),
+        "barcode": a.obs["barcode"].to_numpy(),
+        "array_row": a.obs["array_row"].to_numpy(),
+        "array_col": a.obs["array_col"].to_numpy(),
+        "ncount": ncount,
+        "nfeature": nfeature,
+        "pct_mito": np.round(pct_mito, 4),
+        "qc_keep": keep,
+        "drop_reason": drop_reason,
+    })
+    metric_frames.append(mf)
+
+    results.append({
+        "species": species, "tag": tag, "path": path,
+        "spots_before": int(a.n_obs), "spots_after": int(kept.n_obs),
+        "genes_before": int(a.n_vars), "genes_after": int(kept.n_vars),
+        "dropped_low": int(low.sum()), "dropped_mito": int(high_mito.sum()),
+        "dropped_union": int((~keep).sum()),
+        "genes_dropped": n_gene_dropped,
+        "n_mito_genes": n_mito_genes,
+        "median_mito": sample_med_mito,
+        "per_sample_keep": per_sample_keep,
+        "per_sample": {sf: {
+            "spots": int((a.obs["sample_id"] == sf).sum()),
+            "kept": int(keep[(a.obs["sample_id"] == sf).to_numpy()].sum()),
+            "med_ncount": float(np.median(ncount[(a.obs["sample_id"] == sf).to_numpy()])),
+            "med_nfeature": float(np.median(nfeature[(a.obs["sample_id"] == sf).to_numpy()])),
+            "med_pct_mito": float(np.median(pct_mito[(a.obs["sample_id"] == sf).to_numpy()])),
+        } for sf in a.uns["samples"]},
+    })
+
+# --- 3. 全量 spot 指标表落盘 ---
+all_metrics = pd.concat(metric_frames, ignore_index=True)
+metrics_path = os.path.join(os.environ["QC_OUTDIR"], "spot_qc_metrics.tsv")
+all_metrics.to_csv(metrics_path, sep="\t", index=False)
+log("wrote %s rows=%d" % (metrics_path, len(all_metrics)))
+
+# --- 4. 报告 ---
+elapsed = time.time() - started
+report = []
+report.append("step=qc_spots")
+report.append("seed=%s" % SEED)
+report.append("thresholds=min_counts:%d min_features:%d max_mito_pct:%.0f gene_min_spots:%d"
+              % (MIN_COUNTS, MIN_FEATURES, MAX_MITO_PCT, GENE_MIN_SPOTS))
+report.append("threshold_note=沉积数据已由 Space Ranger 预过滤（仅组织下 spot）；"
+              "mito>20%% 探针二证实不聚边缘且集中于 JBO014（掉 19.63%%），"
+              "属样本级质量特征，滤了会在组织上打洞，故阈值定 %.0f 只滤病态，"
+              "样本级偏高记 warning" % MAX_MITO_PCT)
+for r in results:
+    report.append("species=%s (%s)" % (r["species"], r["tag"]))
+    report.append("  source=%s" % r["path"])
+    report.append("  spots: %d -> %d (dropped %d: low=%d high_mito=%d)"
+                  % (r["spots_before"], r["spots_after"], r["dropped_union"],
+                     r["dropped_low"], r["dropped_mito"]))
+    report.append("  genes: %d -> %d (spot filter dropped %d, mito genes=%d)"
+                  % (r["genes_before"], r["genes_after"], r["genes_dropped"],
+                     r["n_mito_genes"]))
+    report.append("  median_pct_mito_before=%.2f" % r["median_mito"])
+    for sf in sorted(r["per_sample"]):
+        s = r["per_sample"][sf]
+        report.append("  sample %s: spots=%d kept=%d med_ncount=%.0f med_nfeature=%.0f med_pct_mito=%.2f"
+                      % (sf, s["spots"], s["kept"], s["med_ncount"], s["med_nfeature"], s["med_pct_mito"]))
+    report.append("  min_keep_fraction=%.3f" % min(r["per_sample_keep"].values()))
+if warnings_list:
+    for w in warnings_list:
+        report.append("warning=%s" % w)
+else:
+    report.append("warning=none")
+report.append("outputs=spatial_qc_mouse.h5ad, spatial_qc_human.h5ad, spot_qc_metrics.tsv")
+report.append("elapsed_seconds=%d" % elapsed)
+report.append("qc_spots_done")
+report_text = "\n".join(report)
+print(report_text)
+with open(os.path.join(os.environ["QC_OUTDIR"], "qc_report.txt"), "w") as f:
+    f.write(report_text + "\n")
+PYSCRIPT
+
+echo "qc_spots_all_done"
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "${QC_OUTDIR:-$(pwd)}" "qc_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

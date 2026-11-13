@@ -1,0 +1,594 @@
+#!/usr/bin/env bash
+# spatial_knockout：line3_spatial 步骤 13 虚拟敲除（线内末端模块）。
+#
+# 输入：步骤 12 产物 spatial_localization_mouse.h5ad / spatial_localization_human.h5ad
+#       （obs 带 domain + target_gene_expr，layers['counts'] 原始计数）。
+#
+# 做法（口径定稿依据：服务器探针 s4_ko_probe*.py 实测）：
+#   1. 敲除对象 = 逐样本子集运行（aims.txt："若为 spot 级空间数据，直接虚拟敲除
+#      需谨慎，可按空间域聚合或子集运行"）。域聚合路线（mouse 57 / human 18
+#      pseudo-cell）实测废弃：human 聚合后 scTenifold QC 只剩 1 个 pseudo-cell，
+#      非恒定基因为 0 建不了网（ValueError n_comp 必须 < 非恒定基因数）；逐样本
+#      spot 级路线探针 7 实测可行（mouse JBO001 1646 spot / human JBO018 2500
+#      spot 均 ~6s 完成）。每个样本内 spot 作 cell 单元，KO 基因在样本内表达
+#      spot 占比 <5% 会被 scTenifold QC 整基因滤掉，该样本跳过并如实记录
+#      （mouse CAP002 / human JBO015 属此类）。基因宇宙收窄到步骤 3 的 HVG
+#      （+敲除基因），与 line2 步骤 9 "HVG 2000 上的 counts" 同口径：全基因
+#      18628 x ~1700 spot 建共表达网络实测不可行（tenifold 逐基因建网，3 分钟
+#      无进展且容器反复重启）。
+#   2. 敲除基因解析优先级（与 line2 步骤 9 同口径）：--ko-gene 参数 > 环境变量
+#      BIO_KO_GENE（引擎契约 P14 注入）> 项目元数据 target_ko_gene > 线内证据兜底
+#      Spp1（mouse 步骤 12 target5、步骤 6 巨噬域 marker Cd5l/C1qb 同域出现、肝
+#      巨噬细胞主题）。不取 line2 的 TNF（三线不交叉原则）。实际生效基因与来源
+#      落台账 ko_gene= / ko_gene_source=，不静默。
+#   3. DR genes = d_regulation 全表（adj p<0.05 且非敲除基因为显著 DR，口径同
+#      line2 步骤 9：DR≠DEG，计算模拟非实验验证）。敲除基因自动排除出期望计算
+#      （scTenifold 行为，与 R 版一致）。
+#   4. spot 级贴回：DR 显著基因的 spot 原始计数表达（该 spot 本身即敲除单元的
+#      表达值），下游映射回空间坐标看分布（aims："映射回空间坐标看分布"）。
+#
+# scTenifold API 要点（探针 5/7 实测，line2 同款重验）：
+#   - import 名是 scTenifold（pip 包名 scTenifoldpy 0.5.1，top_level=scTenifold）；
+#   - DataFrame 约定 index=基因名 columns=细胞名（_QC.py 对 index 做
+#     .str.upper().match("^MT-")， genes x cells 布局）；
+#   - 参数名 ko_genes（str 或 list），random_state 必须走 nc_kws/td_kws 注入
+#     （顶层不接受）；
+#   - QC 硬匹配大写 ^MT-（str.upper().match，species 无关都命中）。**比率分母是
+#     喂进去的矩阵库**：默认在 HVG 子矩阵上算会失真放大约 5 倍（mouse BH001
+#     1706 spot 被剔到 0 直接崩，探针 8 实测），故生产脚本先按全 counts 口径
+#     预剔 mito 比 >=0.1 的 spot，再以 qc_kws={"max_mito_ratio": 1.0} 关掉
+#     库内 mito 过滤（阈值、匹配规则与 scTenifold 一致，只换分母）。
+#
+# 自校验内建：输入契约（步骤 12 键集合 obs 26 + var 15 + uns 27 含 localization
+# + 未做过敲除）、敲除基因在 var_names 内且 counts 有表达、每样本 KO 表达占比
+# 与去留如实记录（无样本可跑才 fail）、DR 表结构
+# （Gene/Distance/Z/FC/p-value/adjusted p-value 七列）、敲除基因不在显著 DR 内、
+# spot 级贴回完整、X/counts/X_pca/domain/obs/var 不变量。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+declare -a INPUTS=()
+output_count=0
+ko_gene=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    --ko-gene) ko_gene="$2"; shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+mouse_h5ad=""
+human_h5ad=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *mouse*.h5ad) mouse_h5ad="$path" ;;
+    *human*.h5ad) human_h5ad="$path" ;;
+    *.h5ad) echo "无法识别的输入文件: $path（文件名需含 mouse/human 物种标识）" >&2; exit 2 ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 12 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$mouse_h5ad" ] && [ -z "$human_h5ad" ]; then
+  # 单物种数据集（GSE233814 只有小鼠 GPL24247）不再要求两份都提供。
+  # 判据改为「至少一份」：两份都缺才报错；实际提供哪份，下游按文件名分流。
+  echo "缺少必需输入：至少需要一份物种 h5ad（mouse 或 human）" >&2
+  exit 2
+fi
+for path in "$mouse_h5ad" "$human_h5ad"; do
+  [ -n "$path" ] || continue
+  if [ ! -f "$path" ]; then
+    echo "输入文件不存在: $path"
+    exit 2
+  fi
+done
+
+# 敲除基因解析（顺序与 line2 步骤 9 同口径）：参数 > 环境变量 BIO_KO_GENE >
+# 项目元数据 target_ko_gene > 线内证据兜底 Spp1。引擎契约（P14）要求虚拟敲除步骤
+# 必须显式给靶基因，所以这里必须真的读 BIO_KO_GENE，否则提交层校验只是形式。
+# project.json 可能不存在或字段为空，任何读取异常都当"没指定"，不许让可选元数据
+# 把整步打挂。
+ko_gene_source="cli:--ko-gene"
+if [ -z "${ko_gene:-}" ]; then
+  ko_gene="$(printf '%s' "${BIO_KO_GENE:-}" | tr -d '[:space:]')"
+  ko_gene_source="env:BIO_KO_GENE"
+fi
+if [ -z "${ko_gene:-}" ]; then
+  # Python 侧输出 "holder.target_ko_gene=基因"，用 = 切分即可拿到基因与来源字段名
+  # （基因名不可能含 =，比 read 分列更省事，也不依赖 IFS 与 here-string）。
+  meta_gene="$(python3 - "${BIOANALYS_PROJECT_JSON:-}" <<'PYGENE'
+import json
+import sys
+
+
+def read_gene(path):
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(meta, dict):
+        return ""
+    for holder in ("biological_priors", "acl_and_output"):
+        block = meta.get(holder)
+        if isinstance(block, dict):
+            value = block.get("target_ko_gene")
+            if isinstance(value, str) and value.strip():
+                return holder + ".target_ko_gene=" + value.strip()
+    return ""
+
+
+print(read_gene(sys.argv[1] if len(sys.argv) > 1 else ""))
+PYGENE
+)"
+  if [ -n "${meta_gene:-}" ]; then
+    ko_gene="${meta_gene#*=}"
+    ko_gene_source="project.json:${meta_gene%%=*}"
+  fi
+fi
+if [ -z "${ko_gene:-}" ]; then
+  ko_gene="Spp1"
+  ko_gene_source="fallback:Spp1"
+fi
+
+echo "step_executed=spatial_knockout"
+echo "bioanalys_seed=${seed}"
+echo "input_mouse=${mouse_h5ad}"
+echo "input_human=${human_h5ad}"
+echo "ko_gene=${ko_gene}"
+echo "ko_gene_source=${ko_gene_source}"
+
+KO_INPUTS="$mouse_h5ad
+$human_h5ad"
+export KO_INPUTS
+export KO_GENE="$ko_gene"
+export KO_GENE_SOURCE="$ko_gene_source"
+export KO_OUTDIR="${KO_OUTDIR:-$(pwd)}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import json
+import hashlib
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+SEED = int(os.environ["BIOANALYS_SEED"])
+# 敲除基因由 bash 包装层解析后经环境变量传入（--ko-gene / BIO_KO_GENE /
+# project.json target_ko_gene / Spp1 兜底），与 line2 步骤 9 同口径。
+KO_GENE = os.environ.get("KO_GENE", "").strip()
+if not KO_GENE:
+    sys.stderr.write("spatial_knockout 自校验失败: 敲除基因未注入（bash 包装层应通过 "
+                     "KO_GENE 环境变量传入：--ko-gene / BIO_KO_GENE / project.json / Spp1 兜底）\n")
+    sys.exit(1)
+KO_GENE_SOURCE = os.environ.get("KO_GENE_SOURCE", "unknown").strip() or "unknown"
+ALPHA = 0.05
+N_CPUS = 3              # 手机端 3 大核算力上限（aims.txt 削峰规范）
+NEED_COLS = ["Gene", "Distance", "Z", "FC", "p-value", "adjusted p-value"]
+
+
+def fail(message):
+    sys.stderr.write("spatial_knockout 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+# 步骤 12 产物键集合（= 步骤 10 键集合 + obs 加 target_gene_expr + uns 加 localization）
+REQUIRED_OBS = ["barcode", "sample_id", "gsm", "species", "platform_id", "strain",
+                "condition", "condition_class", "group", "tissue", "in_tissue",
+                "array_row", "array_col", "pxl_row_fullres", "pxl_col_fullres",
+                "ncount", "nfeature", "total_counts", "n_genes_by_counts", "pct_mito",
+                "domain", "domain_same_frac", "domain_same_z",
+                "domain_rank", "domain_prop", "lr_score_recv", "target_gene_expr"]
+REQUIRED_VAR = ["gene_symbol", "genome", "feature_type", "means", "dispersions",
+                "dispersions_norm", "highly_variable", "morans_i_mean", "morans_i_min",
+                "morans_i_max", "morans_z_mean", "gearys_c_mean", "gearys_c_min",
+                "gearys_c_max", "autocorr_n_valid_samples"]
+REQUIRED_UNS = ["coord_note", "dimred", "domains", "gene_id_type", "genome",
+                "grouping_check", "hvg", "image_note", "log1p", "markers",
+                "autocorr", "cooccurrence", "composition", "communication",
+                "localization", "normalization", "pca", "qc", "samples", "seed",
+                "source_h5ad", "source_soft_human", "source_soft_mouse",
+                "source_tar", "spatial", "species", "warnings"]
+
+report_sections = []
+
+for path in os.environ["KO_INPUTS"].splitlines():
+    path = path.strip()
+    if not path:
+        continue
+    species = "mouse" if "mouse" in os.path.basename(path) else "human"
+    adata = ad.read_h5ad(path)
+    log("loaded %s spots=%d genes=%d" % (species, adata.shape[0], adata.shape[1]))
+    per_sample_dr = {}      # 每物种重置：{sample_id: [dr row dicts]}
+
+    # --- 1. 输入契约 ---
+    missing_obs = [col for col in REQUIRED_OBS if col not in adata.obs.columns]
+    if missing_obs:
+        fail("%s 缺少 obs 列 %s（不是 spatial_localization 产物？）" % (path, missing_obs))
+    missing_var = [col for col in REQUIRED_VAR if col not in adata.var.columns]
+    if missing_var:
+        fail("%s 缺少 var 列 %s" % (path, missing_var))
+    missing_uns = [key for key in REQUIRED_UNS if key not in adata.uns]
+    if missing_uns:
+        fail("%s 缺少 uns 键 %s（不是 spatial_localization 产物？）" % (path, missing_uns))
+    if "counts" not in adata.layers:
+        fail("%s 缺少 layers['counts']" % path)
+    for key in ["X_pca", "X_umap", "spatial"]:
+        if key not in adata.obsm:
+            fail("%s 缺少 obsm['%s']" % (path, key))
+    if "knockout" in adata.uns:
+        fail("%s 已含敲除结果（重复执行？）" % path)
+    x_nnz_before = adata.X.nnz
+    counts_nnz_before = adata.layers["counts"].nnz
+    pca_before = adata.obsm["X_pca"].copy()
+    domain_before = adata.obs["domain"].copy()
+
+    # --- 2. 敲除基因定位 + 物种适配 ---
+    # KO_GENE 为人类命名；mouse symbol 是 Title case，用大写归一匹配（同步骤 10 口径）
+    sym_upper = {}
+    for i, s in enumerate(adata.var["gene_symbol"].astype(str).tolist()):
+        sym_upper.setdefault(s.upper(), i)
+    ko_upper = KO_GENE.upper()
+    ko_gi = sym_upper.get(ko_upper)
+    ko_note = ""
+    if ko_gi is None:
+        # 物种适配：从线内 top 目标基因取第一个映射到的（不引入外部基因表）
+        targets = adata.uns["localization"]["targets"]
+        fallback = None
+        for i in range(1, 11):
+            t = targets.get("target%d" % i)
+            if t is None:
+                continue
+            fi = sym_upper.get(t["gene_symbol"].upper())
+            if fi is not None:
+                fallback = (t["gene_symbol"], fi)
+                break
+        if fallback is None:
+            fail("%s KO_GENE=%s 未映射且无线内 top 目标基因可回退" % (species, KO_GENE))
+        ko_symbol, ko_gi = fallback
+        ko_note = "KO_GENE=%s 未映射（%s 物种），回退线内 top 目标基因 %s" % (
+            KO_GENE, species, ko_symbol)
+    else:
+        ko_symbol = str(adata.var["gene_symbol"].iloc[ko_gi])
+    ko_counts = np.asarray(adata.layers["counts"][:, ko_gi].toarray()).ravel() \
+        if hasattr(adata.layers["counts"], "toarray") else adata.layers["counts"][:, ko_gi]
+    if not (np.asarray(ko_counts) > 0).any():
+        fail("%s 敲除基因 %s 在 counts 层零表达" % (species, ko_symbol))
+    if ko_note:
+        log("%s %s" % (species, ko_note))
+    log("%s KO gene: %s (var_idx=%d, counts sum=%d)"
+        % (species, ko_symbol, ko_gi, int(np.asarray(ko_counts).sum())))
+
+    # --- 3. 基因宇宙收窄到 HVG（与 line2 步骤 9 同口径：HVG 2000 上的 counts） ---
+    # 定稿依据：全基因 18628 x 57 pseudo-cell 建共表达网络不可行（tenifold 对
+    # 每基因建网，实测 3 分钟无进展且容器反复重启）；line2 用 HVG 2000 口径
+    # 顺利完成，line3 复用。HVG 标签在步骤 3 落的 var['highly_variable']。
+    # 基因 index 用 gene_symbol（scTenifold 对 index 做 .str.upper().match("^MT-")，
+    # symbol 口径与探针 5 一致；重复 symbol 取首个 var 位置）。
+    hvg_mask = adata.var["highly_variable"].to_numpy(dtype=bool)
+    if hvg_mask.sum() == 0:
+        fail("%s 无 highly_variable 基因（步骤 3 产物应有）" % species)
+    gene_all = adata.var["gene_symbol"].astype(str).tolist()
+    hvg_symbols = [s for s, h in zip(gene_all, hvg_mask) if h]
+    if ko_symbol not in hvg_symbols:
+        # 敲除基因必须保留在基因宇宙内（scTenifold 要求 ko_genes 在 data 中）
+        hvg_symbols = hvg_symbols + [ko_symbol]
+    # 重复 symbol 去重（保留首次出现，与步骤 6/10 口径一致）
+    seen = set()
+    hvg_symbols = [s for s in hvg_symbols if not (s in seen or seen.add(s))]
+    log("%s 基因宇宙收窄：%d -> %d（HVG + 敲除基因 %s）"
+        % (species, adata.shape[1], len(hvg_symbols), ko_symbol))
+    # symbol -> 首个 var 位置（用于从全 counts 取列）
+    first_pos = {}
+    for i, s in enumerate(gene_all):
+        first_pos.setdefault(s, i)
+    keep_var_idx = [first_pos[s] for s in hvg_symbols]
+
+    # --- 4. 逐样本子集运行（spot 作 cell 单元，scTenifold 内部 QC 后建网） ---
+    # 域聚合路线（mouse 57 / human 18 pseudo-cell）实测废弃（见文件头口径），
+    # 改逐样本：每样本 spot 作 cell 跑一次 scTenifoldKnk。
+    # **QC 口径关键修正（探针 8 实测）**：scTenifold 的 mito 比例在喂给它的
+    # HVG 子矩阵上算（mt sum / HVG 库），mouse mito 基因计数高、HVG 库分母小，
+    # 比率被放大约 5 倍，BH001 1706 个 spot 被剔到 0 个、2000 基因全滤、
+    # make_networks 断言 "Gene names are required" 崩。对策：先在**全 counts**
+    # 口径下剔除 mito 比 >=0.1 的 spot（与 scTenifold 定义同阈值、同 ^MT- 匹配，
+    # 但分母是全库而非 HVG 子集，不失真），再用 qc_kws max_mito_ratio=1.0 关掉
+    # 库内 mito 过滤（该步已无失真风险可关），lib/outlier/基因闸保留。
+    t0 = time.time()
+    sample_arr = adata.obs["sample_id"].astype(str).to_numpy()
+    samples = sorted(set(sample_arr.tolist()))
+    counts = adata.layers["counts"].tocsr()
+    ko_expr_all = np.asarray(counts[:, ko_gi].todense()).ravel()
+    lib_full = np.asarray(counts.sum(axis=1)).ravel()
+    mito_cols = [i for i, s in enumerate(gene_all)
+                 if s.upper().startswith("MT-")]
+    mito_sum = np.asarray(counts[:, mito_cols].sum(axis=1)).ravel() if mito_cols \
+        else np.zeros(counts.shape[0])
+    mito_ratio_full = mito_sum / np.maximum(lib_full, 1.0)
+    log("%s 全 counts 口径 mito 基因 %d 个，mito 比>=0.1 的 spot %d 个（预先剔除，"
+        "scTenifold 库内 mito 过滤关闭）"
+        % (species, len(mito_cols), int((mito_ratio_full >= 0.1).sum())))
+    from scTenifold import scTenifoldKnk
+    QC_KWS = {"max_mito_ratio": 1.0}   # mito 已按全 counts 口径预剔除
+    drift_rows = []          # 逐样本 DR 汇总（含跳过的样本）
+    sig_genes_all = set()    # 任一显著的基因都算物种级显著 DR
+    skipped = []
+    for s in samples:
+        m = sample_arr == s
+        n_spots_raw = int(m.sum())
+        # 在全 counts 口径预剔 mito（与 scTenifold 定义同阈值同匹配，分母全库）
+        m = m & (mito_ratio_full < 0.1)
+        n_spots = int(m.sum())
+        row = {"sample_id": s, "n_spots_raw": n_spots_raw,
+               "n_spots_after_mito": n_spots,
+               "ko_frac": float((ko_expr_all[m] > 0).mean())}
+        if n_spots < 50 or row["ko_frac"] < 0.05:
+            # <50 spot：tensor 分解与 10 次子采样建网都不可靠；KO 占比 <5%
+            # scTenifold QC 会滤掉整基因，同样作废
+            reason = "ko_low_frac" if row["ko_frac"] < 0.05 else "too_few_spots"
+            log("  [%s] %s 跳过：%s（spots=%d, KO%%=%.4f）"
+                % (species, s, reason, n_spots, row["ko_frac"]))
+            row["status"] = "skipped_" + reason
+            row["n_dr_genes"] = 0
+            row["n_sig"] = 0
+            drift_rows.append(row)
+            skipped.append(s)
+            continue
+        sub = counts[m][:, keep_var_idx]
+        pseudo = pd.DataFrame(np.asarray(sub.todense()).T,
+                              index=hvg_symbols, columns=adata.obs_names[m].tolist())
+        knk = scTenifoldKnk(data=pseudo, ko_genes=ko_symbol,
+                            qc_kws=dict(QC_KWS),
+                            nc_kws={"n_cpus": N_CPUS, "n_cores": N_CPUS,
+                                    "random_state": SEED},
+                            td_kws={"random_state": SEED})
+        knk.build()
+        dr_s = knk.d_regulation
+        if dr_s is None or not hasattr(dr_s, "columns"):
+            fail("%s 样本 %s d_regulation 为空（build 失败？）" % (species, s))
+        miss = [c for c in NEED_COLS if c not in dr_s.columns]
+        if miss:
+            fail("%s 样本 %s DR 表缺列 %s" % (species, s, miss))
+        dr_s = dr_s.copy()
+        dr_s["is_knockout_gene"] = dr_s["Gene"].astype(str) == ko_symbol
+        dr_s["significant"] = (dr_s["adjusted p-value"] < ALPHA) & (~dr_s["is_knockout_gene"])
+        if dr_s["is_knockout_gene"].any() and dr_s.loc[dr_s["is_knockout_gene"], "significant"].any():
+            fail("%s 样本 %s 敲除基因自身出现在显著 DR（scTenifold 应自动排除）" % (species, s))
+        sig_s = dr_s.loc[dr_s["significant"], "Gene"].astype(str).tolist()
+        sig_genes_all.update(sig_s)
+        row["status"] = "ok"
+        row["n_dr_genes"] = int(len(dr_s))
+        row["n_sig"] = int(len(sig_s))
+        drift_rows.append(row)
+        log("  [%s] %s spots=%d KO%%=%.3f -> DR 表 %d 基因，显著非敲除 %d 个"
+            % (species, s, n_spots, row["ko_frac"], len(dr_s), len(sig_s)))
+        # 逐样本 DR 表落 jets（物种级汇总用）
+        out_rows = []
+        for _, r in dr_s.sort_values("adjusted p-value").iterrows():
+            out_rows.append({"species": species, "ko_gene": ko_symbol, "sample_id": s,
+                             "Gene": str(r["Gene"]),
+                             "Distance": float(r["Distance"]),
+                             "Z": float(r["Z"]), "FC": float(r["FC"]),
+                             "p-value": float(r["p-value"]),
+                             "adjusted p-value": float(r["adjusted p-value"]),
+                             "is_knockout_gene": bool(r["is_knockout_gene"]),
+                             "significant": bool(r["significant"])})
+        per_sample_dr[s] = out_rows
+    elapsed_ko = time.time() - t0
+    ok_samples = [r["sample_id"] for r in drift_rows if r["status"] == "ok"]
+    if not ok_samples:
+        fail("%s 没有可跑样本（全部 mito 预剔后不足 50 spot 或 KO 表达占比 <5%）" % species)
+    n_dr_genes = max((r["n_dr_genes"] for r in drift_rows), default=0)
+    n_sig = len(sig_genes_all)
+    log("%s 敲除 %s 完成 %.1fs：跑通 %d/%d 样本，物种级显著非敲除 DR 基因 %d 个%s"
+        % (species, ko_symbol, elapsed_ko, len(ok_samples), len(samples), n_sig,
+           ("，跳过 %s" % skipped) if skipped else ""))
+
+    # --- 5. spot 级贴回：物种级显著 DR 基因的 spot 原始计数表达 ---
+    # aims："映射回空间坐标看分布"：该 spot 在敲除实验中本身就是 cell 单元，
+    # 直接取 counts 层表达值。物种级显著 = 至少一个样本显著（口径与 line2 步骤 10
+    # "按 p-value 升序 rank"不同：本步骤 9 个样本独立建网，跨样本取并集）。
+    sig_genes = sorted(sig_genes_all)
+    spot_records = {}
+    for gname in sig_genes:
+        gi = first_pos.get(gname)
+        if gi is None:
+            continue
+        spot_records[gname] = np.asarray(counts[:, gi].todense()).ravel()
+    # spot 级汇总列：该 spot 的显著 DR 基因计数均值（0 值 Spot 也参与，表达广度如实）
+    if spot_records:
+        stacked = np.array(list(spot_records.values()), dtype=float)
+        spot_dr_mean = stacked.mean(axis=0)
+    else:
+        spot_dr_mean = np.zeros(adata.shape[0], dtype=float)
+    if not np.all(np.isfinite(spot_dr_mean)):
+        fail("%s spot 级 ko_dr_expr 有非有限值" % species)
+
+    # --- 6. 自校验 + 不变量 ---
+    n_genes_hvg = len(hvg_symbols)
+    if n_dr_genes != n_genes_hvg:
+        # scTenifold QC 可能过滤基因（MT- / 低表达 / min_percent），逐样本如实记录
+        log("  注意：最大 DR 表基因数 %d != HVG 宇宙 %d（scTenifold QC 逐样本过滤）"
+            % (n_dr_genes, n_genes_hvg))
+    if adata.X.nnz != x_nnz_before:
+        fail("%s X nnz 被改变" % species)
+    if adata.layers["counts"].nnz != counts_nnz_before:
+        fail("%s counts 层 nnz 被改变" % species)
+    if not np.array_equal(adata.obsm["X_pca"], pca_before):
+        fail("%s X_pca 被改动" % species)
+    if not adata.obs["domain"].equals(domain_before):
+        fail("%s domain 列被改动" % species)
+    for col_name in REQUIRED_OBS:
+        if col_name not in adata.obs.columns:
+            fail("%s obs 列丢失: %s" % (species, col_name))
+    for col_name in REQUIRED_VAR:
+        if col_name not in adata.var.columns:
+            fail("%s var 列丢失: %s" % (species, col_name))
+
+    # --- 7. 落盘 ---
+    adata.obs["ko_dr_expr"] = spot_dr_mean
+    # 物种级 top：按（显著样本数降序，最小 adj p 升序）rank，取前 10
+    gene_sig_samples = {}
+    gene_min_p = {}
+    gene_z = {}
+    gene_fc = {}
+    for s, rows in per_sample_dr.items():
+        for r in rows:
+            if not r["significant"]:
+                continue
+            g = r["Gene"]
+            gene_sig_samples[g] = gene_sig_samples.get(g, 0) + 1
+            if g not in gene_min_p or r["adjusted p-value"] < gene_min_p[g]:
+                gene_min_p[g] = r["adjusted p-value"]
+                gene_z[g] = r["Z"]
+                gene_fc[g] = r["FC"]
+    top_genes = sorted(gene_sig_samples,
+                       key=lambda g: (-gene_sig_samples[g], gene_min_p[g]))[:10]
+    uns_top = {"dr%d" % (i + 1): {
+        "gene": g,
+        "n_sig_samples": int(gene_sig_samples[g]),
+        "adj_p": float(gene_min_p[g]),
+        "z": float(gene_z[g]),
+        "fc": float(gene_fc[g]),
+    } for i, g in enumerate(top_genes)}
+    adata.uns["knockout"] = {
+        "method": "scTenifoldKnk_per_sample_spot_level",
+        "note": "敲除对象=逐样本子集运行（aims.txt spot 级数据可按空间域聚合或子集"
+                "运行；域聚合路线在 human 18 域 QC 后剩 1 个 pseudo-cell 不可建网，"
+                "实测废弃），每样本 spot 作 cell 单元独立建网，KO 基因样本内表达占比"
+                "<5% 的样本跳过；DR genes=d_regulation 显著（adj p<0.05 且非敲除基因，"
+                "跨样本取并集）；DR≠DEG，计算模拟非实验验证",
+        "seed": SEED,
+        "ko_gene": ko_symbol,
+        "ko_gene_note": ko_note,
+        "ko_gene_requested": KO_GENE,
+        "alpha": ALPHA,
+        "n_samples_total": int(len(samples)),
+        "n_samples_ok": int(len(ok_samples)),
+        "skipped_samples": skipped,
+        "n_genes_in_dr": int(n_dr_genes),
+        "n_genes_hvg_universe": int(n_genes_hvg),
+        "n_significant_dr": int(n_sig),
+        # anndata uns 禁 list-of-dicts（序列化会 TypeError），逐样本统计落 JSON 字符串
+        "sample_dr_stats_json": json.dumps(drift_rows, ensure_ascii=False,
+                                           sort_keys=True),
+        "seconds": round(elapsed_ko, 2),
+        "top_dr": uns_top,
+        "source_h5ad": path,
+    }
+    h5ad_name = "spatial_knockout_%s.h5ad" % species
+    adata.write_h5ad(h5ad_name)
+
+    tsv_name = "ko_dr_genes_%s.tsv" % species
+    flat_rows = []
+    for s in sorted(per_sample_dr):
+        flat_rows.extend(per_sample_dr[s])
+    dr_out = pd.DataFrame(flat_rows, columns=[
+        "species", "ko_gene", "sample_id", "Gene", "Distance", "Z", "FC",
+        "p-value", "adjusted p-value", "is_knockout_gene", "significant"])
+    if len(dr_out):
+        dr_out = dr_out.sort_values(["sample_id", "adjusted p-value"])
+    dr_out.to_csv(tsv_name, sep="\t", index=False)
+    log("%s wrote %s (%d spots) + %s (%d 行, %d 样本)"
+        % (species, h5ad_name, adata.shape[0], tsv_name, len(dr_out),
+           len(per_sample_dr)))
+
+    section_samples = "\n".join(
+        "  %-12s spots_raw=%-5d after_mito=%-5d KO%%=%.4f status=%-22s dr_genes=%-5d sig=%d"
+        % (r["sample_id"], r["n_spots_raw"], r["n_spots_after_mito"], r["ko_frac"],
+           r["status"], r["n_dr_genes"], r["n_sig"])
+        for r in sorted(drift_rows, key=lambda x: x["sample_id"]))
+    lines = [
+        "[%s]" % species,
+        "spots=%d genes=%d" % (adata.shape[0], adata.shape[1]),
+        "ko_gene=%s%s" % (ko_symbol, "（回退：%s）" % ko_note if ko_note else ""),
+        "samples_ok=%d/%d%s（mito 预剔后 <50 spot 或 KO 表达占比 <5%% 的样本跳过）"
+        % (len(ok_samples), len(samples),
+           ("，skipped=%s" % skipped) if skipped else ""),
+        "dr_genes_max_per_sample=%d significant_species_level=%d "
+        "(adj p<%.2f 且非敲除，跨样本并集)" % (n_dr_genes, n_sig, ALPHA),
+        "seconds=%.1f" % elapsed_ko,
+        "small_sample_note=spot 级 cell 单元数（mouse 438-2348 / human 530-2500）"
+        "远小于 line2 细胞级敲除（2747 细胞），单样本网络估计稳定性受限，DR 结果"
+        "按计算模拟解读，显著性仅作参考（aims：细胞数要足够）",
+        "per_sample:",
+        section_samples,
+        "top_dr（按显著样本数降序再按 adj_p 升序）:",
+    ]
+    for i, g in enumerate(top_genes, 1):
+        lines.append("  %2d. %-14s n_sig_samples=%d adj_p=%.4g Z=%.3f FC=%.4f"
+                     % (i, g, gene_sig_samples[g], gene_min_p[g],
+                        gene_z[g], gene_fc[g]))
+    report_sections.append("\n".join(lines))
+
+report_lines = [
+    "step=spatial_knockout",
+    "seed=%d" % SEED,
+    "method=scTenifoldKnk 0.5.1（import scTenifold）逐样本子集运行（spot 作 cell 单元）；"
+    "DR genes = d_regulation adj p<%.2f 且非敲除基因（跨样本并集）" % ALPHA,
+    "domain_identity_note=敲除对象为逐样本 spot 级子集（域聚合路线 human 18 域 QC 后"
+    "剩 1 个 pseudo-cell 不可建网，实测废弃）；domain 身份样本私有（同步骤 9 口径）；"
+    "跨物种不共享基因网络；mito spot 按全 counts 口径预剔（阈值 0.1、^MT- 匹配同"
+    "scTenifold），scTenifold 库内 mito 过滤以 max_mito_ratio=1.0 关闭（其默认过滤"
+    "在 HVG 子矩阵上算比率会失真放大约 5 倍，小鼠样本被大量误剔）",
+    "ko_gene_note=敲除基因来源 %s（优先级 --ko-gene > BIO_KO_GENE > project.json > "
+    "线内证据兜底 Spp1：步骤 12 target5 + 步骤 6 巨噬域 marker 同域）；物种不适配时"
+    "回退线内 top 目标基因；不取 line2 基因（三线不交叉）" % KO_GENE_SOURCE,
+    "limitation_note=DR≠DEG；单样本 spot 单元数（mouse 438-2348 / human 530-2500）"
+    "远小于 line2 细胞级（2747 细胞），网络质量不能直接对比；计算模拟非实验验证；"
+    "建议换 seed 复核稳健性",
+    "outputs=spatial_knockout_mouse.h5ad, spatial_knockout_human.h5ad, "
+    "ko_dr_genes_mouse.tsv, ko_dr_genes_human.tsv, knockout_report.txt",
+] + report_sections + [
+    "elapsed_seconds=%.0f" % (time.time() - START),
+]
+with open("knockout_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'knockout_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('knockout_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("spatial_knockout_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "${KO_OUTDIR:-$(pwd)}" "knockout_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

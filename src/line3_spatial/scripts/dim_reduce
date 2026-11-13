@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# dim_reduce：line3_spatial 步骤 4 降维。
+#
+# 输入：步骤 3 产物 spatial_norm_mouse.h5ad / spatial_norm_human.h5ad
+#       （归一化 log 值全基因矩阵 + layers['counts'] 原始整数计数 + var['highly_variable']）。
+#
+# 做两件事（逐物种，基因宇宙不同禁止跨物种）：
+#   1. 降维：HVG 2000 子集上 scale(max_value=10) → PCA(50) → neighbors(15,30PC)
+#      → UMAP。scanpy 空间数据教程标准口径；PCA/UMAP 嵌入与 neighbors 图贴回
+#      全基因对象（下游空间 marker 等步骤用全基因矩阵，嵌入只作质控与聚类参考）。
+#   2. 诊断入报告：PC 方差解释率、按 sample_id / group 的 PCA(10) silhouette
+#      （采样 5000 spots）、各段计时。
+#
+# 口径说明（为什么不做跨样本批次校正）：
+#   下游空间域识别逐样本做（像素坐标跨样本不可比，见 README 坐标口径），
+#   嵌入不承担跨样本整合职能；样本/组在 PCA 上的分离度如实记录，不强行校正
+#   抹掉真实的生物学区域差异。
+#
+# 自校验内建：输入契约（步骤 3 产物 32 项 + 未做过降维）、HVG 数精确 2000、
+# X_pca 形状与全有限、X_umap 全有限、方差解释率非空、layers['counts'] nnz 不变、
+# obsm spatial / uns spatial 不丢、obs 20 列不丢。任一不过非零退出。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：两个 h5ad（步骤 3 产物，小鼠 / 人源）。模式前后都带 *：拿到的是绝对路径，
+# 前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+mouse_h5ad=""
+human_h5ad=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *mouse*.h5ad) mouse_h5ad="$path" ;;
+    *human*.h5ad) human_h5ad="$path" ;;
+    *.h5ad) echo "无法识别的输入文件: $path（文件名需含 mouse/human 物种标识）" >&2; exit 2 ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 3 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$mouse_h5ad" ] && [ -z "$human_h5ad" ]; then
+  # 单物种数据集（GSE233814 只有小鼠 GPL24247）不再要求两份都提供。
+  # 判据改为「至少一份」：两份都缺才报错；实际提供哪份，下游按文件名分流。
+  echo "缺少必需输入：至少需要一份物种 h5ad（mouse 或 human）" >&2
+  exit 2
+fi
+for path in "$mouse_h5ad" "$human_h5ad"; do
+  [ -n "$path" ] || continue
+  if [ ! -f "$path" ]; then
+    echo "输入文件不存在: $path" >&2
+    exit 2
+  fi
+done
+
+echo "step_executed=dim_reduce"
+echo "bioanalys_seed=${seed}"
+echo "input_mouse=${mouse_h5ad}"
+echo "input_human=${human_h5ad}"
+
+NORM_INPUTS="$mouse_h5ad
+$human_h5ad"
+export NORM_INPUTS
+export NORM_OUTDIR="${NORM_OUTDIR:-$(pwd)}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import sys
+import time
+
+import numpy as np
+import anndata as ad
+import scanpy as sc
+from sklearn.metrics import silhouette_score
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+N_COMPS = 50
+N_NEIGHBORS = 15
+N_PCS_NEIGH = 30
+MAX_VALUE = 10
+SIL_SAMPLE = 5000
+
+
+def fail(message):
+    sys.stderr.write("dim_reduce 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+REQUIRED_OBS = ["barcode", "sample_id", "gsm", "species", "platform_id", "strain",
+                "condition", "condition_class", "group", "tissue", "in_tissue",
+                "array_row", "array_col", "pxl_row_fullres", "pxl_col_fullres",
+                "ncount", "nfeature", "total_counts", "n_genes_by_counts", "pct_mito"]
+REQUIRED_VAR = ["gene_symbol", "genome", "feature_type"]
+REQUIRED_UNS = ["coord_note", "image_note", "qc", "samples", "spatial",
+                "normalization", "hvg", "seed", "source_h5ad"]
+
+report_sections = []
+
+for path in os.environ["NORM_INPUTS"].splitlines():
+    path = path.strip()
+    if not path:
+        continue
+    species = "mouse" if "mouse" in os.path.basename(path) else "human"
+    adata = ad.read_h5ad(path)
+    log("loaded %s spots=%d genes=%d" % (species, adata.shape[0], adata.shape[1]))
+
+    # --- 1. 输入契约：必须是步骤 3 产物且未做过降维 ---
+    missing_obs = [col for col in REQUIRED_OBS if col not in adata.obs.columns]
+    if missing_obs:
+        fail("%s 缺少 obs 列 %s（不是 normalize_hvg 产物？）" % (path, missing_obs))
+    missing_var = [col for col in REQUIRED_VAR if col not in adata.var.columns]
+    if missing_var:
+        fail("%s 缺少 var 列 %s" % (path, missing_var))
+    missing_uns = [key for key in REQUIRED_UNS if key not in adata.uns]
+    if missing_uns:
+        fail("%s 缺少 uns 键 %s（不是 normalize_hvg 产物？）" % (path, missing_uns))
+    if "counts" not in adata.layers:
+        fail("%s 缺少 layers['counts']（不是 normalize_hvg 产物？）" % path)
+    if "highly_variable" not in adata.var.columns:
+        fail("%s 缺少 var['highly_variable']（不是 normalize_hvg 产物？）" % path)
+    if "X_pca" in adata.obsm or "dimred" in adata.uns:
+        fail("%s 已含降维结果（重复执行？）" % path)
+    if "spatial" not in adata.obsm or "spatial" not in adata.uns:
+        fail("%s 缺少 spatial 坐标或样本图（输入契约破坏）" % path)
+
+    hvg_mask = adata.var["highly_variable"].to_numpy(dtype=bool)
+    hvg_count = int(hvg_mask.sum())
+    if hvg_count != 2000:
+        fail("%s HVG 数 %d != 预期 2000（上游口径被改？）" % (path, hvg_count))
+    counts_nnz_before = adata.layers["counts"].nnz
+
+    # --- 2. HVG 子集上 scale + PCA + neighbors + UMAP ---
+    # X 保持归一化后的全基因 log 值不动，降维只在 HVG 子集上算，嵌入贴回全基因对象。
+    sub = adata[:, hvg_mask].copy()
+    t0 = time.time()
+    sc.pp.scale(sub, max_value=MAX_VALUE)
+    t1 = time.time()
+    sc.tl.pca(sub, n_comps=N_COMPS, random_state=int(os.environ["BIOANALYS_SEED"]))
+    t2 = time.time()
+    variance_ratio = np.asarray(sub.uns["pca"]["variance_ratio"], dtype=float)
+    sc.pp.neighbors(sub, n_neighbors=N_NEIGHBORS, n_pcs=N_PCS_NEIGH,
+                    random_state=int(os.environ["BIOANALYS_SEED"]))
+    sc.tl.umap(sub, random_state=int(os.environ["BIOANALYS_SEED"]))
+    t3 = time.time()
+    log("%s scale %.1fs pca %.1fs neighbors+umap %.1fs | PC1=%.3f%% cum30=%.3f%%"
+        % (species, t1 - t0, t2 - t1, t3 - t2,
+           variance_ratio[0] * 100, variance_ratio[:30].sum() * 100))
+
+    # --- 3. 嵌入贴回全基因对象 ---
+    adata.obsm["X_pca"] = sub.obsm["X_pca"]
+    adata.obsm["X_umap"] = sub.obsm["X_umap"]
+    adata.obsp["connectivities"] = sub.obsp["connectivities"]
+    adata.obsp["distances"] = sub.obsp["distances"]
+    adata.uns["pca"] = sub.uns["pca"]
+
+    # --- 4. 诊断：sample_id / group 在 PCA(10) 上的 silhouette（采样控制 O(n^2)）---
+    sil_lines = []
+    rng = np.random.default_rng(int(os.environ["BIOANALYS_SEED"]))
+    n = adata.shape[0]
+    idx = rng.choice(n, size=min(SIL_SAMPLE, n), replace=False)
+    emb = adata.obsm["X_pca"][idx][:, :10]
+    for key in ["sample_id", "group"]:
+        if key not in adata.obs.columns:
+            continue
+        labels = adata.obs[key].to_numpy()[idx]
+        if len(np.unique(labels)) < 2:
+            continue
+        sil = float(silhouette_score(emb, labels))
+        sil_lines.append("silhouette_%s_pca10=%.4f（采样 %d spots）" % (key, sil, len(idx)))
+        log("%s silhouette(%s, PCA10) = %.4f" % (species, key, sil))
+
+    # --- 5. 自校验 ---
+    if adata.obsm["X_pca"].shape != (adata.shape[0], N_COMPS):
+        fail("%s X_pca 形状异常 %s" % (species, adata.obsm["X_pca"].shape))
+    if not np.isfinite(adata.obsm["X_pca"]).all():
+        fail("%s X_pca 含非有限值" % species)
+    if not np.isfinite(adata.obsm["X_umap"]).all():
+        fail("%s X_umap 含非有限值" % species)
+    if not (variance_ratio > 0).all() or not np.isfinite(variance_ratio).all():
+        fail("%s 方差解释率异常" % species)
+    if adata.layers["counts"].nnz != counts_nnz_before:
+        fail("%s counts 层 nnz 被改变 %d -> %d" % (species, counts_nnz_before, adata.layers["counts"].nnz))
+    if "spatial" not in adata.obsm or "spatial" not in adata.uns:
+        fail("%s spatial 坐标或样本图丢失" % species)
+    current_obs = list(adata.obs.columns)
+    for col in REQUIRED_OBS:
+        if col not in current_obs:
+            fail("%s obs 列丢失: %s" % (species, col))
+    if int(adata.var["highly_variable"].sum()) != hvg_count:
+        fail("%s var['highly_variable'] 被改变" % species)
+
+    # --- 6. 落盘 ---
+    seed = int(os.environ["BIOANALYS_SEED"])
+    adata.uns["dimred"] = {
+        "method": "scanpy_scale_pca_neighbors_umap_on_hvg",
+        "n_comps": N_COMPS,
+        "n_neighbors": N_NEIGHBORS,
+        "n_pcs_neighbors": N_PCS_NEIGH,
+        "max_value": MAX_VALUE,
+        "batch_correction": None,
+        "seed": seed,
+        "source_h5ad": path,
+    }
+    out_name = "spatial_dimred_%s.h5ad" % species
+    adata.write_h5ad(out_name)
+    log("%s wrote %s" % (species, out_name))
+
+    report_sections.append("\n".join([
+        "[%s]" % species,
+        "spots=%d genes=%d hvg=%d" % (adata.shape[0], adata.shape[1], hvg_count),
+        "pca_variance_ratio=PC1 %.4f%% / cum10 %.4f%% / cum30 %.4f%%"
+        % (variance_ratio[0] * 100, variance_ratio[:10].sum() * 100,
+           variance_ratio[:30].sum() * 100),
+        "scale=%.1fs pca=%.1fs neighbors+umap=%.1fs" % (t1 - t0, t2 - t1, t3 - t2),
+    ] + sil_lines + [
+        "note=不做跨样本批次校正：空间域识别下游逐样本做（像素坐标跨样本不可比），"
+        "嵌入仅作质控与无监督聚类参考；分离度如上如实记录",
+    ]))
+
+seed = int(os.environ["BIOANALYS_SEED"])
+report_lines = [
+    "step=dim_reduce",
+    "seed=%d" % seed,
+    "method=scanpy scale(max_value=%d) -> PCA(%d) -> neighbors(%d,%dPC) -> UMAP on HVG 2000 子集，嵌入贴回全基因对象"
+    % (MAX_VALUE, N_COMPS, N_NEIGHBORS, N_PCS_NEIGH),
+    "batch_correction=none（理由见各物种 note）",
+    "outputs=spatial_dimred_mouse.h5ad, spatial_dimred_human.h5ad, dimred_report.txt",
+] + report_sections + [
+    "elapsed_seconds=%.0f" % (time.time() - START),
+]
+with open("dimred_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'dimred_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('dimred_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("dim_reduce_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "${NORM_OUTDIR:-$(pwd)}" "dimred_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

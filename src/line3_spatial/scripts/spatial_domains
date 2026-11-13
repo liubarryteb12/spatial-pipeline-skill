@@ -1,0 +1,489 @@
+#!/usr/bin/env bash
+# spatial_domains：line3_spatial 步骤 5 空间域识别。
+#
+# 输入：步骤 4 产物 spatial_dimred_mouse.h5ad / spatial_dimred_human.h5ad
+#       （归一化 log 全基因矩阵 + X_pca/X_umap + 邻居图 + layers['counts']）。
+#
+# 做法（逐样本，基因宇宙与像素坐标均跨样本不可比，README 口径）：
+#   默认用 obsm['spatial'] 的像素坐标建 cKDTree 6 邻空间图，对称化后写入
+#   obsp['connectivities'] / ['distances']，用该空间邻接图跑 Leiden
+#   (resolution=0.5, igraph, n_iterations=2)。BIO_SPATIAL_GRAPH=0 时保留旧
+#   纯表达 PCA neighbors(15,30PC) 路径，作为显式对照。域编号按样本命名空间
+#   隔离（obs['domain'] = "<sample_id>_d<n>"），避免跨样本域编号混淆。
+#
+# 口径定稿依据（服务器探针实测）：
+#   resolution 0.5 vs 1.0 双跑对比：0.5 的逐样本空间连贯性
+#   （spot 的样本内像素最近邻与自身同域比例）mouse mean 0.5163 / human 0.6951，
+#   1.0 降到 0.3627 / 0.4647；且 0.5 的碎片域（<30 spots）mouse 4 个 vs 1.0 的 11 个。
+#   取 0.5：域更贴合空间结构、碎片更少。敏感性结论写入报告备查。
+#
+# 工具路线说明：README 首选 BayesSpace（R），但容器 R 侧未装、squidpy dry-run
+# 会连带降级 numpy 2.5.3→2.4.6 并拖入 60+ 包（坑 #107 场景），故走 scanpy 原生
+# 零新依赖方案；口径与决策证据全部落报告。
+#
+# 自校验内建：输入契约（步骤 4 产物 32 项 + 未做过域识别）、每 spot 均有域标签
+# （无 NaN）、每样本域数 > 1、空间连贯性算得出（0-1）、X_pca 不被改动、
+# layers['counts'] nnz 不变、spatial 双不丢、obs 20 列不丢。任一不过非零退出。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：两个 h5ad（步骤 4 产物，小鼠 / 人源）。模式前后都带 *：拿到的是绝对路径，
+# 前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    # BANKSY 可选空间平滑（Argon 第 69 轮 Q2c：默认关闭受控合入）。
+    # 默认 0.0 = 完全旁路平滑，存量基准零漂移；显式给 0.2 才启用。
+    --banksy-lambda) BANKSY_LAMBDA_ARG="$2"; shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+# BANKSY 平滑开关必须在参数解析之后再取值：
+# 首版写在 while 之前，BANKSY_LAMBDA_ARG 还没被赋值，永远拿到 0.0，
+# 于是 --banksy-lambda 0.2 静默失效（三次跑出同一 md5 才发现）。
+BIO_BANKSY_LAMBDA="${BANKSY_LAMBDA_ARG:-0.0}"
+export BIO_BANKSY_LAMBDA
+
+# 空间邻接图开关：默认 1，按 obsm['spatial'] 建 cKDTree 6 邻图；
+# 显式给 0 才回退到旧表达 kNN（PCA neighbors）对照路径。
+SPATIAL_GRAPH="${BIO_SPATIAL_GRAPH:-1}"
+case "$SPATIAL_GRAPH" in
+  0|1) ;;
+  *) echo "BIO_SPATIAL_GRAPH 只接受 0 或 1（当前: ${SPATIAL_GRAPH}）" >&2; exit 2 ;;
+esac
+export BIO_SPATIAL_GRAPH="$SPATIAL_GRAPH"
+
+mouse_h5ad=""
+human_h5ad=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *mouse*.h5ad) mouse_h5ad="$path" ;;
+    *human*.h5ad) human_h5ad="$path" ;;
+    *.h5ad) echo "无法识别的输入文件: $path（文件名需含 mouse/human 物种标识）" >&2; exit 2 ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 4 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$mouse_h5ad" ] && [ -z "$human_h5ad" ]; then
+  # 单物种数据集（GSE233814 只有小鼠 GPL24247）不再要求两份都提供。
+  # 判据改为「至少一份」：两份都缺才报错；实际提供哪份，下游按文件名分流。
+  echo "缺少必需输入：至少需要一份物种 h5ad（mouse 或 human）" >&2
+  exit 2
+fi
+for path in "$mouse_h5ad" "$human_h5ad"; do
+  [ -n "$path" ] || continue
+  if [ ! -f "$path" ]; then
+    echo "输入文件不存在: $path" >&2
+    exit 2
+  fi
+done
+
+echo "step_executed=spatial_domains"
+echo "bioanalys_seed=${seed}"
+echo "bio_spatial_graph=${SPATIAL_GRAPH}"
+echo "input_mouse=${mouse_h5ad}"
+echo "input_human=${human_h5ad}"
+
+NORM_INPUTS="$mouse_h5ad
+$human_h5ad"
+export NORM_INPUTS
+export NORM_OUTDIR="${NORM_OUTDIR:-$(pwd)}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import sys
+import time
+from collections import Counter
+
+import numpy as np
+import anndata as ad
+import scanpy as sc
+from scipy.sparse import csr_matrix
+from scipy.spatial import cKDTree
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+N_NEIGHBORS = 15
+N_PCS = 30
+RESOLUTION = 0.5
+SMALL_DOMAIN = 30
+SPATIAL_K = 6
+
+
+def fail(message):
+    sys.stderr.write("spatial_domains 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+# BANKSY 可选空间平滑（Argon 第 69 轮 Q2c）。默认 0.0 = 完全旁路。
+# 只在已算好的 PCA(30) 上做凸组合，绝不回全基因 21318 维：
+# 全基因平滑会把稀疏矩阵变稠密，多切片时在 8GB 设备上必 OOM。
+BANKSY_LAMBDA = float(os.environ.get("BIO_BANKSY_LAMBDA", "0.0"))
+if BANKSY_LAMBDA < 0.0 or BANKSY_LAMBDA >= 1.0:
+    fail("BANKSY_LAMBDA=%r 越界，必须在 [0, 1) 内" % BANKSY_LAMBDA)
+
+# 空间邻接图开关：默认 1。0 时走旧表达 kNN 对照，报告里改记 graph_source。
+_graph_flag = os.environ.get("BIO_SPATIAL_GRAPH", "1").strip()
+if _graph_flag not in ("0", "1"):
+    fail("BIO_SPATIAL_GRAPH=%r 非法，只接受 0 或 1（默认 1）" % _graph_flag)
+SPATIAL_GRAPH = _graph_flag == "1"
+GRAPH_SOURCE = "spatial_cKDTree" if SPATIAL_GRAPH else "expression_knn_control"
+GRAPH_SOURCE_LINE = ("graph_source=spatial_cKDTree" if SPATIAL_GRAPH
+                     else "graph_source=expression_knn_control")
+
+
+def _spatial_knn(coords, k=SPATIAL_K):
+    """按 obsm['spatial'] 的像素坐标建样本内 kNN 图。
+
+    8GB 内存红线下的轻量路线：cKDTree 查询是 O(n log n)，结果每 spot 只有
+    2k 个非零，不构造稠密距离矩阵，不引入 squidpy 或深度学习图库。
+    连接矩阵取 1，Leiden 只读邻接关系；距离矩阵保留原始最近邻距离。
+    """
+    coords = np.asarray(coords, dtype=float)
+    if coords.ndim != 2 or coords.shape[1] != 2:
+        fail("obsm['spatial'] 必须是 n x 2 坐标，实际 shape=%s" % (coords.shape,))
+    if not np.isfinite(coords).all():
+        fail("obsm['spatial'] 含 NaN/Inf，无法建空间图")
+    n = coords.shape[0]
+    if n < 2:
+        fail("样本 spot 数 %d < 2，无法建空间图" % n)
+    k_eff = min(int(k), n - 1)
+    dist, idx = cKDTree(coords).query(coords, k=k_eff + 1)
+    dist = np.atleast_2d(dist)
+    idx = np.atleast_2d(idx)
+    rows = np.repeat(np.arange(n), k_eff)
+    cols = idx[:, 1:].ravel()
+    vals = dist[:, 1:].ravel().astype(float)
+    conn = csr_matrix((np.ones(vals.size, dtype=float), (rows, cols)), shape=(n, n))
+    dists = csr_matrix((vals, (rows, cols)), shape=(n, n))
+    conn = conn.maximum(conn.T)
+    dists = dists.maximum(dists.T)
+    return conn, dists
+
+
+def _banksy_smooth(adata, sample_mask, lam):
+    """对单个样本的 PCA 表示做 BANKSY 式邻域平滑。
+
+    Xs = (1 - lam) * X_pca + lam * (W_norm @ X_pca)
+
+    W 用该样本自身的像素 kNN 邻接（六角晶格，k=6），对称化后行归一化。
+    孤立点（degree=0）必须保留原始 PCA 值：否则 (1 - lam) * X 会把它们
+    整体收缩到 0.8 倍，等于凭空改变这些 spot 的坐标，下游聚类会把它们
+    单独聚成一类假域。
+
+    返回 (smoothed, n_isolated)。不修改 adata，不写 adata.X。
+    """
+    X_pca = np.asarray(adata.obsm["X_pca"], dtype=float)[sample_mask]
+    xy = np.asarray(adata.obsm["spatial"], dtype=float)[sample_mask]
+    n = X_pca.shape[0]
+    if n < 2:
+        return X_pca.copy(), 0
+    # 只借用同一套空间 kNN 权重做特征平滑，不把 W 写成 Leiden 邻接图。
+    W, _ = _spatial_knn(xy, SPATIAL_K)
+    deg = np.asarray((W > 0).sum(axis=1)).ravel()
+    row_sums = np.asarray(W.sum(axis=1)).ravel()
+    row_sums[row_sums == 0] = 1.0
+    W_norm = csr_matrix(W.multiply(1.0 / row_sums[:, None]))
+    Xs = (1.0 - lam) * X_pca + lam * (W_norm @ X_pca)
+    isolated = deg == 0
+    n_isolated = int(isolated.sum())
+    if n_isolated:
+        # 孤立点回填原值：它们没有邻居可借，平滑对它们只有收缩副作用
+        Xs[isolated] = X_pca[isolated]
+    return np.asarray(Xs), n_isolated
+
+
+REQUIRED_OBS = ["barcode", "sample_id", "gsm", "species", "platform_id", "strain",
+                "condition", "condition_class", "group", "tissue", "in_tissue",
+                "array_row", "array_col", "pxl_row_fullres", "pxl_col_fullres",
+                "ncount", "nfeature", "total_counts", "n_genes_by_counts", "pct_mito"]
+REQUIRED_VAR = ["gene_symbol", "genome", "feature_type"]
+REQUIRED_UNS = ["coord_note", "image_note", "qc", "samples", "spatial",
+                "normalization", "hvg", "seed", "source_h5ad", "dimred", "pca"]
+
+report_sections = []
+
+for path in os.environ["NORM_INPUTS"].splitlines():
+    path = path.strip()
+    if not path:
+        continue
+    species = "mouse" if "mouse" in os.path.basename(path) else "human"
+    adata = ad.read_h5ad(path)
+    log("loaded %s spots=%d genes=%d" % (species, adata.shape[0], adata.shape[1]))
+
+    # --- 1. 输入契约：必须是步骤 4 产物且未做过域识别 ---
+    missing_obs = [col for col in REQUIRED_OBS if col not in adata.obs.columns]
+    if missing_obs:
+        fail("%s 缺少 obs 列 %s（不是 dim_reduce 产物？）" % (path, missing_obs))
+    missing_var = [col for col in REQUIRED_VAR if col not in adata.var.columns]
+    if missing_var:
+        fail("%s 缺少 var 列 %s" % (path, missing_var))
+    missing_uns = [key for key in REQUIRED_UNS if key not in adata.uns]
+    if missing_uns:
+        fail("%s 缺少 uns 键 %s（不是 dim_reduce 产物？）" % (path, missing_uns))
+    for key in ["counts", ]:
+        if key not in adata.layers:
+            fail("%s 缺少 layers['%s']" % (path, key))
+    for key in ["X_pca", "X_umap", "spatial"]:
+        if key not in adata.obsm:
+            fail("%s 缺少 obsm['%s']（不是 dim_reduce 产物？）" % (path, key))
+    if "domain" in adata.obs.columns or "domains" in adata.uns:
+        fail("%s 已含空间域结果（重复执行？）" % path)
+    if int(adata.var["highly_variable"].sum()) != 2000:
+        fail("%s HVG 数 %d != 2000（上游口径被改？）" % (path, int(adata.var["highly_variable"].sum())))
+    counts_nnz_before = adata.layers["counts"].nnz
+    pca_before = adata.obsm["X_pca"].copy()
+
+    # --- 2. 逐样本建图 + leiden（域编号按样本命名空间隔离）---
+    domains = np.empty(adata.shape[0], dtype=object)
+    per_sample_counts = {}
+    per_sample_sizes = {}
+    per_sample_graph = {}
+    banksy_total_isolated = 0
+    banksy_applied = BANKSY_LAMBDA > 0.0
+    # 进入平滑前的原始矩阵指纹：平滑只准写 obsm，绝不准碰 adata.X。
+    # 静态扫描 adata.X 赋值挡不住切片赋值/in-place 改写/别名共享等路径，
+    # 只有进出指纹比对能证明「值没有变」。
+    _mg = None
+    if banksy_applied:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        sys.path.insert(0, "/mnt/ssd/bio_data/ops")
+        try:
+            from matrix_guard import fingerprint, assert_unchanged
+            _mg = (fingerprint, assert_unchanged)
+        except ImportError as exc:
+            fail("BANKSY 开启但缺少 matrix_guard（%s）：没有指纹断言就不允许平滑" % exc)
+        _x_fp_before = fingerprint(adata.X)
+    t0 = time.time()
+    for sample in adata.obs["sample_id"].unique():
+        mask = (adata.obs["sample_id"] == sample).to_numpy()
+        sub = adata[mask].copy()
+        if banksy_applied:
+            smoothed, n_iso = _banksy_smooth(adata, mask, BANKSY_LAMBDA)
+            banksy_total_isolated += n_iso
+            sub.obsm["X_pca"] = smoothed
+            # 平滑后的表示单独存一列，供事后核对用了什么特征做聚类。
+            # 它只进 obsm，不进 X_pca、不进 adata.X。
+            if "X_banksy_pca" not in adata.obsm:
+                # 列数必须取 X_pca 的实际维度，不能用 N_PCS：
+                # N_PCS=30 只是邻居计算取前 30 个主成分，而 X_pca 本身存了 50 维。
+                # 首版按 N_PCS 分配，实测报 shape mismatch (2417,50) vs (2417,30)。
+                adata.obsm["X_banksy_pca"] = np.full(
+                    (adata.shape[0], adata.obsm["X_pca"].shape[1]),
+                    np.nan, dtype=float)
+            adata.obsm["X_banksy_pca"][mask] = smoothed
+        if SPATIAL_GRAPH:
+            conn, dist = _spatial_knn(sub.obsm["spatial"], SPATIAL_K)
+            sub.obsp["connectivities"] = conn
+            sub.obsp["distances"] = dist
+            sub.uns["neighbors"] = {
+                "connectivities_key": "connectivities",
+                "distances_key": "distances",
+                "params": {"n_neighbors": SPATIAL_K, "method": "spatial_cKDTree",
+                           "use_rep": "spatial", "ncells": int(sub.n_obs)},
+            }
+            if conn.shape != (sub.n_obs, sub.n_obs):
+                fail("样本 %s 空间图 shape 异常 %s" % (sample, (conn.shape,)))
+            if conn.nnz == 0 or dist.nnz == 0:
+                fail("样本 %s 空间图为空" % sample)
+            if (conn != conn.T).nnz != 0:
+                fail("样本 %s 空间图未对称化" % sample)
+            if float(conn.data.min()) <= 0.0:
+                fail("样本 %s 空间图含非正连接权重" % sample)
+            sc.tl.leiden(sub, adjacency=sub.obsp["connectivities"],
+                         resolution=RESOLUTION, flavor="igraph", n_iterations=2,
+                         directed=False, random_state=int(os.environ["BIOANALYS_SEED"]))
+            per_sample_graph[sample] = {
+                "source": GRAPH_SOURCE,
+                "k": SPATIAL_K,
+                "edges": int(conn.nnz // 2),
+                "mean_degree": float(np.asarray(conn.sum(axis=1)).ravel().mean()),
+            }
+        else:
+            # 显式对照：旧路径，表达 PCA kNN 建图后再 Leiden。
+            sc.pp.neighbors(sub, n_neighbors=N_NEIGHBORS, n_pcs=N_PCS,
+                            random_state=int(os.environ["BIOANALYS_SEED"]))
+            sc.tl.leiden(sub, resolution=RESOLUTION, flavor="igraph", n_iterations=2,
+                         directed=False, random_state=int(os.environ["BIOANALYS_SEED"]))
+            per_sample_graph[sample] = {
+                "source": GRAPH_SOURCE,
+                "k": N_NEIGHBORS,
+                "n_pcs": N_PCS,
+            }
+        if "connectivities" not in sub.obsp or "distances" not in sub.obsp:
+            fail("样本 %s 缺少 connectivities/distances，Leiden 无图可读" % sample)
+        sample_domains = ["%s_d%s" % (sample, value) for value in sub.obs["leiden"].astype(str)]
+        domains[mask] = sample_domains
+        per_sample_counts[sample] = int(sub.obs["leiden"].nunique())
+        per_sample_sizes[sample] = dict(Counter(sample_domains))
+    elapsed = time.time() - t0
+    adata.obs["domain"] = domains
+    log("leiden done %.1fs domains_total=%d" % (elapsed, len(set(domains))))
+    if banksy_applied:
+        # 平滑结果只留在 obsm，供追溯；adata.X 必须与进来时逐字节一致。
+        _mg[1](_x_fp_before, adata.X, stage="spatial_domains/banksy")
+        adata.uns["banksy"] = {
+            "lambda": float(BANKSY_LAMBDA),
+            "space": "X_pca(30) from HVG2000",
+            "knn_k": SPATIAL_K,
+            "graph_source": GRAPH_SOURCE,
+            "isolated_spots": int(banksy_total_isolated),
+            "note": ("平滑结果写入 X_banksy_pca 供追溯；默认空间图 Leiden 只读空间邻接，BANKSY 不替代图"
+                     if SPATIAL_GRAPH else
+                     "平滑 PCA 供表达 kNN 对照聚类；未写入 adata.X，下游 Moran/NNLS 读原始矩阵"),
+        }
+        log("banksy lambda=%.2f isolated=%d, adata.X fingerprint unchanged"
+            % (BANKSY_LAMBDA, banksy_total_isolated))
+
+    # --- 3. 诊断：逐样本空间连贯性（样本内像素 KD 树；跨样本坐标范围重叠，禁混算）---
+    coherences = {}
+    for sample in adata.obs["sample_id"].unique():
+        mask = (adata.obs["sample_id"] == sample).to_numpy()
+        coords = adata.obsm["spatial"][mask]
+        labels = domains[mask]
+        tree = cKDTree(coords)
+        _, idx = tree.query(coords, k=2)
+        coherences[sample] = float((labels[idx[:, 1]] == labels).mean())
+    all_sizes = Counter(domains)
+    n_small = sum(1 for value in all_sizes.values() if value < SMALL_DOMAIN)
+    log("逐样本连贯性 mean=%.4f min=%.4f | <30 spots 域数=%d"
+        % (np.mean(list(coherences.values())), np.min(list(coherences.values())), n_small))
+
+    # --- 4. 自校验 ---
+    if (domains == None).any() or (domains == "").any():  # noqa: E711
+        fail("%s 存在未赋值域标签的 spot" % species)
+    for sample, count in per_sample_counts.items():
+        if count < 2:
+            fail("%s 样本 %s 域数 %d < 2（聚类失效？）" % (species, sample, count))
+    for sample, coherence in coherences.items():
+        if not 0.0 <= coherence <= 1.0:
+            fail("%s 样本 %s 连贯性异常 %.4f" % (species, sample, coherence))
+    if not np.array_equal(adata.obsm["X_pca"], pca_before):
+        fail("%s X_pca 被改动" % species)
+    if adata.layers["counts"].nnz != counts_nnz_before:
+        fail("%s counts 层 nnz 被改变" % species)
+    if "spatial" not in adata.obsm or "spatial" not in adata.uns:
+        fail("%s spatial 坐标或样本图丢失" % species)
+    current_obs = list(adata.obs.columns)
+    for col in REQUIRED_OBS:
+        if col not in current_obs:
+            fail("%s obs 列丢失: %s" % (species, col))
+
+    # --- 5. 落盘 ---
+    seed = int(os.environ["BIOANALYS_SEED"])
+    adata.uns["domains"] = {
+        "method": ("scanpy_leiden_per_sample_on_spatial_cKDTree"
+                   if SPATIAL_GRAPH else
+                   "scanpy_leiden_per_sample_on_pca_expression_knn_control"),
+        "graph_source": GRAPH_SOURCE,
+        "resolution": RESOLUTION,
+        "n_neighbors": SPATIAL_K if SPATIAL_GRAPH else N_NEIGHBORS,
+        "n_pcs": N_PCS,
+        "spatial_graph_k": SPATIAL_K if SPATIAL_GRAPH else 0,
+        "expression_neighbors_k": N_NEIGHBORS,
+        "expression_neighbors_pcs": N_PCS,
+        "banksy_lambda": float(BANKSY_LAMBDA),
+        "flavor": "igraph",
+        "n_iterations": 2,
+        "seed": seed,
+        "domains_total": len(all_sizes),
+        "per_sample_counts": per_sample_counts,
+        "per_sample_graph": per_sample_graph,
+        "per_sample_spatial_coherence": {k: round(v, 4) for k, v in coherences.items()},
+        "small_domains_lt30": n_small,
+        "tool_note": "默认走 obsm['spatial'] 的 cKDTree 6 邻图，BIO_SPATIAL_GRAPH=0 才回退表达 kNN 对照；squidpy dry-run 会连带降级 numpy（坑 #107），保持零新依赖",
+        "source_h5ad": path,
+    }
+    out_name = "spatial_domains_%s.h5ad" % species
+    adata.write_h5ad(out_name)
+    log("%s wrote %s" % (species, out_name))
+
+    report_sections.append("\n".join(
+        ["[%s]" % species,
+         "spots=%d genes=%d" % (adata.shape[0], adata.shape[1]),
+         "domains_total=%d per_sample=%s" % (len(all_sizes), per_sample_counts),
+         "domain_sizes_top5=%s" % all_sizes.most_common(5),
+         "small_domains_lt30=%d" % n_small,
+         "spatial_coherence_per_sample=%s" % {k: round(v, 4) for k, v in coherences.items()},
+         "spatial_coherence_mean=%.4f min=%.4f" % (np.mean(list(coherences.values())),
+                                                    np.min(list(coherences.values()))),
+         "elapsed_seconds=%.1f" % elapsed,
+         GRAPH_SOURCE_LINE,
+         "graph_params=%s" % json.dumps(per_sample_graph, ensure_ascii=False),
+         "banksy_lambda=%.2f%s" % (BANKSY_LAMBDA,
+                                   "" if banksy_applied else "（0.0 = 完全旁路，未启用平滑）"),
+         "banksy_isolated_spots=%d" % banksy_total_isolated,
+         "resolution_sensitivity=探针双跑：res=0.5 连贯性高于 res=1.0 且碎片域更少，取 0.5（详见操作台账续十八条）"]
+    ))
+
+seed = int(os.environ["BIOANALYS_SEED"])
+graph_method_text = (
+    "spatial cKDTree(k=%d) on obsm['spatial']" % SPATIAL_K
+    if SPATIAL_GRAPH else
+    "scanpy neighbors(%d,%dPC) on X_pca (expression kNN control)" % (N_NEIGHBORS, N_PCS)
+)
+graph_param_line = (
+    "spatial_graph_k=%d" % SPATIAL_K
+    if SPATIAL_GRAPH else
+    "expression_neighbors_k=%d expression_neighbors_pcs=%d" % (N_NEIGHBORS, N_PCS)
+)
+report_lines = [
+    "step=spatial_domains",
+    "seed=%d" % seed,
+    GRAPH_SOURCE_LINE,
+    graph_param_line,
+    "method=per-sample %s -> leiden(resolution=%.1f, igraph, n_iterations=2)，域编号按样本命名空间隔离"
+    % (graph_method_text, RESOLUTION),
+    "tool_route=BayesSpace(R) 未装 + squidpy dry-run 连带降级 numpy 2.5.3->2.4.6 并拖入 60+ 包（坑 #107 场景），取 scanpy 原生零新依赖方案",
+    "coherence_definition=spot 的样本内像素最近邻与自身同域比例（跨样本像素坐标范围重叠，禁混算）",
+    "outputs=spatial_domains_mouse.h5ad, spatial_domains_human.h5ad, domains_report.txt",
+] + report_sections + [
+    "elapsed_seconds=%.0f" % (time.time() - START),
+]
+with open("domains_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'domains_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('domains_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("spatial_domains_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "${NORM_OUTDIR:-$(pwd)}" "domains_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

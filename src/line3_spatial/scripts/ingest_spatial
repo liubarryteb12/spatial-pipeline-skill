@@ -1,0 +1,982 @@
+#!/usr/bin/env bash
+# ingest_spatial：line3_spatial 步骤 1 读入与格式统一。
+#
+# 数据形态（2026-10-13 服务器三探针实测，GSE192741，Guilliams et al. 2022 Cell
+# "Spatial proteogenomics reveals distinct and evolutionarily-conserved hepatic
+# macrophage niches"）：
+#   15 个 10x Visium 样本（3' v1，Space Ranger 1.1.0），10 小鼠 + 5 人，
+#   全部打在 GSE192741_RAW.tar 里。每样本 5 个文件：
+#     filtered_feature_bc_matrix_<SF>.h5   CSC 矩阵（genes x spots），只含组织下 spot
+#     tissue_positions_list_<SF>.csv.gz    全捕获区 4992 个 spot 位（in_tissue 标记）
+#     scalefactors_json_<SF>.json.gz       4 个缩放因子（spot 直径 + 高低倍缩放）
+#     tissue_hires_image_<SF>.png.gz       高倍组织图（~2000x2000 RGB）
+#     tissue_lowres_image_<SF>.png.gz      低倍组织图（~600x590 RGB）
+#   BH001 额外带 counts_ADT_BH001.csv.gz（93 种抗体计数，barcode 带引号且无 -1 后缀）。
+#   小鼠 mm10 31053 基因（symbol 重复 35 个），人 hg19 32738 基因（symbol 重复 91 个），
+#   Ensembl ID 唯一；同物种内跨样本基因顺序逐字节一致。
+#   每样本元数据（shortfilename/strain/condition/number of spots 等）在
+#   GPL24247_family.soft.gz（小鼠）与 GPL24676_family.soft.gz（人）的 ^SAMPLE 块里。
+#
+# 本步骤做四件事：
+#   1. 解析两个平台 soft 的 15 个样本元数据，与 tar 内文件集交叉核对；
+#   2. 逐样本读 h5 矩阵 + positions + scalefactors + 低倍图，装配 AnnData；
+#   3. 按物种拼接（小鼠/人基因宇宙不同，禁止跨物种拼接），落 h5ad；
+#   4. 落 samples_meta.tsv（逐样本台账）+ ingest_report.txt。
+#
+# 口径决定（2026-10-13 探针实测定稿）：
+#   - var_names 用 Ensembl 基因 ID（symbol 有重复，ID 唯一且跨样本同序）；
+#   - obsm['spatial'] = pxl 全分辨率像素坐标（仅供组织图叠加，样本间图像缩放不同，
+#     跨样本不可比）；array_row/array_col 入 obs，捕获区网格才是跨样本共同坐标框；
+#   - uns['spatial'][sample_id] 按 scanpy 约定存 lowres 图 + scalefactors，
+#     hires 图不入 h5ad（12MB x 15，太大；需要时从 tar 重取，raw_data 常驻）；
+#   - BH001 的 ADT 只记录台账（抗体数/barcode 重合），不并入基因表达矩阵（模态不同）；
+#   - grouping.txt 只作组名词汇表核对：5 个声明组合全部覆盖实际样本才放行；
+#     其"共 10 个样本"与实际 15 个不符，如实记警告不静默（见报告 grouping 节）。
+#
+# 自校验内建：tar 成员集完整且无意外文件、soft 元数据齐全、平台-物种-基因组三方一致、
+# 矩阵 barcode 全部落在 positions 的 in_tissue=1  spot 上、矩阵 spot 数与 soft
+# "number of spots" 一致、基因 ID 唯一且同物种跨样本同序、计数非负、组映射完整、
+# ADT barcode 可对齐。任一不过非零退出，让台账记 failed，不产出半成品。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：按文件名特征。模式前后都带 *：拿到的是绝对路径（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+tar_file=""
+mouse_soft=""
+human_soft=""
+grouping_file=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *.tar) tar_file="$path" ;;
+    *GPL24247*) mouse_soft="$path" ;;
+    *GPL24676*) human_soft="$path" ;;
+    *grouping*|*grouping*) grouping_file="$path" ;;
+    *) echo "无法识别的输入文件: $path（需要 *.tar / *GPL* soft / *grouping*）" >&2; exit 2 ;;
+  esac
+done
+
+# 单物种数据集（如 GSE233814 小鼠 pMCAO）只带一份平台 soft。
+# 旧写法把「必须有人的 soft」写成硬条件，会让这类数据集在参数解析阶段就 exit 2，
+# 而真正的判据是「至少一份 soft 在位 + tar 里的物种与 soft 对得上」，交给 Python 段核。
+if [ -z "$tar_file" ]; then
+  echo "缺少必需输入：需要 RAW tar（当前为空）" >&2
+  exit 2
+fi
+if [ -z "$mouse_soft" ] && [ -z "$human_soft" ]; then
+  echo "缺少平台 soft：至少需要一份 GPL24247（小鼠）或 GPL24676（人）" >&2
+  exit 2
+fi
+for required in "$tar_file" "$mouse_soft" "$human_soft"; do
+  [ -n "$required" ] || continue
+  if [ ! -f "$required" ]; then
+    echo "输入文件不存在: $required" >&2
+    exit 2
+  fi
+done
+if [ -n "$grouping_file" ] && [ ! -f "$grouping_file" ]; then
+  echo "grouping 文件不存在: $grouping_file" >&2
+  exit 2
+fi
+
+echo "step_executed=ingest_spatial"
+echo "bioanalys_seed=${seed}"
+echo "input_raw_tar=${tar_file}"
+echo "input_mouse_soft=${mouse_soft}"
+echo "input_human_soft=${human_soft}"
+echo "input_grouping=${grouping_file:-（未提供，跳过组名核对）}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+TAR_FILE="$tar_file" MOUSE_SOFT="$mouse_soft" HUMAN_SOFT="$human_soft" \
+GROUPING_FILE="$grouping_file" BIOANALYS_SEED="$seed" \
+python3 - <<'PYSCRIPT'
+import gzip
+import io
+import json
+import os
+import re
+import sys
+import tarfile
+import time
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+import h5py
+from PIL import Image
+from scipy.sparse import csc_matrix, csr_matrix, coo_matrix, vstack
+
+# pandas 3 与 2 的 infer_string 默认值不同，写 obs 字符串列时会因 nullable strings
+# 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+
+# 物种台账：soft organism / 平台 / h5 genome 三方一致才放行。
+SPECIES_BY_PLATFORM = {"GPL24247": "Mus musculus", "GPL24676": "Homo sapiens"}
+PLATFORM_BY_SPECIES = {v: k for k, v in SPECIES_BY_PLATFORM.items()}
+GENOME_BY_SPECIES = {"Mus musculus": "mm10", "Homo sapiens": "hg19"}
+TAG_BY_SPECIES = {"Mus musculus": "mouse", "Homo sapiens": "human"}
+
+# grouping.txt 声明组合词汇表 -> (物种, 条件类, 组织)。
+# 条件类把 soft 的原始 condition 归并：SD/WD 同属 NAFLD 饮食诱导实验
+# （SD 是对照、WD 是模型，下游按 obs['condition'] 原始值再拆）。
+# 旧字典只作兜底（GSE192741 肝脏数据集的 5 个组名）。
+# 正确口径是「分组由 project.json 的 grouping_design 派生，不硬编码组名」
+# （docs/figure_spec.md 第 8 节硬规则）。见下方 derive_condition_class()。
+LEGACY_CONDITION_CLASS = {"StSt": "stst", "SD": "nafld", "WD": "nafld",
+                          "Healthy": "non_steatotic", "Steatotic": "steatotic"}
+DECLARED_SPECIES = {"小鼠": "Mus musculus", "人": "Homo sapiens"}
+DECLARED_CONDITION = {"StSt": "stst", "NAFLD": "nafld",
+                      "non-steatotic": "non_steatotic", "steatotic": "steatotic"}
+DECLARED_TISSUE = {"liver": "liver", "capsule": "capsule"}
+
+def derive_condition_map() -> dict:
+    """从 project.json 的 grouping_design 派生 condition -> groupClass 映射。
+
+    口径（docs/figure_spec.md 第 8 节）：分组名只来自建项时锁死的 project.json，
+    不允许分析代码里写死具体组名。取不到项目契约时返回空 dict，由调用方回落兜底。
+    """
+    path = os.environ.get("BIOANALYS_PROJECT_JSON", "")
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    design = (meta or {}).get("grouping_design") or (meta or {}).get("groupingDesign") or {}
+    # 按线分区优先：本项目只跑 line3_spatial，取 byLine.line3_spatial
+    by_line = design.get("byLine") or {}
+    line_block = by_line.get("line3_spatial") or {}
+    source = line_block if line_block.get("groups") else design
+    groups = source.get("groups") or []
+    # 键一律小写：查表时对 soft 取值做 lower()。
+    # 生成大小写变体的做法在混合大小写（pMCAO）上必漏，大小写归一才是正解。
+    out = {}
+    # 组名到 soft 实际取值的常见别名。soft 用处理模型名（control / pMCAO / MCAO），
+    # 项目契约用语义组名（Control / Disease）。别名表只做同义词归并，不改判据语义。
+    ALIASES = {
+        "control": ["control", "sham", "ctrl", "healthy", "normal", "vehicle", "uninjured"],
+        "disease": ["pmcao", "mcao", "lesion", "disease", "model", "treated", "treat",
+                    "infarct", "ischemia", "ischaemia"],
+    }
+    for g in groups:
+        name = str(g.get("groupName") or g.get("label") or "").strip()
+        if not name:
+            continue
+        cls = name.lower()
+        out[cls] = cls
+        # 项目显式声明的 aliases 优先（比通用别名表更精确，换数据集只改项目配置）
+        for alias in (g.get("aliases") or []):
+            if alias:
+                out[str(alias).strip().lower()] = cls
+        # 再叠加通用别名表兜底
+        for alias in ALIASES.get(cls, []):
+            out[alias.lower()] = cls
+    return out
+
+
+CONDITION_MAP = derive_condition_map()
+
+FILE_KINDS = ["filtered_feature_bc_matrix", "tissue_positions_list",
+              "scalefactors_json", "tissue_hires_image", "tissue_lowres_image"]
+CAPTURE_AREA_SPOTS = 4992  # 10x Visium 3' v1 捕获区 spot 位数（实测 15 样本一致）
+
+
+def fail(message):
+    sys.stderr.write("ingest_spatial 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    sys.stdout.write(message + "\n")
+    sys.stdout.flush()
+
+
+def log_condition_map():
+    """在 log() 就绪后报告分组映射来源，便于事后核查「用的是项目契约还是兜底」。"""
+    if CONDITION_MAP:
+        log("condition_map_from_project=%d keys" % len(CONDITION_MAP))
+    else:
+        log("condition_map_from_project=0（将回落 LEGACY_CONDITION_CLASS）")
+
+
+tar_file = os.environ["TAR_FILE"]
+# 单物种数据集没有第二份 soft：bash 段已将空串传入，这里用 get 而非 [] 取，
+# 否则 os.environ["HUMAN_SOFT"] 在值为空时仍抛 KeyError（值为空键存在也会返回空串，
+# 但 bash 的 VAR="" 前缀赋值在部分 shell 下会省略该变量，故必须容错）。
+mouse_soft = os.environ.get("MOUSE_SOFT", "")
+human_soft = os.environ.get("HUMAN_SOFT", "")
+grouping_file = os.environ.get("GROUPING_FILE", "")
+seed = os.environ["BIOANALYS_SEED"]
+
+log_condition_map()
+
+# --- 1. tar 成员清单：先判数据形态，再按形态解析 ---
+#
+# 两种形态并存（GSE233814 立项时补）：
+#   v1_h5  ：GSE192741 那批，每样本 filtered_feature_bc_matrix_<sf>.h5 等 5 件
+#   v1_mtx ：GSE233814 这批，每样本 barcodes.tsv.gz / features.tsv.gz / matrix.mtx.gz
+#            + 一个坐标 json（旧版 Space Ranger 把 spot 坐标写在 *_<sf>.json.gz 里）
+# 判据来源是 tar 实际成员名，不看调用方传了什么名字。
+_MTX_MARKERS = ("barcodes.tsv.gz", "features.tsv.gz", "matrix.mtx.gz")
+_mtx_hits = 0
+_h5_hits = 0
+_member_names = []
+with tarfile.open(tar_file, "r:") as tf:
+    for member in tf:
+        if member.isfile():
+            _member_names.append(os.path.basename(member.name))
+for _base in _member_names:
+    if any(k in _base for k in _MTX_MARKERS):
+        _mtx_hits += 1
+    if _base.endswith(".h5"):
+        _h5_hits += 1
+
+if _mtx_hits == 0 and _h5_hits == 0:
+    fail("tar 内既没有 mtx 三件套也没有 h5 矩阵，无法判定数据形态: %s" % tar_file)
+if _mtx_hits > 0 and _h5_hits > 0:
+    fail("tar 内同时出现 mtx 与 h5 两种矩阵形态，拒绝猜测（mtx=%d h5=%d）" % (_mtx_hits, _h5_hits))
+format_kind = "v1_mtx" if _mtx_hits > 0 else "v1_h5"
+log("data_format=%s (mtx_files=%d h5_files=%d)" % (format_kind, _mtx_hits, _h5_hits))
+
+# tar 内实际命名有两种形态（实测 2026-11-06，GSE233814）：
+#   v1_h5 ：GSM####_<kind>_<短名>.h5 / .csv.gz / .json.gz / .png.gz      <- kind 在中间
+#   v1_mtx：GSM####_<短名>_<barcodes|features|matrix>.<tsv|mtx>.gz       <- kind 在末尾
+#           GSM####_<短名>.json.gz                                         <- 坐标随 json 给
+# 短名可含连字符（如 C1-control / B1-D1 / V10M09-040-B1），故不能再用 [A-Za-z0-9+] 限制。
+member_re = re.compile(
+    r"^(GSM\d+)_(?P<part1>[A-Za-z0-9+_.-]*?)_?(?P<kind1>barcodes|features|matrix)"
+    r"\.(?:tsv|mtx)\.gz$"
+    r"|^(GSM\d+)_(?P<sf2>[A-Za-z0-9+_-]+)\.(?:json\.gz)$"
+    r"|^(GSM\d+)_(?P<kind3>filtered_feature_bc_matrix|tissue_positions_list|scalefactors_json"
+    r"|tissue_hires_image|tissue_lowres_image|counts_ADT)_(?P<sf3>[A-Za-z0-9+]+)"
+    r"\.(?:h5|csv\.gz|json\.gz|png\.gz)$"
+    # v1_mtx 的全分辨率组织图：GSM####_<任意短名>_c1+2+3.tif.gz。
+    # 1.7 GB 且只用于底图叠加，识别它只为「不因未匹配而 fail」，不参与装配。
+    r"|^(GSM\d+)_(?P<sf4>[A-Za-z0-9+_ -]+)\.(?:tif\.gz)$"
+)
+samples = {}  # gsm -> {"shortfilename": sf, "files": {kind: member_name}}
+with tarfile.open(tar_file, "r:") as tf:
+    for member in tf:
+        if not member.isfile():
+            continue
+        base = os.path.basename(member.name)
+        m = member_re.match(base)
+        if not m:
+            fail("tar 内存在无法解析的文件名: %s（需要 <GSM>_<kind>_<短名>.<ext>）" % base)
+        # 多分支正则：按实际命中的分支取名，不假设 groups() 的固定顺序
+        gd = m.groupdict()
+        gsm = next(g for g in m.groups() if g and g.startswith("GSM"))
+        if gd.get("kind1"):
+            kind, sf = gd["kind1"], (gd["part1"] or "")
+        elif gd.get("sf2"):
+            kind, sf = "json", gd["sf2"]
+        elif gd.get("sf4"):
+            kind, sf = "tif", gd["sf4"]
+        else:
+            kind, sf = gd["kind3"], gd["sf3"]
+        entry = samples.setdefault(gsm, {"shortfilename": sf, "files": {}})
+        # 短名放宽：v1_mtx 的矩阵三件套与坐标 json 是两套独立命名
+        # （如 C1-control vs mouse_control_V11A20-380-C1），同一 GSM 内不必一致；
+        # 一致性只在 v1_h5 形态（按样本分组的 5 件套）下才有意义。
+        if format_kind == "v1_h5" and entry["shortfilename"] != sf:
+            fail("GSM %s 的短文件名不一致: %s vs %s" % (gsm, entry["shortfilename"], sf))
+        if kind in entry["files"]:
+            fail("GSM %s 的 %s 文件重复" % (gsm, kind))
+        entry["files"][kind] = member.name
+
+if not samples:
+    fail("tar 内没有任何可识别文件: %s" % tar_file)
+log("tar_samples=%d" % len(samples))
+
+# 形态专属的必备成员。v1_mtx 的组织图按 GSE233814 的实测命名是 *.tif.gz，
+# 它只用于叠加显示，缺了不阻断装配（与 v1_h5 的低倍图同等级别）。
+if format_kind == "v1_h5":
+    _required_kinds = list(FILE_KINDS)
+else:
+    _required_kinds = ["barcodes", "features", "matrix"]
+# json 是 v1_mtx 的坐标载体（v1_h5 里它叫 scalefactors_json），必须算合法成员，
+# 否则会误报「未预期的文件类型」。tif 是全分辨率组织图，识别但不装配。
+_allowed_kinds = set(FILE_KINDS) | {
+    "counts_ADT", "barcodes", "features", "matrix", "json", "tif",
+}
+
+for gsm in sorted(samples):
+    entry = samples[gsm]
+    missing = [k for k in _required_kinds if k not in entry["files"]]
+    if missing:
+        fail("GSM %s 缺少文件类型: %s（形态 %s）" % (gsm, missing, format_kind))
+    extra = [k for k in entry["files"] if k not in _allowed_kinds]
+    if extra:
+        fail("GSM %s 有未预期的文件类型: %s" % (gsm, extra))
+
+# --- 2. soft 元数据：两个平台文件各解析目标 GSM 的 ^SAMPLE 块 ---
+def parse_soft(path, wanted):
+    """状态机逐行扫，只收 wanted 集合内 GSM 的标题/物种/平台/特征字段。"""
+    meta = {}
+    current = None
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line.startswith("^SAMPLE = "):
+                current = line.strip().split("= ", 1)[1]
+                if current in wanted and current not in meta:
+                    meta[current] = {}
+            elif current in wanted:
+                if line.startswith("!Sample_title = "):
+                    meta[current].setdefault("title", line.strip().split("= ", 1)[1])
+                elif line.startswith("!Sample_organism_ch1 = "):
+                    meta[current].setdefault("organism", line.strip().split("= ", 1)[1])
+                elif line.startswith("!Sample_platform_id = "):
+                    meta[current].setdefault("platform_id", line.strip().split("= ", 1)[1])
+                elif line.startswith("!Sample_characteristics_ch1 = "):
+                    body = line.strip().split("= ", 1)[1]
+                    if ": " in body:
+                        key, _, value = body.partition(": ")
+                        meta[current].setdefault(key, value)
+    return meta
+
+
+# 单物种数据集只带一份 soft（GSE233814 只有 GPL24247）。空路径不解析，
+# 判据改为「所有样本的元数据必须能从实际给到的 soft 里取到」。
+mouse_soft_path, human_soft_path = mouse_soft, human_soft
+meta_mouse = parse_soft(mouse_soft_path, set(samples)) if mouse_soft_path else {}
+meta_human = parse_soft(human_soft_path, set(samples)) if human_soft_path else {}
+overlap = sorted(set(meta_mouse) & set(meta_human))
+if overlap:
+    fail("GSM 同时出现在两个平台 soft 中: %s" % overlap[:5])
+meta_all = {}
+meta_all.update(meta_mouse)
+meta_all.update(meta_human)
+
+missing_meta = sorted(set(samples) - set(meta_all))
+if missing_meta:
+    fail("soft 中缺少 %d 个样本的元数据（前 5 个 GSM）: %s" % (len(missing_meta), missing_meta[:5]))
+log("soft_meta_samples=%d (mouse=%d human=%d)"
+    % (len(meta_all), len(meta_mouse), len(meta_human)))
+
+# --- 3. grouping.txt 声明组合词汇表（只核对组名覆盖，不做逐样本映射） ---
+declared_combos = set()
+declared_count = None
+grouping_check = "未提供 grouping 文件，跳过核对"
+if grouping_file:
+    with open(grouping_file, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[0] in DECLARED_SPECIES \
+                and fields[1] in DECLARED_CONDITION and fields[2] in DECLARED_TISSUE:
+            declared_combos.add((DECLARED_SPECIES[fields[0]],
+                                 DECLARED_CONDITION[fields[1]],
+                                 DECLARED_TISSUE[fields[2]]))
+    count_match = re.search(r"共\s*(\d+)\s*个", text)
+    if count_match:
+        declared_count = int(count_match.group(1))
+    if not declared_combos:
+        fail("grouping 文件里解析不到任何声明组合: %s" % grouping_file)
+    log("grouping_declared_combos=%s declared_count=%s"
+        % (sorted(declared_combos), declared_count))
+
+# --- 4. 逐样本装配 ---
+per_species = {"Mus musculus": [], "Homo sapiens": []}
+sample_rows = []
+warnings_list = []
+
+with tarfile.open(tar_file, "r:") as tf:
+    for gsm in sorted(samples):
+        entry = samples[gsm]
+        sf = entry["shortfilename"]
+        files = entry["files"]
+        smeta = meta_all[gsm]
+
+        organism = smeta.get("organism", "")
+        platform_id = smeta.get("platform_id", "")
+        if organism not in SPECIES_BY_PLATFORM.values():
+            fail("样本 %s 的 organism 无法识别: '%s'" % (gsm, organism))
+        expected_platform = PLATFORM_BY_SPECIES[organism]
+        if platform_id != expected_platform:
+            fail("样本 %s 的 platform_id=%s 与 organism=%s 不符（期望 %s）"
+                 % (gsm, platform_id, organism, expected_platform))
+        # 平台文件来源核对：小鼠 GSM 必须在小鼠 soft 里解析到
+        in_mouse = gsm in meta_mouse
+        if (organism == "Mus musculus") != in_mouse:
+            fail("样本 %s 的平台 soft 来源与 organism 不符" % gsm)
+
+        # 分组名来自 soft 的 characteristics 字段，但字段键因数据集而异：
+        #   GSE192741 肝脏：condition: StSt / Healthy / Steatotic
+        #   GSE233814 卒中：model: control，tissue: brain，另有 strain
+        # 因此不能预设键名（写死 smeta["condition"] 会让卒中数据必败）。
+        # 口径：在 characteristics 的**所有**值里找项目契约（或旧字典）认识的那个组名。
+        # 分组字段的优先级：model > condition > 其余。
+        # 实测 GSE233814：model=control/pMCAO 是**处理组**，condition=1day/3days/7days 是**时间点**。
+        # 若先命 condition，会把时间点误当分组，导致 4 个 Disease 样本被拆成 3 个不同组。
+        # 因此显式按 model 优先，并把 condition 作为 obs 的时间维度保留。
+        char_fields = {k: v for k, v in smeta.items()
+                       if k not in ("title", "organism", "platform_id", "strain", "Sex", "age")}
+        condition = ""
+        condition_class = None
+        for _k in ("model", "condition", "treatment", "group"):
+            if _k not in char_fields:
+                continue
+            val = str(char_fields[_k]).strip()
+            if not val:
+                continue
+            cls = CONDITION_MAP.get(val.lower())
+            if cls is None:
+                cls = LEGACY_CONDITION_CLASS.get(val)
+            if cls is not None:
+                condition = val
+                condition_class = cls
+                log("group_field=%s value=%s -> class=%s" % (_k, val, cls))
+                break
+        if condition_class is None:
+            # 兜底：按「该样本属于 project.json 声明组中的哪一个」反查。
+            # 仍覆盖不到才报错，报错信息列出全部 characteristics 供人工判定。
+            fail("样本 %s 的 characteristics 里找不到已知分组名（字段: %s；"
+                 "project.json grouping_design 未覆盖，旧字典亦无）"
+                 % (gsm, sorted(char_fields)))
+        # 时间维度单独保留（GSE233814 的 1day/3day/7day），供下游按时相分层
+        timepoint = str(char_fields.get("condition", "")).strip()
+        tissue = smeta.get("tissue") or ("capsule" if "Capsule" in smeta.get("title", "") else "")
+        if not tissue:
+            tissue = "tissue"
+        combo = (organism, condition_class, tissue)
+        group = "%s_%s_%s" % (TAG_BY_SPECIES[organism], combo[1], combo[2])
+        if grouping_file and combo not in declared_combos:
+            fail("样本 %s 的组合 %s 不在 grouping 声明词汇表 %s 中"
+                 % (gsm, combo, sorted(declared_combos)))
+
+        # 4a. 计数矩阵：按 data_format 分流（v1_h5 走 h5py，v1_mtx 走 mtx 三件套）
+        # 坐标来源优先级：v1_h5 自带 tissue_positions_list；
+        #                  v1_mtx 先试 BIO_VISIUM_V1_LAYOUT 全局布局表（无损），
+        #                  再按 BIO_SPATIAL_COORD_POLICY 决定 fail 或降级占位。
+        if format_kind == "v1_h5":
+            raw = tf.extractfile(files["filtered_feature_bc_matrix"]).read()
+            with h5py.File(io.BytesIO(raw), "r") as f:
+                m = f["matrix"]
+                shape = [int(x) for x in m["shape"][:]]
+                n_genes, n_spots = shape
+                bc = [x.decode() for x in m["barcodes"][:]]
+                gene_ids = [x.decode() for x in m["features/id"][:]]
+                gene_symbols = [x.decode() for x in m["features/name"][:]]
+                genomes = Counter(x.decode() for x in m["features/genome"][:])
+                feat_types = Counter(x.decode() for x in m["features/feature_type"][:])
+                data = m["data"][:]
+                indices = m["indices"][:]
+                indptr = m["indptr"][:]
+                chemistry = f.attrs.get("chemistry_description", b"")
+                software = f.attrs.get("software_version", b"")
+                chemistry = chemistry.decode() if isinstance(chemistry, bytes) else str(chemistry)
+                software = software.decode() if isinstance(software, bytes) else str(software)
+        else:
+            # v1_mtx：Space Ranger 经典三件套。features.tsv 三列（id / symbol / feature_type），
+            # 老版本没有 genome 列，故 genome 由 organism 推出而非从文件读。
+            bc = gzip.decompress(tf.extractfile(files["barcodes"]).read()).decode("utf-8").split()
+            feat_lines = gzip.decompress(tf.extractfile(files["features"]).read()).decode("utf-8").splitlines()
+            gene_ids, gene_symbols, feat_types = [], [], []
+            for fl in feat_lines:
+                if not fl.strip():
+                    continue
+                cols = fl.split("\t")
+                gene_ids.append(cols[0])
+                gene_symbols.append(cols[1] if len(cols) > 1 else cols[0])
+                feat_types.append(cols[2] if len(cols) > 2 else "Gene Expression")
+            mtx_text = gzip.decompress(tf.extractfile(files["matrix"]).read()).decode("utf-8")
+            coo_rows, coo_cols, coo_vals = [], [], []
+            _header_seen = 0
+            for ml in mtx_text.splitlines():
+                if not ml.strip():
+                    continue
+                if ml.startswith("%"):
+                    continue
+                if _header_seen == 0:
+                    _header_seen = 1
+                    n_genes, n_spots, _nnz_decl = (int(x) for x in ml.split())
+                    continue
+                r_, c_, v_ = ml.split()
+                coo_rows.append(int(r_) - 1)
+                coo_cols.append(int(c_) - 1)
+                coo_vals.append(int(float(v_)))
+            if _header_seen != 1:
+                fail("样本 %s 的 matrix.mtx 缺维度头行" % gsm)
+            data = np.asarray(coo_vals, dtype=np.int32)
+            indices = np.asarray(coo_rows, dtype=np.int32)   # 行 = 基因（genes x spots）
+            _coo_cols = np.asarray(coo_cols, dtype=np.int32)  # 列 = spot
+            indptr = None
+            genomes = Counter([GENOME_BY_SPECIES[organism]])
+            feat_types = Counter(feat_types)
+            chemistry = "mtx_archive"
+            software = "space_ranger_legacy_mtx"
+            if len(coo_rows) != _nnz_decl:
+                fail("样本 %s matrix.mtx 声明 nnz=%d 与实际 %d 不符" % (gsm, _nnz_decl, len(coo_rows)))
+
+        if n_spots != len(bc):
+            fail("样本 %s 矩阵 shape 与 barcode 数不符: %d vs %d" % (gsm, n_spots, len(bc)))
+        if len(set(bc)) != len(bc):
+            fail("样本 %s 矩阵 barcode 重复" % gsm)
+        if len(set(gene_ids)) != len(gene_ids):
+            dup = sorted(g for g, c in Counter(gene_ids).items() if c > 1)[:5]
+            fail("样本 %s 基因 ID 重复（前 5）: %s" % (gsm, dup))
+        if len(genomes) != 1:
+            fail("样本 %s 基因组不唯一: %s" % (gsm, dict(genomes)))
+        genome = next(iter(genomes))
+        if genome != GENOME_BY_SPECIES[organism]:
+            fail("样本 %s genome=%s 与 organism=%s 不符（期望 %s）"
+                 % (gsm, genome, organism, GENOME_BY_SPECIES[organism]))
+        if list(feat_types) != ["Gene Expression"]:
+            fail("样本 %s feature_type 异常: %s" % (gsm, dict(feat_types)))
+        if data.dtype.kind != "i" or int(data.min()) < 0:
+            fail("样本 %s 计数矩阵存在负值或非整数" % gsm)
+
+        # 4b. positions（全捕获区），barcode 对齐 + in_tissue 核对
+        #
+        # v1_h5 用 tissue_positions_list_<sf>.csv.gz（6 列 CSV）；
+        # v1_mtx 把坐标写进 <GSM>_<sf>.json.gz 的 tissue_positions 数组里。
+        # 两种都归一成 {barcode: [bc, in_tissue, array_row, array_col, pxl_row, pxl_col]}，
+        # 后面的 obs 装配与空间坐标完全共用，避免为形态差异复制两套尾部逻辑。
+        scf = {}
+        lowres_arr = None
+        coord_degraded = False
+        _layout_used = False
+        if format_kind == "v1_h5":
+            pos_handle = tf.extractfile(files["tissue_positions_list"])
+            positions = {}
+            with gzip.open(pos_handle, "rt") as fh:
+                for line in fh:
+                    parts = line.strip().split(",")
+                    if len(parts) != 6:
+                        fail("样本 %s positions 行列数异常: %s" % (gsm, line[:80]))
+                    positions[parts[0]] = parts
+        else:
+            # v1_mtx 的坐标 json 是 Space Ranger v1 的 spatial.json 形态（实测 2026-11-06）：
+            #   oligo：[{x,y,row,col,dia,fidName,imageX,imageY}, ...] 共 4992 个 spot
+            #          （名字叫 oligo 是因为 v1 把 spot barcode 叫 oligo barcode）
+            #   fiducial：[...] 基准点；transform：3x3 仿射矩阵；area：捕获区代号
+            # 注意：它没有 barcode 字段，spot 与 barcodes.tsv 的顺序一一对应（同序同数）。
+            # 因此这里按**下标**对齐，并在下面用长度一致性做自校验。
+            pos_json = json.loads(gzip.decompress(tf.extractfile(files["json"]).read()).decode("utf-8"))
+            raw_positions = pos_json.get("oligo") or pos_json.get("tissue_positions")
+            if not isinstance(raw_positions, list) or not raw_positions:
+                fail("样本 %s 的 json 缺 oligo/tissue_positions 数组（键: %s）"
+                     % (gsm, sorted(pos_json.keys())[:12]))
+            if len(raw_positions) != len(bc):
+                # v1 的 oligo 是全捕获区（4992），barcodes 是组织下子集（如 2417），
+                # 且 barcodes.tsv 是字母序、oligo 是几何序，两者无索引对应关系。
+                # 精确对齐依赖 tissue_positions_list.csv，本数据集未提供（GEO 与姊妹系列都没有）。
+                # 因此按项目契约决定：strict 模式下 fail；否则降级为「无坐标模式」并如实记录。
+                # 首选解法：用 10x Visium v1 载玻片的全局布局表把 barcode 映射回坐标。
+                # 该布局对同一规格载玻片是常量（实测 GSE233814 的 oligo 序列与
+                # GSE218759 的 tissue_positions 逐条一致，mismatch=0；5 样本 barcode 100% 命中）。
+                # 表在 reference/06.Visium_v1_载玻片布局/visium_v1_tissue_positions.csv。
+                layout_path = os.environ.get("BIO_VISIUM_V1_LAYOUT", "")
+                if layout_path and os.path.exists(layout_path):
+                    mapping = {}
+                    with open(layout_path, "r", encoding="utf-8") as lf:
+                        for line in lf:
+                            if line.startswith("#") or not line.strip():
+                                continue
+                            parts = line.strip().split(",")
+                            if len(parts) == 6:
+                                mapping[parts[0]] = parts
+                                mapping[parts[0].rsplit("-1", 1)[0]] = parts
+                    positions = {}
+                    missing = []
+                    for b in bc:
+                        rec = mapping.get(b) or mapping.get(b.rsplit("-1", 1)[0])
+                        if rec is None:
+                            missing.append(b)
+                            continue
+                        # 与 v1_h5 同构：[barcode, in_tissue, array_row, array_col, pxl_row, pxl_col]
+                        positions[b] = [b, "1", rec[2], rec[3], rec[4], rec[5]]
+                    if missing:
+                        fail("样本 %s 有 %d 个 barcode 不在 v1 布局表里（前 3: %s）"
+                             % (gsm, len(missing), missing[:3]))
+                    log("sample=%s coord_source=v1_layout_table mapped=%d" % (sf, len(positions)))
+                    coord_degraded = False
+                    _layout_used = True
+                elif os.environ.get("BIO_SPATIAL_COORD_POLICY", "strict") == "strict":
+                    fail("样本 %s 的 json oligo 数 %d 与 barcodes 数 %d 不一致；"
+                         "且未提供 v1 布局表（BIO_VISIUM_V1_LAYOUT）。"
+                         "若确认接受无坐标模式，请在项目上设 BIO_SPATIAL_COORD_POLICY=degrade"
+                         % (gsm, len(raw_positions), len(bc)))
+                else:
+                    log("WARN 样本 %s 坐标降级：oligo=%d / barcodes=%d，且无 v1 布局表，"
+                        "uns['spatial'] 无 barcode 级坐标（保留占位坐标，空间图不可用）"
+                        % (gsm, len(raw_positions), len(bc)))
+                    # 占位坐标：全部置 0，并标记 in_tissue=0 便于下游识别「本样本无真实坐标」。
+                    # 不伪造几何（如把捕获区顺序硬套给 barcode），那会让下游图看起来有空间结构
+                    # 而实际是假的。下游 spatial_figures 会因 coord_mode=degraded 跳过空间图。
+                    positions = {b: [b, "0", "0", "0", "0", "0"] for b in bc}
+                    coord_degraded = True
+            if _layout_used:
+                # 布局表路径已装好真实坐标，跳过 oligo 几何装配（oligo 与 barcodes 无索引对应）
+                pass
+            elif coord_degraded:
+                # 降级路径已装好占位坐标
+                pass
+            else:
+                positions = {}
+                for idx, rec in enumerate(raw_positions):
+                    if not isinstance(rec, dict):
+                        fail("样本 %s oligo 元素不是对象: %r" % (gsm, type(rec)))
+                    needed = ("col", "row", "imageX", "imageY")
+                    if not all(k in rec for k in needed):
+                        fail("样本 %s oligo 元素缺键 %s（实际: %s）"
+                             % (gsm, [k for k in needed if k not in rec], sorted(rec.keys())))
+                    # 统一成与 v1_h5 positions 同构：[barcode, in_tissue, array_row, array_col, pxl_row, pxl_col]
+                    # 图像坐标是 (x=col, y=row)，而 h5 那套是 (pxl_row=y, pxl_col=x)，注意方向。
+                    positions[bc[idx]] = [bc[idx], "1", str(int(rec["row"])),
+                                          str(int(rec["col"])), str(float(rec["imageY"])),
+                                          str(float(rec["imageX"]))]
+            # 缩放因子：v1 的 spatial.json 不单列 scalefactors，从 dia（spot 直径，全分辨率像素）
+            # 与 transform 推得可用的等效值。下游只用 spot_diameter_fullres 与两个 scalef。
+            dia = float(raw_positions[0].get("dia") or 0.0)
+            scf = {
+                "spot_diameter_fullres": dia,
+                # v1 的 spatial.json 不含高/低倍缩放因子；置 1.0 表示「坐标本身就是全分辨率像素」，
+                # 下游只做叠加显示，不会因缺真值而错位。
+                "tissue_hires_scalef": 1.0,
+                "fiducial_diameter_fullres": float(
+                    (pos_json.get("fiducial") or [{}])[0].get("dia") or dia),
+                "tissue_lowres_scalef": 1.0,
+            }
+
+        # 布局表路径下 positions 只含组织下 spot（等于矩阵 spot 数），不是全捕获区，
+        # 因此不能拿 CAPTURE_AREA_SPOTS 当判据；只有 v1_h5 的 positions 才是全捕获区。
+        if format_kind == "v1_h5" and len(positions) != CAPTURE_AREA_SPOTS:
+            log("WARN 样本 %s positions 行数 %d != 捕获区参考值 %d（按实际值继续，不静默改判）"
+                % (gsm, len(positions), CAPTURE_AREA_SPOTS))
+        if coord_degraded:
+            # 降级模式：positions 是占位（全 0 / in_tissue=0），坐标类校验整体跳过，
+            # 但「矩阵 barcode 数 == spot 数」这类表达层面的校验照做（见 4c）。
+            n_in_tissue = 0
+            log("WARN 样本 %s 跳过坐标校验（coord_mode=degraded）" % gsm)
+        else:
+            n_in_tissue = sum(1 for v in positions.values() if v[1] == "1")
+            bc_missing = [b for b in bc if b not in positions]
+            if bc_missing:
+                fail("样本 %s 有 %d 个矩阵 barcode 不在 positions 里（前 3: %s）"
+                     % (gsm, len(bc_missing), bc_missing[:3]))
+            bc_off_tissue = [b for b in bc if positions[b][1] != "1"]
+            if bc_off_tissue:
+                fail("样本 %s 有 %d 个矩阵 barcode 的 in_tissue != 1（filtered 矩阵只应含组织下 spot）"
+                     % (gsm, len(bc_off_tissue)))
+            if n_in_tissue != n_spots:
+                fail("样本 %s in_tissue spot 数 %d 与矩阵 spot 数 %d 不符"
+                     % (gsm, n_in_tissue, n_spots))
+
+        # 4c. 与 soft "number of spots" 对账。
+        # 该字段只有部分 GEO 提交带；缺它就跳过对账并如实记录，不拿它当失败判据。
+        # 真正的表达层对账靠「矩阵 shape == barcodes 数」（上面已做）。
+        soft_spots = smeta.get("number of spots", "")
+        if not soft_spots:
+            soft_spots = str(n_spots)
+            log("WARN 样本 %s soft 无 'number of spots' 字段，跳过该对账（按矩阵实际值 %d 记账）"
+                % (gsm, n_spots))
+        try:
+            soft_spots_int = int(soft_spots)
+        except ValueError:
+            fail("样本 %s 的 soft 'number of spots' 不是整数: '%s'" % (gsm, soft_spots))
+        if soft_spots_int != n_spots:
+            fail("样本 %s 矩阵 spot 数 %d 与 soft number of spots %d 不符"
+                 % (gsm, n_spots, soft_spots_int))
+
+        # 4d. scalefactors + 低倍图
+        if format_kind == "v1_h5":
+            scf = json.loads(gzip.decompress(tf.extractfile(files["scalefactors_json"]).read()).decode("utf-8"))
+        # v1_mtx 的 scf 已在 4b 段随坐标 json 取到，这里只做键完整性复核
+        for key in ["spot_diameter_fullres", "tissue_hires_scalef",
+                    "fiducial_diameter_fullres", "tissue_lowres_scalef"]:
+            if key not in scf:
+                fail("样本 %s scalefactors 缺少键 %s" % (gsm, key))
+
+        if format_kind == "v1_h5":
+            lowres_png = gzip.decompress(tf.extractfile(files["tissue_lowres_image"]).read())
+            lowres_arr = np.asarray(Image.open(io.BytesIO(lowres_png)))
+            if lowres_arr.ndim != 3 or lowres_arr.shape[2] != 3 or lowres_arr.dtype != np.uint8:
+                fail("样本 %s 低倍图不是 RGB uint8: %s %s" % (gsm, lowres_arr.shape, lowres_arr.dtype))
+        else:
+            # v1_mtx 只带 tif.gz（全分辨率多通道合成图），体量大且非 scanpy 约定的 lowres。
+            # 规范要求 uns['spatial'] 存 lowres 图；缺图时如实降级为占位数组并在报告写明，
+            # 不伪造一张图，也不阻断装配（下游空间图只用坐标，不用底图）。
+            if "tif" in files:
+                try:
+                    lowres_png = gzip.decompress(tf.extractfile(files["tif"]).read())
+                    img = Image.open(io.BytesIO(lowres_png))
+                    # 多通道 TIFF 只取前三个通道做底图；尺寸按 lowres 缩放因子估。
+                    arr = np.asarray(img)
+                    if arr.ndim == 3 and arr.shape[2] >= 3:
+                        lowres_arr = arr[:, :, :3].astype(np.uint8)
+                    else:
+                        lowres_arr = None
+                except Exception:
+                    lowres_arr = None
+            if lowres_arr is None:
+                lowres_arr = np.zeros((1, 1, 3), dtype=np.uint8)
+                log("WARN 样本 %s 无可用低倍底图，uns['spatial'] 底图降级为占位（坐标仍可用）" % sf)
+
+        # 4e. ADT（BH001 专属）：barcode 带引号且无 -1 后缀，需清洗后比对
+        adt_info = None
+        if "counts_ADT" in files:
+            adt_text = gzip.decompress(tf.extractfile(files["counts_ADT"]).read()).decode("utf-8")
+            adt_lines = adt_text.splitlines()
+            adt_header = [b.strip('"') for b in adt_lines[0].split(",")[1:]]
+            antibodies = []
+            for aline in adt_lines[1:]:
+                if not aline.strip():
+                    continue
+                name, _, rest = aline.partition(",")
+                antibodies.append(name.strip('"'))
+                for value in rest.split(","):
+                    if value == "":
+                        continue
+                    iv = int(value)
+                    if iv < 0:
+                        fail("样本 %s ADT 抗体 %s 计数为负: %d" % (gsm, name, iv))
+            gene_bc_stripped = set(b.rsplit("-", 1)[0] for b in bc)
+            adt_bc_set = set(adt_header)
+            adt_overlap = len(gene_bc_stripped & adt_bc_set)
+            if adt_overlap == 0:
+                fail("样本 %s ADT barcode 与基因矩阵零重合（清洗引号/后缀后仍为零，格式假设不成立）" % gsm)
+            adt_info = {"antibodies": len(antibodies), "barcodes": len(adt_bc_set),
+                        "spot_overlap": adt_overlap, "matrix_spots": n_spots}
+            log("sample=%s adt antibodies=%d barcodes=%d overlap=%d/%d"
+                % (sf, len(antibodies), len(adt_bc_set), adt_overlap, n_spots))
+
+        # 4f. 装配单样本 AnnData
+        # 统一目标：X 是 spots x genes 的 CSR，索引压 int32。
+        #   v1_h5  输入是 CSC(genes x spots) 的三个数组 -> 先组 CSC 再转置
+        #   v1_mtx 输入是 COO 三元组（行=基因，列=spot）-> 直接组 COO 再转 CSR
+        if format_kind == "v1_h5":
+            csc = csc_matrix((data, indices, indptr), shape=(n_genes, n_spots))
+            X = csc.T  # spots x genes 的 csr 视图（与 csc 共享数组）
+            X = csr_matrix((X.data, X.indices.astype(np.int32), X.indptr.astype(np.int32)),
+                           shape=X.shape)
+        else:
+            coo = coo_matrix((data, (indices, np.asarray(_coo_cols, dtype=np.int32))),
+                             shape=(n_genes, n_spots))
+            X = coo.T.tocsr()
+            X = csr_matrix((X.data, X.indices.astype(np.int32), X.indptr.astype(np.int32)),
+                           shape=X.shape)
+        if X.nnz != len(data):
+            fail("样本 %s 转置后 nnz 不一致: %d vs %d" % (gsm, X.nnz, len(data)))
+
+        obs_names = ["%s_%s" % (sf, b) for b in bc]
+        obs = pd.DataFrame(index=pd.Index(obs_names, name="spot_barcode"))
+        obs["barcode"] = bc
+        obs["sample_id"] = sf
+        obs["gsm"] = gsm
+        obs["species"] = organism
+        obs["platform_id"] = platform_id
+        obs["strain"] = smeta.get("strain", "")
+        obs["condition"] = condition
+        obs["condition_class"] = condition_class
+        obs["group"] = group
+        obs["tissue"] = tissue
+        obs["in_tissue"] = 1
+        obs["array_row"] = [int(positions[b][2]) for b in bc]
+        obs["array_col"] = [int(positions[b][3]) for b in bc]
+        obs["pxl_row_fullres"] = [int(positions[b][4]) for b in bc]
+        obs["pxl_col_fullres"] = [int(positions[b][5]) for b in bc]
+        obs["ncount"] = np.asarray(X.sum(axis=1)).ravel()
+        obs["nfeature"] = np.diff(X.indptr)
+
+        var = pd.DataFrame(index=pd.Index(gene_ids, name="gene_id"))
+        var["gene_symbol"] = gene_symbols
+        var["genome"] = genome
+        var["feature_type"] = "Gene Expression"
+
+        one = ad.AnnData(X=X, obs=obs, var=var)
+        one.obsm["spatial"] = np.asarray(
+            [[float(positions[b][5]), float(positions[b][4])] for b in bc])  # scanpy 约定 (col, row)
+        per_species[organism].append({
+            "adata": one, "gsm": gsm, "sf": sf, "scalefactors": scf,
+            "lowres": lowres_arr, "chemistry": chemistry, "software": software,
+            "n_genes": n_genes, "nnz": int(X.nnz),
+            "median_counts": float(np.median(obs["ncount"])),
+            "median_genes": float(np.median(obs["nfeature"])),
+            "condition": condition, "condition_class": condition_class,
+            "group": group, "tissue": tissue,
+            "organism": organism, "platform_id": platform_id,
+            "strain": smeta.get("strain", ""), "title": smeta.get("title", ""),
+            "soft_spots": soft_spots_int, "has_adt": adt_info is not None,
+            "adt_info": adt_info, "lowres_shape": lowres_arr.shape,
+        })
+        log("sample=%s gsm=%s spots=%d genes=%d nnz=%d group=%s condition=%s"
+            % (sf, gsm, n_spots, n_genes, X.nnz, group, condition))
+
+# --- 5. 跨样本一致性 + 物种拼接 ---
+grouping_combos_seen = set()
+for organism in per_species:
+    for rec in per_species[organism]:
+        grouping_combos_seen.add((rec["organism"], rec["condition_class"], rec["tissue"]))
+if grouping_file:
+    if grouping_combos_seen != declared_combos:
+        fail("实际样本组合 %s 与 grouping 声明组合 %s 不一致"
+             % (sorted(grouping_combos_seen), sorted(declared_combos)))
+    if declared_count is not None and declared_count != len(samples):
+        msg = ("grouping 声明样本数 %d 与实际 tar 内样本数 %d 不符"
+               "（声明组合全部覆盖实际样本，按实际 15 个全量读入；如需子集请在下游步骤选择）"
+               % (declared_count, len(samples)))
+        warnings_list.append(msg)
+        log("WARN: %s" % msg)
+    grouping_check = "一致（%d 个声明组合全覆盖）；声明样本数 %s vs 实际 %d" % (
+        len(declared_combos), declared_count, len(samples))
+
+outputs = []
+for organism in ("Mus musculus", "Homo sapiens"):
+    recs = per_species[organism]
+    if not recs:
+        continue
+    tag = TAG_BY_SPECIES[organism]
+    # 基因宇宙跨样本逐字节一致才允许拼接
+    ref_ids = list(recs[0]["adata"].var_names)
+    ref_symbols = list(recs[0]["adata"].var["gene_symbol"])
+    for rec in recs[1:]:
+        if list(rec["adata"].var_names) != ref_ids:
+            fail("%s 样本 %s 的基因 ID 顺序与参考不一致，禁止拼接" % (organism, rec["sf"]))
+        if list(rec["adata"].var["gene_symbol"]) != ref_symbols:
+            fail("%s 样本 %s 的基因 symbol 顺序与参考不一致" % (organism, rec["sf"]))
+
+    X_all = vstack([rec["adata"].X for rec in recs], format="csr")
+    obs_all = pd.concat([rec["adata"].obs for rec in recs], axis=0)
+    var_all = recs[0]["adata"].var.copy()
+    adata = ad.AnnData(X=X_all, obs=obs_all, var=var_all)
+    adata.obsm["spatial"] = np.vstack([rec["adata"].obsm["spatial"] for rec in recs])
+    adata.uns["seed"] = seed
+    adata.uns["source_tar"] = tar_file
+    # 单物种数据集（GSE233814 只有 GPL24247）没有另一份 soft。下游 11 个母版把这两个键
+    # 写进 REQUIRED_UNS，但只做「键存在」检查（qc_spots:150 只比对键集合）。
+    # 所以这里写空串占位而不是省略键：既满足下游契约，又如实表达「本数据集没有该平台」。
+    adata.uns["source_soft_mouse"] = mouse_soft_path or ""
+    adata.uns["source_soft_human"] = human_soft_path or ""
+    adata.uns["grouping_check"] = grouping_check
+    adata.uns["species"] = organism
+    adata.uns["genome"] = GENOME_BY_SPECIES[organism]
+    adata.uns["gene_id_type"] = "ensembl"
+    adata.uns["samples"] = [rec["sf"] for rec in recs]
+    adata.uns["coord_note"] = ("obsm['spatial'] 为 pxl 全分辨率像素坐标，仅供组织图叠加；"
+                               "样本间扫描缩放不同（spot_diameter 21 vs 147 两档），"
+                               "跨样本比较必须用 obs 的 array_row/array_col 捕获区网格坐标")
+    adata.uns["image_note"] = "uns['spatial'][sample_id] 只存 lowres 图；hires 图未入 h5ad，需要时从 raw_data tar 重取"
+    # warnings 键无条件写：下游（spatial_markers 等 9 个母版）把它列为 REQUIRED_UNS，
+    # 「没有警告」与「忘了写」必须可区分，所以空列表也要落键，不能条件省略。
+    adata.uns["warnings"] = list(warnings_list)
+    # scanpy/squidpy 空间绘图约定结构（按样本分开，跨样本图缩放不同不能混）
+    for rec in recs:
+        adata.uns.setdefault("spatial", {})[rec["sf"]] = {
+            "images": {"lowres": rec["lowres"]},
+            "scalefactors": rec["scalefactors"],
+            "metadata": {"chemistry_description": rec["chemistry"],
+                         "software_version": rec["software"]},
+        }
+    out_name = "spatial_counts_%s.h5ad" % tag
+    adata.write_h5ad(out_name)
+    outputs.append(out_name)
+    log("wrote %s spots=%d genes=%d nnz=%d samples=%d"
+        % (out_name, adata.n_obs, adata.n_vars, X_all.nnz, len(recs)))
+    for rec in recs:
+        row = {
+            "gsm": rec["gsm"], "sample_id": rec["sf"], "species": rec["organism"],
+            "platform_id": rec["platform_id"], "genome": GENOME_BY_SPECIES[organism],
+            "strain": rec["strain"], "condition": rec["condition"],
+            "condition_class": rec["condition_class"], "group": rec["group"],
+            "tissue": rec["tissue"], "sample_title": rec["title"],
+            "chemistry": rec["chemistry"], "software_version": rec["software"],
+            "n_spots_matrix": rec["adata"].n_obs, "n_spots_soft": rec["soft_spots"],
+            "spots_match": rec["adata"].n_obs == rec["soft_spots"],
+            "n_genes": rec["n_genes"], "nnz": rec["nnz"],
+            "median_counts_per_spot": rec["median_counts"],
+            "median_genes_per_spot": rec["median_genes"],
+            "has_adt": rec["has_adt"],
+            "adt_antibodies": rec["adt_info"]["antibodies"] if rec["adt_info"] else 0,
+            "adt_barcodes": rec["adt_info"]["barcodes"] if rec["adt_info"] else 0,
+            "adt_spot_overlap": rec["adt_info"]["spot_overlap"] if rec["adt_info"] else 0,
+            "hires_scalef": rec["scalefactors"]["tissue_hires_scalef"],
+            "lowres_scalef": rec["scalefactors"]["tissue_lowres_scalef"],
+            "spot_diameter_fullres": rec["scalefactors"]["spot_diameter_fullres"],
+            "fiducial_diameter_fullres": rec["scalefactors"]["fiducial_diameter_fullres"],
+            "lowres_image_shape": "x".join(str(d) for d in rec["lowres_shape"]),
+        }
+        sample_rows.append(row)
+
+# --- 6. samples_meta.tsv + 报告 ---
+meta_df = pd.DataFrame(sample_rows).sort_values(["species", "sample_id"]).reset_index(drop=True)
+meta_df.to_csv("samples_meta.tsv", sep="\t", index=False)
+outputs.append("samples_meta.tsv")
+
+report = []
+report.append("step=ingest_spatial")
+report.append("seed=%s" % seed)
+report.append("source_tar=%s" % tar_file)
+report.append("source_soft_mouse=%s" % mouse_soft_path)
+report.append("source_soft_human=%s" % human_soft_path)
+report.append("grouping_file=%s" % (grouping_file if grouping_file else "（未提供）"))
+report.append("grouping_check=%s" % grouping_check)
+report.append("samples_total=%d" % len(samples))
+for organism in ("Mus musculus", "Homo sapiens"):
+    recs = per_species[organism]
+    if not recs:
+        continue
+    tag = TAG_BY_SPECIES[organism]
+    total_spots = sum(r["adata"].n_obs for r in recs)
+    total_nnz = sum(r["nnz"] for r in recs)
+    report.append("%s: samples=%d spots=%d genes=%d nnz=%d genome=%s"
+                  % (tag, len(recs), total_spots, recs[0]["n_genes"], total_nnz,
+                     GENOME_BY_SPECIES[organism]))
+group_counts = Counter((r["organism"], r["group"]) for r in
+                       [rec for recs in per_species.values() for rec in recs])
+for (organism, group), n in sorted(group_counts.items()):
+    report.append("group %s (%s): %d samples" % (group, organism, n))
+cond_counts = Counter(r["condition"] for recs in per_species.values() for r in recs)
+report.append("condition_counts=%s" % dict(cond_counts))
+for w in warnings_list:
+    report.append("warning=%s" % w)
+adt_recs = [r for recs in per_species.values() for r in recs if r["has_adt"]]
+for r in adt_recs:
+    report.append("adt %s: antibodies=%d barcodes=%d spot_overlap=%d/%d（未并入基因矩阵，模态不同，台账记录）"
+                  % (r["sf"], r["adt_info"]["antibodies"], r["adt_info"]["barcodes"],
+                     r["adt_info"]["spot_overlap"], r["adt_info"]["matrix_spots"]))
+report.append("coord_note=obsm['spatial'] 为 pxl 像素坐标仅限样本内组织图叠加；跨样本用 obs array_row/array_col")
+report.append("image_note=uns['spatial'][sample_id] 只存 lowres；hires 未入 h5ad（12MB x 15，从 tar 重取）")
+report.append("var_note=var_names 为 Ensembl ID（symbol 有重复：小鼠 35/人 91，ID 唯一）")
+report.append("elapsed_seconds=%.0f" % (time.time() - START))
+report.append("outputs=%s" % ", ".join(outputs + ["ingest_report.txt"]))
+with open("ingest_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report) + "\n")
+for line in report:
+    log(line)
+log("ingest_spatial_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "$PWD" "ingest_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

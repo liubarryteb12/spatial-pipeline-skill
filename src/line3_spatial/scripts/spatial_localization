@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+# spatial_localization：line3_spatial 步骤 12 目标基因空间定位。
+#
+# 输入：步骤 10 产物 spatial_communication_mouse.h5ad / spatial_communication_human.h5ad
+#       （obs 带 domain + lr_score_recv，uns 含 domain_markers / communication）。
+#
+# 做法：目标基因候选池 = 步骤 6 rank_genes_groups 的各域 marker 前 TOPK_MARKER 名
+# （去重；探针定性 wilcoxon top1 含大量泛表达基因 frac>=0.99 无定位信息量，取 top20
+# 让打分排序自行筛选）。逐基因逐样本算域富集（domain 身份样本私有，跨样本累加
+# 无意义，同步骤 9 教训）：
+#   enrich(sample) = 域内表达 spot 占比 / 该基因全 spot 占比（该样本内）
+#   self_consistent(sample) = 该基因 marker 域（样本内）恰为 enrich 最高域
+# 目标基因排序 = self_consistent 样本数降序 → best_enrich 降序 → frac_all 升序
+# （泛表达基因 frac 高自然沉底，不用硬阈值拍脑袋）。
+#
+# 产物语义：
+#   - gene_localization_{species}.tsv：每基因一行（symbol + Ensembl + n_expr +
+#     frac_all + 自洽样本数 + best_enrich + 定位域示例 + marker 域数）。
+#   - h5ad obs 贴回 spot 级 target_gene_expr：该 spot 所属样本的 top 目标基因
+#     （排序第一）表达值（其余基因此步不做 spot 级贴回，避免 obs 列爆炸；
+#     下游需要可用本脚本口径重算，同 seed 可复现、与 seed 无关）。
+#   - uns['localization'] 存口径 + 目标基因集合（top N_TARGETS）+ 逐基因汇总。
+#
+# 自校验内建：输入契约（步骤 10 键集合 + communication 口径键 + 未做过定位）、
+# 候选池非空、所有候选基因可映射 var_names、enrich >= 0、自洽样本数 <= 总样本数、
+# spot 级贴回与目标基因表达列一致、X/counts/X_pca/domain/obs/var 不变量。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+mouse_h5ad=""
+human_h5ad=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *mouse*.h5ad) mouse_h5ad="$path" ;;
+    *human*.h5ad) human_h5ad="$path" ;;
+    *.h5ad) echo "无法识别的输入文件: $path（文件名需含 mouse/human 物种标识）" >&2; exit 2 ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 10 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$mouse_h5ad" ] && [ -z "$human_h5ad" ]; then
+  # 单物种数据集（GSE233814 只有小鼠 GPL24247）不再要求两份都提供。
+  # 判据改为「至少一份」：两份都缺才报错；实际提供哪份，下游按文件名分流。
+  echo "缺少必需输入：至少需要一份物种 h5ad（mouse 或 human）" >&2
+  exit 2
+fi
+for path in "$mouse_h5ad" "$human_h5ad"; do
+  [ -n "$path" ] || continue
+  if [ ! -f "$path" ]; then
+    echo "输入文件不存在: $path"
+    exit 2
+  fi
+done
+
+echo "step_executed=spatial_localization"
+echo "bioanalys_seed=${seed}"
+echo "input_mouse=${mouse_h5ad}"
+echo "input_human=${human_h5ad}"
+
+LOC_INPUTS="$mouse_h5ad
+$human_h5ad"
+export LOC_INPUTS
+export LOC_OUTDIR="${LOC_OUTDIR:-$(pwd)}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+TOPK_MARKER = 20    # 候选池：各域 marker 前 N 名（探针定稿，top1 含泛表达噪声）
+N_TARGETS = 10      # 目标基因集合输出数（报告与 uns 记录）
+SEED = int(os.environ["BIOANALYS_SEED"])
+
+
+def fail(message):
+    sys.stderr.write("spatial_localization 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+# 步骤 10 产物键集合（= 步骤 9 键集合 + obs 加 lr_score_recv + uns 加 communication）
+REQUIRED_OBS = ["barcode", "sample_id", "gsm", "species", "platform_id", "strain",
+                "condition", "condition_class", "group", "tissue", "in_tissue",
+                "array_row", "array_col", "pxl_row_fullres", "pxl_col_fullres",
+                "ncount", "nfeature", "total_counts", "n_genes_by_counts", "pct_mito",
+                "domain", "domain_same_frac", "domain_same_z",
+                "domain_rank", "domain_prop", "lr_score_recv"]
+REQUIRED_VAR = ["gene_symbol", "genome", "feature_type", "means", "dispersions",
+                "dispersions_norm", "highly_variable", "morans_i_mean", "morans_i_min",
+                "morans_i_max", "morans_z_mean", "gearys_c_mean", "gearys_c_min",
+                "gearys_c_max", "autocorr_n_valid_samples"]
+REQUIRED_UNS = ["coord_note", "dimred", "domains", "gene_id_type", "genome",
+                "grouping_check", "hvg", "image_note", "log1p", "markers",
+                "autocorr", "cooccurrence", "composition", "communication",
+                "normalization", "pca", "qc", "samples", "seed", "source_h5ad",
+                "source_soft_human", "source_soft_mouse", "source_tar", "spatial",
+                "species", "warnings"]
+
+report_sections = []
+
+for path in os.environ["LOC_INPUTS"].splitlines():
+    path = path.strip()
+    if not path:
+        continue
+    species = "mouse" if "mouse" in os.path.basename(path) else "human"
+    adata = ad.read_h5ad(path)
+    log("loaded %s spots=%d genes=%d" % (species, adata.shape[0], adata.shape[1]))
+
+    # --- 1. 输入契约 ---
+    missing_obs = [col for col in REQUIRED_OBS if col not in adata.obs.columns]
+    if missing_obs:
+        fail("%s 缺少 obs 列 %s（不是 spatial_communication 产物？）" % (path, missing_obs))
+    missing_var = [col for col in REQUIRED_VAR if col not in adata.var.columns]
+    if missing_var:
+        fail("%s 缺少 var 列 %s" % (path, missing_var))
+    missing_uns = [key for key in REQUIRED_UNS if key not in adata.uns]
+    if missing_uns:
+        fail("%s 缺少 uns 键 %s（不是 spatial_communication 产物？）" % (path, missing_uns))
+    if "counts" not in adata.layers:
+        fail("%s 缺少 layers['counts']" % path)
+    for key in ["X_pca", "X_umap", "spatial"]:
+        if key not in adata.obsm:
+            fail("%s 缺少 obsm['%s']" % (path, key))
+    if "localization" in adata.uns:
+        fail("%s 已含定位结果（重复执行？）" % path)
+    x_nnz_before = adata.X.nnz
+    counts_nnz_before = adata.layers["counts"].nnz
+    pca_before = adata.obsm["X_pca"].copy()
+    domain_before = adata.obs["domain"].copy()
+
+    # --- 2. 候选池：各域 marker 前 TOPK_MARKER 名（Ensembl ID，var_names 口径） ---
+    names_arr = np.asarray(adata.uns["domain_markers"]["names"])
+    groups = adata.obs["domain"].astype("category").cat.categories.tolist()
+    n_ranks = names_arr.shape[0]
+    if n_ranks < TOPK_MARKER:
+        fail("%s marker ranks=%d < TOPK_MARKER=%d" % (species, n_ranks, TOPK_MARKER))
+    cand = {}
+    for g in groups:
+        for rank in range(TOPK_MARKER):
+            cand.setdefault(str(names_arr[g][rank]), set()).add(g)
+    if not cand:
+        fail("%s 候选池为空（domain_markers names 为空？）" % species)
+    var_index = {v: i for i, v in enumerate(adata.var_names.tolist())}
+    unmapped = [g for g in cand if g not in var_index]
+    if unmapped:
+        fail("%s 候选基因未映射 var_names: %s" % (species, unmapped[:5]))
+    log("%s 候选池（各域 marker top%d 去重）=%d 基因" % (species, TOPK_MARKER, len(cand)))
+
+    # --- 3. 逐基因逐样本域富集 ---
+    t0 = time.time()
+    dom = adata.obs["domain"].astype(str).to_numpy()
+    sample_arr = adata.obs["sample_id"].astype(str).to_numpy()
+    samples = sorted(adata.obs["sample_id"].unique().tolist())
+    X = adata.X.tocsc()
+    rows = []
+    gene_col = {}
+    for gene in sorted(cand.keys()):
+        gi = var_index[gene]
+        col = np.asarray(X[:, gi].toarray()).ravel()
+        gene_col[gene] = col
+        n_expr = int((col > 0).sum())
+        marker_doms = sorted(cand[gene])
+        n_samples_top = 0
+        n_samples_total = 0
+        best_enrich = 0.0
+        best_example = ""
+        for s in samples:
+            sm = sample_arr == s
+            cs = col[sm]
+            all_frac_s = float((cs > 0).mean())
+            if all_frac_s <= 0:
+                continue
+            n_samples_total += 1
+            dom_s = dom[sm]
+            marker_here = [d for d in marker_doms if (dom_s == d).any()]
+            if not marker_here:
+                continue
+            per_dom = []
+            for d in sorted(set(dom_s.tolist())):
+                m = dom_s == d
+                per_dom.append((d, float((cs[m] > 0).mean())))
+            per_dom_sorted = sorted(per_dom, key=lambda x: (-x[1], x[0]))
+            top_d, top_frac = per_dom_sorted[0]
+            enrich = top_frac / all_frac_s
+            if enrich > best_enrich:
+                best_enrich = enrich
+                best_example = "%s:%s" % (s, top_d)
+            if top_d in marker_here:
+                n_samples_top += 1
+        rows.append({
+            "ensembl_id": gene,
+            "gene_symbol": str(adata.var["gene_symbol"].iloc[gi]),
+            "n_expr": n_expr,
+            "frac_all": n_expr / adata.shape[0],
+            "n_samples_top": n_samples_top,
+            "n_samples_total": n_samples_total,
+            "best_enrich": best_enrich,
+            "best_example": best_example,
+            "n_marker_domains": len(marker_doms),
+        })
+    elapsed = time.time() - t0
+    log("%s 逐基因域富集 %.1fs（候选 %d）" % (species, elapsed, len(rows)))
+
+    # 排序：自洽样本数降序 → best_enrich 降序 → frac_all 升序（泛表达沉底）
+    rows_sorted = sorted(rows, key=lambda r: (-r["n_samples_top"], -r["best_enrich"],
+                                              r["frac_all"], r["ensembl_id"]))
+    targets = rows_sorted[:N_TARGETS]
+
+    # --- 4. 自校验 ---
+    if any(r["best_enrich"] < -1e-12 for r in rows):
+        fail("%s 有基因 best_enrich < 0（表达非负不可能）" % species)
+    if any(r["n_samples_top"] > r["n_samples_total"] for r in rows):
+        fail("%s 有基因自洽样本数 > 总样本数" % species)
+    if not targets:
+        fail("%s 目标基因为空" % species)
+
+    # --- 5. spot 级贴回：top 目标基因在该 spot 的表达值 ---
+    top_gene = targets[0]["ensembl_id"]
+    spot_expr = gene_col[top_gene].astype(float)
+    if not np.all(np.isfinite(spot_expr)):
+        fail("%s spot 级 target_gene_expr 有非有限值" % species)
+    if not np.all(spot_expr >= -1e-12):
+        fail("%s spot 级 target_gene_expr 有负值" % species)
+
+    if adata.X.nnz != x_nnz_before:
+        fail("%s X nnz 被改变" % species)
+    if adata.layers["counts"].nnz != counts_nnz_before:
+        fail("%s counts 层 nnz 被改变" % species)
+    if not np.array_equal(adata.obsm["X_pca"], pca_before):
+        fail("%s X_pca 被改动" % species)
+    if not adata.obs["domain"].equals(domain_before):
+        fail("%s domain 列被改动" % species)
+    for col_name in REQUIRED_OBS:
+        if col_name not in adata.obs.columns:
+            fail("%s obs 列丢失: %s" % (species, col_name))
+    for col_name in REQUIRED_VAR:
+        if col_name not in adata.var.columns:
+            fail("%s var 列丢失: %s" % (species, col_name))
+
+    # --- 6. 落盘 ---
+    adata.obs["target_gene_expr"] = spot_expr
+    uns_targets = {"target%d" % (i + 1): {
+        "ensembl_id": r["ensembl_id"],
+        "gene_symbol": r["gene_symbol"],
+        "n_expr": int(r["n_expr"]),
+        "frac_all": round(float(r["frac_all"]), 4),
+        "n_samples_top": int(r["n_samples_top"]),
+        "n_samples_total": int(r["n_samples_total"]),
+        "best_enrich": round(float(r["best_enrich"]), 4),
+        "best_example": r["best_example"],
+        "n_marker_domains": int(r["n_marker_domains"]),
+    } for i, r in enumerate(targets)}
+    adata.uns["localization"] = {
+        "method": "marker_topk_candidates_per_sample_domain_enrichment",
+        "note": "候选池=步骤 6 各域 marker 前 %d 名去重；domain 身份样本私有，"
+                "域富集逐样本算（enrich=域内表达 spot 占比/该基因全 spot 占比），"
+                "self_consistent=marker 域恰为 enrich 最高域；排序=自洽样本数降序"
+                "→ best_enrich 降序 → frac_all 升序（泛表达基因自然沉底）" % TOPK_MARKER,
+        "seed": SEED,
+        "topk_marker": int(TOPK_MARKER),
+        "n_targets": int(N_TARGETS),
+        "n_candidates": int(len(rows)),
+        "top_target_gene": top_gene,
+        "targets": uns_targets,
+        "source_h5ad": path,
+    }
+    h5ad_name = "spatial_localization_%s.h5ad" % species
+    adata.write_h5ad(h5ad_name)
+
+    tsv_name = "gene_localization_%s.tsv" % species
+    tsv_df = pd.DataFrame(rows_sorted)
+    tsv_df.to_csv(tsv_name, sep="\t", index=False)
+    log("%s wrote %s (%d spots) + %s (%d 行)"
+        % (species, h5ad_name, adata.shape[0], tsv_name, len(tsv_df)))
+
+    lines = [
+        "[%s]" % species,
+        "spots=%d genes=%d" % (adata.shape[0], adata.shape[1]),
+        "candidates=%d (marker top%d 去重)" % (len(rows), TOPK_MARKER),
+        "seconds=%.1f" % elapsed,
+        "top_target_gene=%s (%s)" % (top_gene, targets[0]["gene_symbol"]),
+        "targets:",
+    ]
+    for r in targets:
+        lines.append("  %-10s %-18s 自洽=%d/%d enrich=%.2f frac=%.3f n_expr=%d"
+                     % (r["gene_symbol"], r["ensembl_id"], r["n_samples_top"],
+                        r["n_samples_total"], r["best_enrich"], r["frac_all"],
+                        r["n_expr"]))
+    lines.append("note=排序口径自洽样本数降序→best_enrich 降序→frac_all 升序；"
+                 "泛表达基因（frac 接近 1）无定位信息量，排序自然沉底；"
+                 "domain 身份样本私有，enrich 逐样本算，跨样本只汇总计数不比域身份")
+    report_sections.append("\n".join(lines))
+
+report_lines = [
+    "step=spatial_localization",
+    "seed=%d" % SEED,
+    "method=marker top%d 候选池 + 逐样本域富集（enrich=域内表达占比/全占比）+ "
+    "self-consistent 样本数排序" % TOPK_MARKER,
+    "domain_identity_note=domain 身份样本私有，enrich 逐样本算，跨样本只汇总自洽计数",
+    "spot_level_note=obs 贴回 target_gene_expr（top 目标基因表达值），其余基因不逐 spot 贴回",
+    "outputs=spatial_localization_mouse.h5ad, spatial_localization_human.h5ad, "
+    "gene_localization_mouse.tsv, gene_localization_human.tsv, localization_report.txt",
+] + report_sections + [
+    "elapsed_seconds=%.0f" % (time.time() - START),
+]
+with open("localization_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'localization_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('localization_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("spatial_localization_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "${LOC_OUTDIR:-$(pwd)}" "localization_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

@@ -1,0 +1,670 @@
+#!/usr/bin/env bash
+# spatial_communication：line3_spatial 步骤 10 空间通讯分析。
+#
+# 输入：步骤 9 产物 spatial_composition_mouse.h5ad / spatial_composition_human.h5ad
+#       （obs 带 domain + domain_rank/domain_prop，X 归一化 log 值，uns 含 composition）。
+#
+# 做法：LR 资源取 liana consensus（本地已装 1.10.0，离线可用零新依赖），配体/受体
+# 基因用**大写归一匹配**（liana 资源是人类命名大写，mouse symbol 是 Title case 如
+# Tgfb1，直接匹配 mouse 只命中 2/4620，探针实测定性；重复 symbol 取首个 var 索引，
+# 与步骤 6 marker 映射口径一致）。空间打分：逐物种、逐样本像素 KNN(k=6) 邻域权重
+# （与步骤 7/8/9 同一 build_knn_weights：有向邻接 A → 对称化 A+A.T 互向权重 2 →
+# 行标准化），对每对 LR 算 domain 对级强度
+#   score(p; di, dj) = sum_i sum_j lv_ip * w_ij * rv_jp * 1[dom_i=di] * 1[dom_j=dj]
+# 再除以 domain 对邻域质量 mass(di,dj) = sum_{i in di, j in dj} w_ij，得到"每单位
+# 邻域质量的 LR 强度"，消除域规模差异（与步骤 9 rank 对齐精神一致）。
+# 向量化实现（探针 5 定稿，human 1.5s / mouse 6.0s；逐 pair 循环 253s/588s 不可接受）：
+#   rec_side = W @ (rv * mask_dj)                      # spots x pairs 稀疏乘一次
+#   score[:, di, dj] += einsum('ip,ip->p', lv*mask_di, rec_side)
+#
+# 统计口径（与步骤 9 同款，line2 DEG 教训）：显著性只作参考，重点报效应量与置换 p。
+# 组间比较用样本级指标（top LR 对 score、n_top_pairs、dominated pair 等）KW + 置换。
+# spot 级贴回 lr_score_max：每 spot 作为"受体端"收到的最大 LR 强度（该 spot 所属 domain
+# 为受体域时的单位质量强度，逐 pair 取 max）。
+#
+# 自校验内建：输入契约（步骤 9 键集合 + composition 口径键 + 未做过通讯）、
+# 权重行和=1、score 非负、样本总邻域质量>0（孤立单 spot 域允许对角质量 0）、
+# 与步骤 9 uns 样本记录
+# 对账（domain 数/n_spots）、spot 级贴回完整、X/counts/X_pca/domain/obs/var 不变量、
+# 参考值对账（单样本单 pair 朴素双重循环）。任一不过非零退出。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+mouse_h5ad=""
+human_h5ad=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *mouse*.h5ad) mouse_h5ad="$path" ;;
+    *human*.h5ad) human_h5ad="$path" ;;
+    *.h5ad) echo "无法识别的输入文件: $path（文件名需含 mouse/human 物种标识）" >&2; exit 2 ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 9 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$mouse_h5ad" ] && [ -z "$human_h5ad" ]; then
+  # 单物种数据集（GSE233814 只有小鼠 GPL24247）不再要求两份都提供。
+  # 判据改为「至少一份」：两份都缺才报错；实际提供哪份，下游按文件名分流。
+  echo "缺少必需输入：至少需要一份物种 h5ad（mouse 或 human）" >&2
+  exit 2
+fi
+for path in "$mouse_h5ad" "$human_h5ad"; do
+  [ -n "$path" ] || continue
+  if [ ! -f "$path" ]; then
+    echo "输入文件不存在: $path"
+    exit 2
+  fi
+done
+
+echo "step_executed=spatial_communication"
+echo "bioanalys_seed=${seed}"
+echo "input_mouse=${mouse_h5ad}"
+echo "input_human=${human_h5ad}"
+
+COMM_INPUTS="$mouse_h5ad
+$human_h5ad"
+export COMM_INPUTS
+export COMM_OUTDIR="${COMM_OUTDIR:-$(pwd)}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import sys
+import time
+from itertools import combinations
+from math import comb
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+from scipy.sparse import csr_matrix
+from scipy.spatial import cKDTree
+from scipy.stats import kruskal
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+K_NN = 6                # 像素 KNN 近邻数（与步骤 7/8/9 同一权重定义）
+N_PERM_FALLBACK = 10000  # 非 2 组时的随机置换次数（seed 注入）
+EXACT_LIMIT = 20000      # 精确枚举上限：C(n, n1) 不超过此值才全枚举
+SEED = int(os.environ["BIOANALYS_SEED"])
+ALPHA = 0.05
+
+def fail(message):
+    sys.stderr.write("spatial_communication 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+# 步骤 9 产物键集合（= 步骤 8 键集合 + obs 加 2 列组成 + uns 加 composition）
+REQUIRED_OBS = ["barcode", "sample_id", "gsm", "species", "platform_id", "strain",
+                "condition", "condition_class", "group", "tissue", "in_tissue",
+                "array_row", "array_col", "pxl_row_fullres", "pxl_col_fullres",
+                "ncount", "nfeature", "total_counts", "n_genes_by_counts", "pct_mito",
+                "domain", "domain_same_frac", "domain_same_z",
+                "domain_rank", "domain_prop"]
+REQUIRED_VAR = ["gene_symbol", "genome", "feature_type", "means", "dispersions",
+                "dispersions_norm", "highly_variable", "morans_i_mean", "morans_i_min",
+                "morans_i_max", "morans_z_mean", "gearys_c_mean", "gearys_c_min",
+                "gearys_c_max", "autocorr_n_valid_samples"]
+REQUIRED_UNS = ["coord_note", "dimred", "domains", "gene_id_type", "genome",
+                "grouping_check", "hvg", "image_note", "log1p", "markers",
+                "autocorr", "cooccurrence", "composition", "normalization", "pca",
+                "qc", "samples", "seed", "source_h5ad", "source_soft_human",
+                "source_soft_mouse", "source_tar", "spatial", "species", "warnings"]
+
+
+def build_knn_weights(coords, k):
+    """逐样本像素 KNN 权重（与步骤 7/8/9 同一函数定义：有向邻接 A → 对称化
+    A+A.T 互向权重 2 → 行标准化）。跨样本坐标范围重叠，禁全数据集建树（坑 #114）。"""
+    n = coords.shape[0]
+    tree = cKDTree(coords)
+    _, idx = tree.query(coords, k=k + 1)  # 第一列是自身
+    rows = np.repeat(np.arange(n), k)
+    cols = idx[:, 1:].ravel()
+    w = csr_matrix((np.ones(n * k), (rows, cols)), shape=(n, n))
+    w = w + w.T
+    row_sums = np.asarray(w.sum(axis=1)).ravel()
+    row_sums[row_sums == 0] = 1.0
+    w = csr_matrix(w.multiply(1.0 / row_sums[:, None]))
+    return w
+
+
+def kw_test(values_by_group, group_names):
+    """KW 检验 + eta^2 效应量。全组同值（scipy 报 ValueError）时记 skipped。
+
+    返回值全部为可 h5ad 序列化的标量：缺失数值用 nan、跳过原因为串
+    （uns 里禁 None / list-of-dicts，anndata 写盘会炸，步骤 9 同款修法）。
+    """
+    groups = [np.asarray(v, dtype=float) for v in values_by_group]
+    names = list(group_names)
+    n = int(sum(len(g) for g in groups))
+    k = len(groups)
+    try:
+        res = kruskal(*groups)
+    except ValueError:
+        return {"groups": names, "n": n, "k": k, "h": float("nan"), "p": float("nan"),
+                "eta2": float("nan"), "skipped": "all_values_identical"}
+    h = float(res.statistic)
+    p = float(res.pvalue)
+    eta2 = (h - k + 1) / (n - k) if n > k else float("nan")
+    return {"groups": names, "n": n, "k": k, "h": round(h, 4), "p": p,
+            "eta2": round(float(eta2), 4), "skipped": ""}
+
+
+def pairwise_l1(V):
+    """样本级指标向量的两两 L1 距离矩阵。"""
+    n = V.shape[0]
+    D = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            D[i, j] = D[j, i] = float(np.abs(V[i] - V[j]).sum())
+    return D
+
+
+def between_minus_within(D, labels):
+    """T = 组间平均 L1 - 组内平均 L1。"""
+    n = len(labels)
+    w, b = [], []
+    for i in range(n):
+        for j in range(i + 1, n):
+            (w if labels[i] == labels[j] else b).append(D[i, j])
+    if not w or not b:
+        return float("nan")
+    return float(np.mean(b) - np.mean(w))
+
+
+def permutation_test(V, labels, rng):
+    """组标签置换检验（与步骤 9 同口径）：恰好 2 组且 C(n,n1)<=EXACT_LIMIT 时
+    精确枚举全部分配（无蒙特卡洛误差、与 seed 无关）；否则随机置换。"""
+    labels = list(labels)
+    uniq = sorted(set(labels))
+    n = len(labels)
+    D = pairwise_l1(V)
+    t_obs = between_minus_within(D, labels)
+    if len(uniq) == 2:
+        ga = uniq[0]
+        idx_a = [i for i, g in enumerate(labels) if g == ga]
+        n_a = len(idx_a)
+        total = comb(n, n_a)
+        if total <= EXACT_LIMIT:
+            ge = abs(t_obs)
+            count = 0
+            null = []
+            for choice in combinations(range(n), n_a):
+                cs = set(choice)
+                perm_labels = [ga if i in cs else uniq[1] for i in range(n)]
+                t = between_minus_within(D, perm_labels)
+                null.append(t)
+                if abs(t) >= ge - 1e-12:
+                    count += 1
+            null = np.asarray(null)
+            return {
+                "mode": "exact_enumeration", "n_assignments": int(total),
+                "t_obs": round(t_obs, 6), "p": count / total,
+                "null_mean": round(float(null.mean()), 6),
+                "null_sd": round(float(null.std(ddof=1)), 6) if total > 1 else float("nan"),
+                "note": "2 组精确枚举全部标签分配，无蒙特卡洛误差，结果与 seed 无关",
+            }
+    null = np.empty(N_PERM_FALLBACK)
+    ge = abs(t_obs)
+    count = 0
+    for i in range(N_PERM_FALLBACK):
+        perm = list(labels)
+        rng.shuffle(perm)
+        t = between_minus_within(D, perm)
+        null[i] = t
+        if abs(t) >= ge - 1e-12:
+            count += 1
+    return {
+        "mode": "random_permutation", "n_perm": N_PERM_FALLBACK,
+        "t_obs": round(t_obs, 6), "p": (count + 1) / (N_PERM_FALLBACK + 1),
+        "null_mean": round(float(null.mean()), 6),
+        "null_sd": round(float(null.std(ddof=1)), 6),
+        "note": "seed 注入随机置换（add-one 校正）",
+    }
+
+
+def load_lr_resource():
+    """liana consensus LR 资源（本地已装，离线零新依赖）。"""
+    from liana.resource import select_resource
+    res = select_resource("consensus")
+    pairs = sorted(set(zip(res["ligand"].astype(str).str.upper(),
+                           res["receptor"].astype(str).str.upper())))
+    return pairs
+
+
+LR_PAIRS = load_lr_resource()
+log("liana consensus uniq pairs=%d" % len(LR_PAIRS))
+
+rng = np.random.default_rng(SEED)
+report_sections = []
+
+for path in os.environ["COMM_INPUTS"].splitlines():
+    path = path.strip()
+    if not path:
+        continue
+    species = "mouse" if "mouse" in os.path.basename(path) else "human"
+    adata = ad.read_h5ad(path)
+    log("loaded %s spots=%d genes=%d" % (species, adata.shape[0], adata.shape[1]))
+
+    # --- 1. 输入契约：必须是步骤 9 产物且未做过通讯 ---
+    missing_obs = [col for col in REQUIRED_OBS if col not in adata.obs.columns]
+    if missing_obs:
+        fail("%s 缺少 obs 列 %s（不是 spatial_composition 产物？）" % (path, missing_obs))
+    missing_var = [col for col in REQUIRED_VAR if col not in adata.var.columns]
+    if missing_var:
+        fail("%s 缺少 var 列 %s" % (path, missing_var))
+    missing_uns = [key for key in REQUIRED_UNS if key not in adata.uns]
+    if missing_uns:
+        fail("%s 缺少 uns 键 %s（不是 spatial_composition 产物？）" % (path, missing_uns))
+    if "counts" not in adata.layers:
+        fail("%s 缺少 layers['counts']" % path)
+    for key in ["X_pca", "X_umap", "spatial"]:
+        if key not in adata.obsm:
+            fail("%s 缺少 obsm['%s']" % (path, key))
+    if "communication" in adata.uns:
+        fail("%s 已含通讯结果（重复执行？）" % path)
+    x_nnz_before = adata.X.nnz
+    counts_nnz_before = adata.layers["counts"].nnz
+    pca_before = adata.obsm["X_pca"].copy()
+    domain_before = adata.obs["domain"].copy()
+    comp_samples = adata.uns["composition"]["samples"]
+
+    samples = sorted(adata.obs["sample_id"].unique())
+    log("%s samples=%d" % (species, len(samples)))
+
+    # --- 2. LR 基因映射（大写归一匹配，重复 symbol 取首个索引） ---
+    sym_upper = {}
+    for i, s in enumerate(adata.var["gene_symbol"].astype(str).tolist()):
+        sym_upper.setdefault(s.upper(), i)
+    lig_idx, rec_idx, pair_names = [], [], []
+    unmapped = 0
+    for lig, rec in LR_PAIRS:
+        li = sym_upper.get(lig)
+        ri = sym_upper.get(rec)
+        if li is None or ri is None:
+            unmapped += 1
+            continue
+        lig_idx.append(li)
+        rec_idx.append(ri)
+        pair_names.append((lig, rec))
+    n_pairs = len(pair_names)
+    log("%s LR mapped=%d unmapped=%d" % (species, n_pairs, unmapped))
+    if n_pairs == 0:
+        fail("%s 没有任何 LR 对可映射到基因宇宙" % species)
+
+    X = adata.X.tocsc()
+    L = np.asarray(X[:, lig_idx].toarray(), dtype=float)   # spots x pairs
+    R = np.asarray(X[:, rec_idx].toarray(), dtype=float)   # spots x pairs
+    del X
+
+    dom = adata.obs["domain"].astype(str).to_numpy()
+    doms = sorted(set(dom.tolist()))
+    n_dom = len(doms)
+    dom_code = {d: i for i, d in enumerate(doms)}
+    dcodes = np.array([dom_code[d] for d in dom])
+    dom_masks = [dcodes == k for k in range(n_dom)]
+    sample_arr = adata.obs["sample_id"].astype(str).to_numpy()
+
+    # --- 3. 逐样本 domain-pair LR score（向量化，探针 5 定稿口径） ---
+    t0 = time.time()
+    total = np.zeros((n_pairs, n_dom, n_dom))   # 全物种所有样本累加
+    mass = np.zeros((n_dom, n_dom))             # domain 对邻域质量（权重和）
+    per_sample_norm = {}                        # sample -> 单位质量强度矩阵
+    per_sample_zero_mass = {}                    # sample -> 无自邻域质量的孤立域
+    spot_recv = np.zeros(adata.shape[0], dtype=float)   # spot 作受体端收到的最大强度
+    for sample in samples:
+        sm = sample_arr == sample
+        w = build_knn_weights(np.asarray(adata.obsm["spatial"])[sm], K_NN)
+        # 权重行和 = 1（自校验）
+        row_sums = np.asarray(w.sum(axis=1)).ravel()
+        if not np.allclose(row_sums, 1.0, atol=1e-9):
+            fail("%s %s 权重行和 != 1" % (species, sample))
+        lv = L[sm]
+        rv = R[sm]
+        sub_masks = [np.asarray(m[sm], dtype=float) for m in dom_masks]
+        n_spots_sample = int(sm.sum())
+        rec = comp_samples.get(sample)
+        if rec is None:
+            fail("%s %s 不在步骤 9 uns['composition'] 样本记录中" % (species, sample))
+        if int(rec["n_spots"]) != n_spots_sample:
+            fail("%s %s spot 数 %d 与步骤 9 记录 %d 不一致"
+                 % (species, sample, n_spots_sample, int(rec["n_spots"])))
+        n_dom_sample = len(set(dcodes[sm].tolist()))
+        if int(rec["n_domains"]) != n_dom_sample:
+            # 与步骤 9 记录对账：样本内实际观测到的 domain 数（全物种 n_dom 是并集，
+            # 与样本内域数不可直接比，坑 #120 同源：categorical 并集 vs 样本内观测）
+            fail("%s %s 样本内 domain 数 %d 与步骤 9 记录 %d 不一致"
+                 % (species, sample, n_dom_sample, int(rec["n_domains"])))
+        s_total = np.zeros((n_pairs, n_dom, n_dom))
+        s_mass = np.zeros((n_dom, n_dom))
+        for dj in range(n_dom):
+            m = sub_masks[dj]
+            if not m.any():
+                continue
+            rhs = rv * m[:, None]
+            rec_side = np.asarray((w @ csr_matrix(rhs)).toarray())  # spots x pairs
+            for di in range(n_dom):
+                mi = sub_masks[di]
+                if not mi.any():
+                    continue
+                s_total[:, di, dj] += np.einsum('ip,ip->p', lv * mi[:, None], rec_side)
+                s_mass[di, dj] += float(
+                    mi @ np.asarray((w @ csr_matrix(m[:, None])).toarray()).ravel())
+        if not np.all(s_total >= -1e-12):
+            fail("%s %s score 出现负值（表达值非负时不应发生）" % (species, sample))
+        # doms 是全物种并集：其他样本私有域 mass=0 属正常。样本内孤立单 spot
+        # 域也可能没有自邻域质量，记录并跳过单位化；样本总质量必须为正。
+        local_doms = sorted(set(dcodes[sm].tolist()))
+        zero_mass_diag = [doms[k] for k in local_doms if s_mass[k, k] <= 0]
+        if float(s_mass.sum()) <= 0:
+            fail("%s %s 样本内所有 domain 对邻域质量均为 0" % (species, sample))
+        if zero_mass_diag:
+            log("%s %s WARN 孤立域无自邻域质量: %s"
+                % (species, sample, ",".join(zero_mass_diag)))
+        per_sample_zero_mass[sample] = zero_mass_diag
+        total += s_total
+        mass += s_mass
+        mass_safe = np.where(s_mass > 0, s_mass, 1.0)
+        norm = s_total / mass_safe[None, :, :]
+        per_sample_norm[sample] = norm
+        # spot 级贴回：spot 作受体端收到的强度 = 其所属源域 -> 所在受体域 的
+        # 最大 pair 强度。先按域对收集 best，再一次写入（避免 (di,k) 双重循环
+        # 后写覆盖先写导致拿到的是最后值不是 max；回读对账抓到此点）
+        recv_local = np.zeros(int(sm.sum()), dtype=float)
+        for di in range(n_dom):
+            mi = sub_masks[di]
+            if not mi.any():
+                continue
+            # 该源域 spot 作受体域 k 时收到的强度 = max_p norm[p, di, k]
+            for k in range(n_dom):
+                mk = sub_masks[k]
+                if not mk.any():
+                    continue
+                strength = float(norm[:, di, k].max())
+                recv_local[mk > 0] = np.maximum(recv_local[mk > 0], strength)
+        spot_recv[np.where(sm)[0]] = recv_local
+    elapsed = time.time() - t0
+    log("%s domain-pair score done %.1fs (pairs=%d domains=%d)"
+        % (species, elapsed, n_pairs, n_dom))
+
+    # --- 4. 全物种单位质量强度 + top 交互 ---
+    mass_safe_total = np.where(mass > 0, mass, 1.0)
+    norm_total = total / mass_safe_total[None, :, :]
+    # 非对角（跨域通讯）top 交互
+    off = norm_total.copy()
+    for k in range(n_dom):
+        off[:, k, k] = -np.inf
+    flat = np.argsort(-off.ravel())
+    top_pairs = []
+    seen = set()
+    for fi in flat:
+        pi, dli, dri = np.unravel_index(fi, off.shape)
+        if not np.isfinite(off[pi, dli, dri]):
+            break
+        key = (doms[dli], doms[dri])
+        if key in seen:
+            continue
+        seen.add(key)
+        top_pairs.append({
+            "ligand": pair_names[pi][0], "receptor": pair_names[pi][1],
+            "source_domain": doms[dli], "target_domain": doms[dri],
+            "score": round(float(off[pi, dli, dri]), 4),
+        })
+        if len(top_pairs) >= 10:
+            break
+    log("%s top cross-domain pairs:" % species)
+    for tp in top_pairs[:5]:
+        log("  %s -> %s : %s-%s score=%.3f"
+            % (tp["source_domain"], tp["target_domain"], tp["ligand"],
+               tp["receptor"], tp["score"]))
+
+    # --- 5. 样本级指标 + 组间检验 ---
+    # 样本级指标取每样本单位质量强度的汇总（跨 domain 对 top pair 与总量），
+    # 与样本域数解耦（除以本样本域对数）。domain 身份私有（步骤 9 教训），
+    # 比的是样本通讯强度结构不是逐域身份。
+    sample_rows = []
+    metric_vecs = []
+    for sample in samples:
+        norm = per_sample_norm[sample]
+        rec = comp_samples[sample]
+        n_dom_s = int(rec["n_domains"])
+        flat_s = norm.ravel()
+        top_score = float(flat_s.max()) if flat_s.size else 0.0
+        mean_score = float(norm[np.isfinite(norm)].mean()) if np.isfinite(norm).any() else 0.0
+        n_active = int((norm > 0).sum())
+        row = {
+            "sample_id": sample,
+            "condition": str(adata.obs.loc[sample_arr == sample, "condition"].iloc[0]),
+            "condition_class": str(
+                adata.obs.loc[sample_arr == sample, "condition_class"].iloc[0]),
+            "n_spots": int(rec["n_spots"]),
+            "n_domains": n_dom_s,
+            "n_lr_pairs": int(n_pairs),
+            "lr_top_score": round(top_score, 4),
+            "lr_mean_score": round(mean_score, 4),
+            "lr_n_active": n_active,
+            # 未舍入值随行落盘，供回读对账 KW/scipy 用完全相同的输入
+            # （tsv 舍入值会引入额外 ties，使教科书 tie 校正后 H 与生产不一致，
+            #  那是舍入伪差异不是口径差异）
+            "lr_top_score_raw": top_score,
+            "lr_mean_score_raw": mean_score,
+        }
+        sample_rows.append(row)
+        metric_vecs.append([top_score, mean_score, n_active])
+    V = np.array(metric_vecs, dtype=float)
+    sample_conds = [r["condition"] for r in sample_rows]
+    sample_ccls = [r["condition_class"] for r in sample_rows]
+
+    group_tests = {}
+    for level, label_arr in (("condition_class", sample_ccls), ("condition", sample_conds)):
+        uniq = sorted(set(label_arr))
+        sizes = {g: int(label_arr.count(g)) for g in uniq}
+        if any(sizes[g] < 2 for g in uniq) or len(uniq) < 2:
+            group_tests[level] = {
+                "groups": sizes,
+                "skipped": "有组样本数 < 2（%s），组间检验不可做，如实记录不硬做"
+                           % {g: sizes[g] for g in uniq if sizes[g] < 2},
+            }
+            log("%s 级分组 %s：有组 <2 样本，跳过组间检验" % (level, sizes))
+            continue
+        metric_tests = {}
+        cols = {"lr_top_score": 0, "lr_mean_score": 1, "lr_n_active": 2}
+        for metric, ci in cols.items():
+            metric_tests[metric] = kw_test(
+                [V[[i for i, g in enumerate(label_arr) if g == gu], ci] for gu in uniq],
+                uniq)
+        perm = permutation_test(V, label_arr, rng)
+        group_tests[level] = {
+            "groups": sizes,
+            "skipped": "",
+            "sample_metrics": metric_tests,
+            "permutation": perm,
+        }
+        log("%s 级分组 %s：置换 p=%.4f（%s）"
+            % (level, sizes, perm["p"], perm["mode"]))
+
+    # --- 6. 自校验 ---
+    if not np.all(np.isfinite(spot_recv)):
+        fail("%s spot 级 lr_score_recv 有非有限值" % species)
+    if not np.all(spot_recv >= -1e-9):
+        fail("%s spot 级 lr_score_recv 有负值" % species)
+    if adata.X.nnz != x_nnz_before:
+        fail("%s X nnz 被改变" % species)
+    if adata.layers["counts"].nnz != counts_nnz_before:
+        fail("%s counts 层 nnz 被改变" % species)
+    if not np.array_equal(adata.obsm["X_pca"], pca_before):
+        fail("%s X_pca 被改动" % species)
+    if not adata.obs["domain"].equals(domain_before):
+        fail("%s domain 列被改动" % species)
+    for col in REQUIRED_OBS:
+        if col not in adata.obs.columns:
+            fail("%s obs 列丢失: %s" % (species, col))
+    for col in REQUIRED_VAR:
+        if col not in adata.var.columns:
+            fail("%s var 列丢失: %s" % (species, col))
+
+    # --- 7. 参考值对账：单样本单 pair 朴素双重循环 vs 向量化（坑 #119 纪律） ---
+    chk_sample = samples[0]
+    sm = sample_arr == chk_sample
+    w_chk = build_knn_weights(np.asarray(adata.obsm["spatial"])[sm], K_NN)
+    wd = np.asarray(w_chk.toarray())
+    lv_chk = L[sm]
+    rv_chk = R[sm]
+    dc_chk = dcodes[sm]
+    # 取该样本内有 spot 的前两个域对与第一个有表达的 pair
+    doms_local = [k for k in range(n_dom) if (dc_chk == k).any()]
+    if len(doms_local) >= 1 and n_pairs >= 1:
+        # 选（pair, 源域, 受体域）里 score 最大的组合做对账，保证非零验证
+        # （取 pair0 可能该 pair 在指定域对无表达，naive=vec=0 是空对账）
+        best_key = np.unravel_index(np.argmax(per_sample_norm[chk_sample]),
+                                    per_sample_norm[chk_sample].shape)
+        p0, di, dj = int(best_key[0]), int(best_key[1]), int(best_key[2])
+        naive = 0.0
+        idx_i = np.where(dc_chk == di)[0]
+        idx_j = np.where(dc_chk == dj)[0]
+        for i in idx_i:
+            for j in idx_j:
+                naive += lv_chk[i, p0] * wd[i, j] * rv_chk[j, p0]
+        vec = per_sample_norm[chk_sample]  # 单位质量
+        m_naive = 0.0
+        for i in idx_i:
+            for j in idx_j:
+                m_naive += wd[i, j]
+        vec_raw = vec[p0, di, dj] * m_naive if m_naive > 0 else vec[p0, di, dj] * 1.0
+        if m_naive > 0:
+            if abs(vec_raw - naive) > 1e-6 * max(1.0, abs(naive)):
+                fail("%s 参考值对账 FAIL %s pair%d dom(%d,%d): naive=%.6f vec=%.6f"
+                     % (species, chk_sample, p0, di, dj, naive, vec_raw))
+            log("  参考值对账 OK %s pair%d(%s-%s) dom(%s->%s): naive=%.6f vec=%.6f"
+                % (chk_sample, p0, pair_names[p0][0], pair_names[p0][1],
+                   doms[di], doms[dj], naive, vec_raw))
+
+    # --- 8. 落盘 ---
+    adata.obs["lr_score_recv"] = spot_recv
+    # per-pair 全明细（2213-2418 对 x dom^2）太大不落 uns，只存全物种 top 对明细；
+    # 完整矩阵如需下游可用本脚本口径重算（同 seed 可复现，score 与 seed 无关）。
+    top_uns = {"top%d" % (i + 1): tp for i, tp in enumerate(top_pairs)}
+    adata.uns["communication"] = {
+        "method": "liana_consensus_LR_domain_pair_spatial_score",
+        "note": "LR 资源 liana consensus（离线本地），大写归一匹配（mouse Title case 需归一）；"
+                "逐样本像素 KNN(k=6)（与步骤 7/8/9 同权重定义），score = 配体源域 x 受体靶域"
+                "邻域加权表达乘积，除以 domain 对邻域质量得单位质量强度，消除域规模差异",
+        "alpha": ALPHA,
+        "seed": SEED,
+        "k_nn": int(K_NN),
+        "n_lr_pairs_resource": int(len(LR_PAIRS)),
+        "n_lr_pairs_mapped": int(n_pairs),
+        "n_lr_pairs_unmapped": int(unmapped),
+        "domains": doms,
+        "domain_pair_mass": [[round(float(v), 2) for v in row] for row in mass],
+        "zero_self_mass_domains": per_sample_zero_mass,
+        "top_pairs": top_uns,
+        "group_tests": group_tests,
+        "source_h5ad": path,
+    }
+    h5ad_name = "spatial_communication_%s.h5ad" % species
+    adata.write_h5ad(h5ad_name)
+
+    tsv_name = "sample_communication_%s.tsv" % species
+    tsv_df = pd.DataFrame(sample_rows)
+    tsv_df.to_csv(tsv_name, sep="\t", index=False)
+    log("%s wrote %s (%d spots) + %s (%d 行)"
+        % (species, h5ad_name, adata.shape[0], tsv_name, len(tsv_df)))
+
+    cc = group_tests.get("condition_class", {})
+    lines = [
+        "[%s]" % species,
+        "spots=%d genes=%d samples=%d" % (adata.shape[0], adata.shape[1], len(samples)),
+        "lr_pairs_mapped=%d unmapped=%d" % (n_pairs, unmapped),
+        "seconds=%.1f" % elapsed,
+        "grouping=condition_class %s / condition %s"
+        % (cc.get("groups"), group_tests.get("condition", {}).get("groups")),
+        "top_cross_domain_pairs:",
+    ]
+    for tp in top_pairs:
+        lines.append("  %s -> %s : %s-%s score=%.4f"
+                     % (tp["source_domain"], tp["target_domain"], tp["ligand"],
+                        tp["receptor"], tp["score"]))
+    for level in ("condition_class", "condition"):
+        gt = group_tests.get(level, {})
+        if gt.get("skipped"):
+            lines.append("%s_skipped=%s" % (level, gt["skipped"]))
+            continue
+        perm = gt["permutation"]
+        lines.append("%s_groups=%s" % (level, gt["groups"]))
+        lines.append("%s_permutation mode=%s p=%.4f t_obs=%.4f null_mean=%.4f"
+                     % (level, perm["mode"], perm["p"], perm["t_obs"], perm["null_mean"]))
+        for m, res in gt["sample_metrics"].items():
+            if np.isnan(res["p"]):
+                lines.append("  metric %s KW skipped(%s)" % (m, res["skipped"]))
+            else:
+                lines.append("  metric %-18s KW H=%.3f p=%.4f eta2=%.3f"
+                             % (m, res["h"], res["p"], res["eta2"]))
+    lines.append("small_sample_note=显著性只作参考，重点看效应量与置换 p；"
+                 "mouse condition 级 SD 单样本、human 小样本设计属性同步骤 9")
+    report_sections.append("\n".join(lines))
+
+report_lines = [
+    "step=spatial_communication",
+    "seed=%d" % SEED,
+    "method=liana consensus LR 资源 + 逐样本像素 KNN(k=6) domain 对单位质量 LR 强度；"
+    "组间样本级指标 KW + eta2 + L1 置换检验",
+    "domain_identity_note=domain 身份样本私有，score 逐样本在本样本邻域权重内计算，"
+    "组间比样本通讯强度结构不逐域身份",
+    "lr_matching_note=大写归一匹配（liana 资源人类命名，mouse symbol Title case），重复 symbol 取首个索引",
+    "outputs=spatial_communication_mouse.h5ad, spatial_communication_human.h5ad, "
+    "sample_communication_mouse.tsv, sample_communication_human.tsv, communication_report.txt",
+] + report_sections + [
+    "elapsed_seconds=%.0f" % (time.time() - START),
+]
+with open("communication_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'communication_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('communication_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("spatial_communication_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "${COMM_OUTDIR:-$(pwd)}" "communication_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

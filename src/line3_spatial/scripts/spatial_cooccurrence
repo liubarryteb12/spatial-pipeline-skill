@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+# spatial_cooccurrence：line3_spatial 步骤 8 空间邻域共现 / 邻域富集。
+#
+# 输入：步骤 7 产物 spatial_autocorr_mouse.h5ad / spatial_autocorr_human.h5ad
+#       （obs 带 domain 列，X 归一化 log 值，layers['counts'] 原始计数）。
+#
+# 做法：逐物种、逐样本在像素坐标上建 KNN(k=6) 空间权重（与步骤 7 同构：
+# cKDTree -> 对称化 w+w.T -> 行标准化），对 domain 标签算共现矩阵
+# C[di,dj] = onehot_di^T W onehot_dj，并做 100 次标签置换（seed 注入，
+# 保持几何权重只打乱标签）得每 domain 的同域富集 z（squidpy
+# gr.nhood_enrichment 同思路，零新依赖自实现）。
+#
+# 口径定稿依据（服务器探针实测，2026-10-13）：
+#   - 计时：one-hot 稀疏乘 + 100 次置换 mouse 全 10 样本 0.6s / human 0.3s；
+#   - 共现矩阵对角占优：所有样本所有 domain 同域邻域富集 z 全为正
+#     （min 2.89 / mean 14-48），与步骤 5 Leiden 空间域的空间连贯性自洽；
+#   - 同域邻居比例 same_frac 0.09-0.90：JBO006 有碎片域 0.089（与步骤 5
+#     碎片域记录一致），JBO014 等连贯样本 0.64-0.90。
+#
+# 自校验内建：输入契约（步骤 7 产物键集合 + autocorr 口径键 + 未做过共现）、
+# 每样本类型数 = 样本内 domain 数、共现行和 > 0、same_frac 在 [0,1]、
+# 同域富集 z 整体显著为正；允许少量近零置换噪声，但负值比例与最小值设硬界、
+# X nnz 不变、counts 层 nnz 不变、X_pca 不被改动、domain 列不被改动、
+# obs/var 列不丢。任一不过非零退出。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：两个 h5ad（步骤 7 产物，小鼠 / 人源）。模式前后都带 *：拿到的是绝对路径，
+# 前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+mouse_h5ad=""
+human_h5ad=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *mouse*.h5ad) mouse_h5ad="$path" ;;
+    *human*.h5ad) human_h5ad="$path" ;;
+    *.h5ad) echo "无法识别的输入文件: $path（文件名需含 mouse/human 物种标识）" >&2; exit 2 ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 7 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$mouse_h5ad" ] && [ -z "$human_h5ad" ]; then
+  # 单物种数据集（GSE233814 只有小鼠 GPL24247）不再要求两份都提供。
+  # 判据改为「至少一份」：两份都缺才报错；实际提供哪份，下游按文件名分流。
+  echo "缺少必需输入：至少需要一份物种 h5ad（mouse 或 human）" >&2
+  exit 2
+fi
+for path in "$mouse_h5ad" "$human_h5ad"; do
+  [ -n "$path" ] || continue
+  if [ ! -f "$path" ]; then
+    echo "输入文件不存在: $path" >&2
+    exit 2
+  fi
+done
+
+echo "step_executed=spatial_cooccurrence"
+echo "bioanalys_seed=${seed}"
+echo "input_mouse=${mouse_h5ad}"
+echo "input_human=${human_h5ad}"
+
+COOCCUR_INPUTS="$mouse_h5ad
+$human_h5ad"
+export COOCCUR_INPUTS
+export COOCCUR_OUTDIR="${COOCCUR_OUTDIR:-$(pwd)}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+from scipy.sparse import csr_matrix
+from scipy.spatial import cKDTree
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+K_NN = 6            # 像素 KNN 近邻数（与步骤 7 同构）
+N_PERM = 100        # 标签置换次数（z 估计）
+SEED = int(os.environ["BIOANALYS_SEED"])
+
+
+def fail(message):
+    sys.stderr.write("spatial_cooccurrence 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def build_knn_weights(coords, k):
+    """逐样本像素 KNN 权重：有向邻接 A -> 对称化 A+A.T（互向近邻权重为 2，
+    与步骤 7 spatial_autocorr 同一权重定义，跨步骤可比）-> 行标准化。
+    跨样本坐标范围重叠，禁在全数据集上建树（坑 #114）。"""
+    n = coords.shape[0]
+    tree = cKDTree(coords)
+    _, idx = tree.query(coords, k=k + 1)  # 第一列是自身
+    rows = np.repeat(np.arange(n), k)
+    cols = idx[:, 1:].ravel()
+    w = csr_matrix((np.ones(n * k), (rows, cols)), shape=(n, n))
+    w = w + w.T
+    row_sums = np.asarray(w.sum(axis=1)).ravel()
+    row_sums[row_sums == 0] = 1.0
+    w = csr_matrix(w.multiply(1.0 / row_sums[:, None]))
+    return w
+
+
+def cooccurrence(w, labels, n_types):
+    """domain 共现矩阵：C[di,dj] = onehot_di^T W onehot_dj（稀疏批量乘）。"""
+    oh = csr_matrix((np.ones(len(labels)), (np.arange(len(labels)), labels)),
+                    shape=(len(labels), n_types))
+    return (oh.T @ w @ oh).toarray()
+
+
+def enrichment_z(w, labels, n_types, n_perm, rng):
+    """squidpy nhood_enrichment 同思路：共现矩阵对标签置换零模型的 z。
+    置换保持几何权重不变、只打乱 domain 标签。"""
+    c_obs = cooccurrence(w, labels, n_types)
+    perm_stack = np.empty((n_perm, n_types, n_types))
+    for p in range(n_perm):
+        perm_stack[p] = cooccurrence(w, rng.permutation(labels), n_types)
+    mu = perm_stack.mean(axis=0)
+    sd = perm_stack.std(axis=0, ddof=1)
+    sd[sd == 0] = 1.0
+    return c_obs, (c_obs - mu) / sd
+
+
+# 步骤 7 产物键集合（= 步骤 6 键集合 + var 加 8 列自相关 + uns 加 autocorr）
+REQUIRED_OBS = ["barcode", "sample_id", "gsm", "species", "platform_id", "strain",
+                "condition", "condition_class", "group", "tissue", "in_tissue",
+                "array_row", "array_col", "pxl_row_fullres", "pxl_col_fullres",
+                "ncount", "nfeature", "total_counts", "n_genes_by_counts", "pct_mito",
+                "domain"]
+REQUIRED_VAR = ["gene_symbol", "genome", "feature_type", "means", "dispersions",
+                "dispersions_norm", "highly_variable", "morans_i_mean", "morans_i_min",
+                "morans_i_max", "morans_z_mean", "gearys_c_mean", "gearys_c_min",
+                "gearys_c_max", "autocorr_n_valid_samples"]
+REQUIRED_UNS = ["coord_note", "dimred", "domains", "gene_id_type", "genome",
+                "grouping_check", "hvg", "image_note", "log1p", "markers",
+                "autocorr", "normalization", "pca", "qc", "samples", "seed",
+                "source_h5ad", "source_soft_human", "source_soft_mouse",
+                "source_tar", "spatial", "species", "warnings"]
+
+report_sections = []
+rng = np.random.default_rng(SEED)
+
+for path in os.environ["COOCCUR_INPUTS"].splitlines():
+    path = path.strip()
+    if not path:
+        continue
+    species = "mouse" if "mouse" in os.path.basename(path) else "human"
+    adata = ad.read_h5ad(path)
+    log("loaded %s spots=%d genes=%d" % (species, adata.shape[0], adata.shape[1]))
+
+    # --- 1. 输入契约：必须是步骤 7 产物且未做过共现 ---
+    missing_obs = [col for col in REQUIRED_OBS if col not in adata.obs.columns]
+    if missing_obs:
+        fail("%s 缺少 obs 列 %s（不是 spatial_autocorr 产物？）" % (path, missing_obs))
+    missing_var = [col for col in REQUIRED_VAR if col not in adata.var.columns]
+    if missing_var:
+        fail("%s 缺少 var 列 %s" % (path, missing_var))
+    missing_uns = [key for key in REQUIRED_UNS if key not in adata.uns]
+    if missing_uns:
+        fail("%s 缺少 uns 键 %s（不是 spatial_autocorr 产物？）" % (path, missing_uns))
+    if "counts" not in adata.layers:
+        fail("%s 缺少 layers['counts']" % path)
+    for key in ["X_pca", "X_umap", "spatial"]:
+        if key not in adata.obsm:
+            fail("%s 缺少 obsm['%s']" % (path, key))
+    if "cooccurrence" in adata.uns:
+        fail("%s 已含共现结果（重复执行？）" % path)
+    x_nnz_before = adata.X.nnz
+    counts_nnz_before = adata.layers["counts"].nnz
+    pca_before = adata.obsm["X_pca"].copy()
+    domain_before = adata.obs["domain"].copy()
+    obs_cols_before = list(adata.obs.columns)
+    var_cols_before = list(adata.var.columns)
+
+    samples = sorted(adata.obs["sample_id"].unique())
+    log("%s samples=%d" % (species, len(samples)))
+
+    # --- 2. 逐样本共现矩阵 + 置换 z ---
+    t0 = time.time()
+    spot_same_frac = np.full(adata.shape[0], np.nan)
+    spot_same_z = np.full(adata.shape[0], np.nan)
+    domain_rows = []
+    uns_samples = {}
+    for sample in samples:
+        mask = (adata.obs["sample_id"] == sample).to_numpy()
+        sub = adata[mask]
+        dom = sub.obs["domain"].astype("category")
+        labels = dom.cat.codes.to_numpy()
+        cats = list(dom.cat.categories)
+        n_types = len(cats)
+        if n_types != sub.obs["domain"].nunique():
+            fail("%s %s 类型数与 domain 数不一致" % (species, sample))
+        w = build_knn_weights(np.asarray(sub.obsm["spatial"]), K_NN)
+        c_obs, z = enrichment_z(w, labels, n_types, N_PERM, rng)
+        row = c_obs.sum(axis=1)
+        if not np.all(row > 0):
+            fail("%s %s 有类型共现行和为 0（该类型无 spot？）" % (species, sample))
+        c_norm = c_obs / row[:, None]
+        same_frac = np.diag(c_norm)
+        same_z = np.diag(z)
+        # spot 级贴回
+        spot_same_frac[mask] = same_frac[labels]
+        spot_same_z[mask] = same_z[labels]
+        # per-domain 明细：同域比例 / z / top 互作域（按归一化共现非对角最大）
+        for di in range(n_types):
+            partner = np.argsort(-c_norm[di])
+            partner = [dj for dj in partner if dj != di]
+            top_p = partner[0] if partner else di
+            domain_rows.append({
+                "sample_id": sample, "domain": cats[di],
+                "n_spots": int((labels == di).sum()),
+                "same_frac": round(float(same_frac[di]), 4),
+                "same_z": round(float(same_z[di]), 2),
+                "top_partner_domain": cats[top_p],
+                "top_partner_frac": round(float(c_norm[di][top_p]), 4),
+            })
+        uns_samples[sample] = {
+            "n_spots": int(w.shape[0]),
+            "domains": cats,
+            "cooccurrence_norm": [[round(float(v), 4) for v in rowv] for rowv in c_norm],
+            "enrichment_z": [[round(float(v), 2) for v in rowv] for rowv in z],
+        }
+        log("  %s n=%d types=%d same_z mean=%.2f min=%.2f"
+            % (sample, w.shape[0], n_types, same_z.mean(), same_z.min()))
+    elapsed = time.time() - t0
+    log("cooccurrence done %.1fs" % elapsed)
+
+    # --- 3. 自校验 ---
+    if not np.all((spot_same_frac >= -1e-9) & (spot_same_frac <= 1.0 + 1e-9)):
+        fail("%s same_frac 超出 [0,1]（min %.4f max %.4f）"
+             % (species, float(np.nanmin(spot_same_frac)), float(np.nanmax(spot_same_frac))))
+    z_vals = np.array([row["same_z"] for row in domain_rows])
+    if not np.all(np.isfinite(z_vals)):
+        fail("%s 同域富集 z 含非有限值" % species)
+    neg_frac = float((z_vals <= 0).mean())
+    if (float(z_vals.max()) <= 0 or float(np.median(z_vals)) <= 0
+            or neg_frac > 0.20 or float(z_vals.min()) < -3.0):
+        fail("%s 同域富集整体失效（min %.2f median %.2f neg_frac %.3f）"
+             % (species, float(z_vals.min()), float(np.median(z_vals)), neg_frac))
+    if neg_frac > 0:
+        log("%s WARN same_z 少量非正: %d/%d, min=%.2f"
+            % (species, int((z_vals <= 0).sum()), len(z_vals), float(z_vals.min())))
+    if adata.X.nnz != x_nnz_before:
+        fail("%s X nnz 被改变" % species)
+    if adata.layers["counts"].nnz != counts_nnz_before:
+        fail("%s counts 层 nnz 被改变" % species)
+    if not np.array_equal(adata.obsm["X_pca"], pca_before):
+        fail("%s X_pca 被改动" % species)
+    if not adata.obs["domain"].equals(domain_before):
+        fail("%s domain 列被改动" % species)
+    for col in REQUIRED_OBS:
+        if col not in adata.obs.columns:
+            fail("%s obs 列丢失: %s" % (species, col))
+    for col in REQUIRED_VAR:
+        if col not in adata.var.columns:
+            fail("%s var 列丢失: %s" % (species, col))
+
+    # --- 4. 落盘 ---
+    adata.obs["domain_same_frac"] = spot_same_frac
+    adata.obs["domain_same_z"] = spot_same_z
+    adata.uns["cooccurrence"] = {
+        "method": "per_sample_pixel_knn_domain_cooccurrence_label_permutation_z",
+        "knn": K_NN,
+        "symmetrized": True,
+        "row_standardized": True,
+        "n_perm": N_PERM,
+        "seed": SEED,
+        "samples_total": len(samples),
+        "samples": uns_samples,
+        "source_h5ad": path,
+    }
+    h5ad_name = "spatial_cooccurrence_%s.h5ad" % species
+    adata.write_h5ad(h5ad_name)
+
+    tsv_name = "domain_cooccurrence_%s.tsv" % species
+    tsv_df = pd.DataFrame(domain_rows)
+    tsv_df.to_csv(tsv_name, sep="\t", index=False)
+    log("%s wrote %s (%d 行) + %s (%d 行)"
+        % (species, h5ad_name, adata.shape[0], tsv_name, len(tsv_df)))
+
+    report_sections.append("\n".join(
+        ["[%s]" % species,
+         "spots=%d genes=%d samples=%d" % (adata.shape[0], adata.shape[1], len(samples)),
+         "seconds=%.1f n_perm=%d" % (elapsed, N_PERM),
+         "same_frac_mean=%.4f same_z_mean=%.2f same_z_min=%.2f same_z_max=%.2f neg_frac=%.3f"
+         % (float(np.nanmean(spot_same_frac)), float(z_vals.mean()),
+            float(z_vals.min()), float(z_vals.max()), neg_frac),
+         "top_partner_examples=%s"
+         % " ".join("%s->%s(%.2f)" % (r["domain"], r["top_partner_domain"], r["top_partner_frac"])
+                    for r in domain_rows[:5])]
+    ))
+
+report_lines = [
+    "step=spatial_cooccurrence",
+    "seed=%d" % SEED,
+    "method=逐样本像素 KNN(k=%d，对称化+行标准化) domain 共现矩阵 + %d 次标签置换 z（squidpy nhood_enrichment 同思路）"
+    % (K_NN, N_PERM),
+    "same_frac_note=同域邻居比例（共现矩阵行内归一化对角）；same_z 对标签置换零模型的富集 z",
+    "outputs=spatial_cooccurrence_mouse.h5ad, spatial_cooccurrence_human.h5ad, "
+    "domain_cooccurrence_mouse.tsv, domain_cooccurrence_human.tsv, cooccurrence_report.txt",
+] + report_sections + [
+    "elapsed_seconds=%.0f" % (time.time() - START),
+]
+with open("cooccurrence_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'cooccurrence_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('cooccurrence_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("spatial_cooccurrence_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "${COOCCUR_OUTDIR:-$(pwd)}" "cooccurrence_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

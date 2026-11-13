@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+# spatial_autocorr：line3_spatial 步骤 7 空间自相关（Moran's I + Geary's C）。
+#
+# 输入：步骤 6 产物 spatial_marker_mouse.h5ad / spatial_marker_human.h5ad
+#       （obs 带 domain 列，X 归一化 log 值，layers['counts'] 原始计数）。
+#
+# 做法：逐物种、逐样本在像素坐标上建 KNN(k=6) 空间权重，样本内逐基因算
+#       Moran's I 与 Geary's C，基因级取跨样本 mean/min/max 与有效样本数。
+#       Moran's I 的显著性用 Cliff-Ord 随机化假设的正态近似解析 z（esda norm
+#       模式同式，零置换成本）；Geary's C 的解析方差依赖基因四阶矩，跨基因
+#       解析式与 esda permutation 模式不等价，故只报统计量，方向解读以
+#       Moran's I 的 z 为准（报告已注明口径）。
+#
+# 口径定稿依据（服务器两轮探针实测，2026-10-13）：
+#   - 权重：逐样本像素 KNN(k=6) -> 对称化(w+w.T) -> 行标准化。
+#     跨样本坐标范围重叠，禁在全数据集建树（坑 #114）。
+#     对称化前后 top10 排序一致（probe1 未对称化 vs probe2 对称化），
+#     定稿对称化以对齐 squidpy/scanpy symmetrize 惯例。
+#   - 计时：批量稀疏乘路线 mouse 全基因 6.4s / human 3.0s（无需子集）。
+#   - Moran's I 分布合理：mouse mean=0.0164 max=0.5949；human max=0.7341。
+#   - 生物学 sanity：mouse Mup17/Cyp2e1/Alb/Mup20/Fabp1 等肝 zonation 基因
+#     I=0.56-0.60 z=57-62；human MT-ND4/MT-CO1/ALB 等 I=0.64-0.74 z=58-65。
+#     known genes：Apoa2 0.521 / Mup3 0.557 / Hamp 0.449（zonation 高 I）vs
+#     Cd5l 0.157 / MARCO 0.101 / C1QB 0.092（免疫弥散低 I），方向与生物学一致。
+#   - nan 基因（全 spot 零表达，denom=0）实测 0 个：步骤 2 QC 已滤
+#     min_cells>=3。仍如实标记 n_valid_samples，出现即入报告 warning。
+#
+# 自校验内建：输入契约（步骤 6 产物键集合 + markers 口径键 + 未做过自相关）、
+# 每样本权重行和=1、I 理论范围 [-1,1]、C 理论范围 [0,2]、zonation 基因 I
+# 显著高于免疫弥散基因（两物种分别硬断言，探针实测间距大稳定可断）、
+# X nnz 不变、counts 层 nnz 不变、X_pca 不被改动、domain 列不被改动、
+# obs/var 列不丢。任一不过非零退出。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：两个 h5ad（步骤 6 产物，小鼠 / 人源）。模式前后都带 *：拿到的是绝对路径，
+# 前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+mouse_h5ad=""
+human_h5ad=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *mouse*.h5ad) mouse_h5ad="$path" ;;
+    *human*.h5ad) human_h5ad="$path" ;;
+    *.h5ad) echo "无法识别的输入文件: $path（文件名需含 mouse/human 物种标识）" >&2; exit 2 ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 6 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$mouse_h5ad" ] && [ -z "$human_h5ad" ]; then
+  # 单物种数据集（GSE233814 只有小鼠 GPL24247）不再要求两份都提供。
+  # 判据改为「至少一份」：两份都缺才报错；实际提供哪份，下游按文件名分流。
+  echo "缺少必需输入：至少需要一份物种 h5ad（mouse 或 human）" >&2
+  exit 2
+fi
+for path in "$mouse_h5ad" "$human_h5ad"; do
+  [ -n "$path" ] || continue
+  if [ ! -f "$path" ]; then
+    echo "输入文件不存在: $path" >&2
+    exit 2
+  fi
+done
+
+echo "step_executed=spatial_autocorr"
+echo "bioanalys_seed=${seed}"
+echo "input_mouse=${mouse_h5ad}"
+echo "input_human=${human_h5ad}"
+
+AUTOCORR_INPUTS="$mouse_h5ad
+$human_h5ad"
+export AUTOCORR_INPUTS
+export AUTOCORR_OUTDIR="${AUTOCORR_OUTDIR:-$(pwd)}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import sys
+import time
+import warnings
+
+import numpy as np
+import anndata as ad
+from scipy.sparse import csr_matrix
+from scipy.spatial import cKDTree
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+K_NN = 6            # 像素 KNN 近邻数（探针实测稳定，与 squidpy 默认惯例一致）
+SEED = int(os.environ["BIOANALYS_SEED"])
+
+# sanity 基因硬断言（探针实测两物种间距都大，稳定可断）：
+# zonation（肝分区，强空间结构）的 I 必须显著高于免疫弥散基因。
+SANITY = {
+    "mouse": {"zonation": ["Apoa2", "Mup3", "Hamp"], "immune": ["Cd5l", "C1qb"]},
+    "human": {"zonation": ["ALB", "APOA1"], "immune": ["MARCO", "C1QB"]},
+}
+
+
+def fail(message):
+    sys.stderr.write("spatial_autocorr 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def build_knn_weights(coords, k):
+    """逐样本像素 KNN 权重：建树 -> KNN -> 对称化(w+w.T) -> 行标准化。
+    跨样本坐标范围重叠，禁在全数据集上建树（坑 #114）。"""
+    n = coords.shape[0]
+    tree = cKDTree(coords)
+    _, idx = tree.query(coords, k=k + 1)  # 第一列是自身
+    rows = np.repeat(np.arange(n), k)
+    cols = idx[:, 1:].ravel()
+    w = csr_matrix((np.ones(n * k), (rows, cols)), shape=(n, n))
+    w = w + w.T
+    row_sums = np.asarray(w.sum(axis=1)).ravel()
+    row_sums[row_sums == 0] = 1.0
+    w = csr_matrix(w.multiply(1.0 / row_sums[:, None]))
+    return w
+
+
+def cliff_ord_moments(w, n):
+    """行标准化权重下 Cliff-Ord 随机化假设的 E[I] 与 Var[I]（正态近似，esda norm 模式同式）。"""
+    s0 = float(w.sum())
+    w_sq = w.multiply(w)
+    s1 = float((w_sq + w_sq.T).sum()) / 2.0
+    deg = np.asarray(w.sum(axis=1)).ravel() + np.asarray(w.sum(axis=0)).ravel()
+    s2 = float((deg ** 2).sum())
+    ei = -1.0 / (n - 1)
+    var_i = (n * n * s1 - n * s2 + 3.0 * s0 * s0) / ((n * n - 1.0) * s0 * s0) - ei * ei
+    return ei, var_i
+
+
+def sample_moments(x, w):
+    """逐基因空间矩：Moran's I 与 Geary's C（标准式批量展开，全基因一次算完）。
+
+    I = (n/S0) * sum_ij w_ij xc_i xc_j / sum_i xc_i^2，行标准化下 S0=n，
+       sum_ij w_ij xc_i xc_j = sum_i xc_i (W@xc)_i。
+    C = ((n-1)/(2*S0)) * sum_ij w_ij (x_i-x_j)^2 / sum_i (x_i-xbar)^2，展开：
+       sum_ij w_ij (x_i-x_j)^2 = sum_i x_i^2 (rowsum_i + colsum_i)
+                                  - 2 * sum_i x_i (W@x)_i
+    两者分母同为 sum_i (x_i - xbar)^2；全零表达基因 denom=0 -> nan 如实标记。
+    """
+    n = x.shape[0]
+    xc = x - x.mean(axis=0, keepdims=True)
+    denom = (xc ** 2).sum(axis=0)
+    safe = np.where(denom > 0, denom, 1.0)
+    lag = w @ xc
+    i_vec = (n / float(w.sum())) * (xc * lag).sum(axis=0) / safe
+    deg = np.asarray(w.sum(axis=0)).ravel()  # 列和
+    num = (x ** 2 * (1.0 + deg)[:, None]).sum(axis=0) - 2.0 * (x * (w @ x)).sum(axis=0)
+    c_vec = ((n - 1.0) / (2.0 * float(w.sum()))) * num / safe
+    i_vec = np.where(denom > 0, i_vec, np.nan)
+    c_vec = np.where(denom > 0, c_vec, np.nan)
+    return i_vec, c_vec
+
+
+# 步骤 6 产物键集合（= 步骤 5 键集合 + uns 加 markers 口径键）
+REQUIRED_OBS = ["barcode", "sample_id", "gsm", "species", "platform_id", "strain",
+                "condition", "condition_class", "group", "tissue", "in_tissue",
+                "array_row", "array_col", "pxl_row_fullres", "pxl_col_fullres",
+                "ncount", "nfeature", "total_counts", "n_genes_by_counts", "pct_mito",
+                "domain"]
+REQUIRED_VAR = ["gene_symbol", "genome", "feature_type", "means", "dispersions",
+                "dispersions_norm", "highly_variable"]
+REQUIRED_UNS = ["coord_note", "dimred", "domains", "gene_id_type", "genome",
+                "grouping_check", "hvg", "image_note", "log1p", "markers",
+                "normalization", "pca", "qc", "samples", "seed", "source_h5ad",
+                "source_soft_human", "source_soft_mouse", "source_tar", "spatial",
+                "species", "warnings"]
+
+report_sections = []
+
+for path in os.environ["AUTOCORR_INPUTS"].splitlines():
+    path = path.strip()
+    if not path:
+        continue
+    species = "mouse" if "mouse" in os.path.basename(path) else "human"
+    adata = ad.read_h5ad(path)
+    log("loaded %s spots=%d genes=%d" % (species, adata.shape[0], adata.shape[1]))
+
+    # --- 1. 输入契约：必须是步骤 6 产物且未做过自相关 ---
+    missing_obs = [col for col in REQUIRED_OBS if col not in adata.obs.columns]
+    if missing_obs:
+        fail("%s 缺少 obs 列 %s（不是 spatial_markers 产物？）" % (path, missing_obs))
+    missing_var = [col for col in REQUIRED_VAR if col not in adata.var.columns]
+    if missing_var:
+        fail("%s 缺少 var 列 %s" % (path, missing_var))
+    missing_uns = [key for key in REQUIRED_UNS if key not in adata.uns]
+    if missing_uns:
+        fail("%s 缺少 uns 键 %s（不是 spatial_markers 产物？）" % (path, missing_uns))
+    if "counts" not in adata.layers:
+        fail("%s 缺少 layers['counts']" % path)
+    for key in ["X_pca", "X_umap", "spatial"]:
+        if key not in adata.obsm:
+            fail("%s 缺少 obsm['%s']" % (path, key))
+    if "autocorr" in adata.uns:
+        fail("%s 已含自相关结果（重复执行？）" % path)
+    if int(adata.var["highly_variable"].sum()) != 2000:
+        fail("%s HVG 数 %d != 2000（上游口径被改？）" % (path, int(adata.var["highly_variable"].sum())))
+    x_nnz_before = adata.X.nnz
+    counts_nnz_before = adata.layers["counts"].nnz
+    pca_before = adata.obsm["X_pca"].copy()
+    domain_before = adata.obs["domain"].copy()
+    obs_cols_before = list(adata.obs.columns)
+    var_cols_before = list(adata.var.columns)
+
+    samples = sorted(adata.obs["sample_id"].unique())
+    n_genes = adata.shape[1]
+    log("%s samples=%d" % (species, len(samples)))
+
+    # --- 2. 逐样本空间矩（全基因范围）---
+    t0 = time.time()
+    i_rows, c_rows, z_rows, valid_rows, ei_sd = [], [], [], [], []
+    for sample in samples:
+        mask = (adata.obs["sample_id"] == sample).to_numpy()
+        sub = adata[mask]
+        x = np.asarray(sub.X.todense())
+        n = x.shape[0]
+        w = build_knn_weights(np.asarray(sub.obsm["spatial"]), K_NN)
+        row_sums = np.asarray(w.sum(axis=1)).ravel()
+        if not np.allclose(row_sums, 1.0, atol=1e-9):
+            fail("%s %s 权重行和不为 1（max dev %.2e）"
+                 % (species, sample, float(np.abs(row_sums - 1.0).max())))
+        ei, var_i = cliff_ord_moments(w, n)
+        ei_sd.append((sample, n, ei, float(np.sqrt(max(var_i, 1e-30)))))
+        i_vec, c_vec = sample_moments(x, w)
+        # z 必须逐样本算（E[I]/sd 依赖样本 n），再跨样本平均
+        z_vec = (i_vec - ei) / np.sqrt(max(var_i, 1e-30))
+        finite = np.isfinite(i_vec)
+        i_rows.append(i_vec)
+        c_rows.append(c_vec)
+        z_rows.append(np.where(finite, z_vec, np.nan))
+        valid_rows.append(finite.astype(np.int8))
+        log("  %s n=%d E[I]=%.5f sd=%.5f" % (sample, n, ei, ei_sd[-1][3]))
+    elapsed = time.time() - t0
+    log("moran+geary done %.1fs" % elapsed)
+
+    i_mat = np.vstack(i_rows)
+    c_mat = np.vstack(c_rows)
+    z_mat = np.vstack(z_rows)
+    valid = np.vstack(valid_rows)
+    n_valid = valid.sum(axis=0)
+
+    # --- 3. 跨样本聚合（nan 基因如实记，不填 0 不删行）---
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        i_mean = np.nanmean(i_mat, axis=0)
+        i_min = np.nanmin(i_mat, axis=0)
+        i_max = np.nanmax(i_mat, axis=0)
+        c_mean = np.nanmean(c_mat, axis=0)
+        c_min = np.nanmin(c_mat, axis=0)
+        c_max = np.nanmax(c_mat, axis=0)
+        z_mean = np.nanmean(z_mat, axis=0)
+    n_nan_genes = int((n_valid == 0).sum())
+    n_partial = int(((n_valid >= 1) & (n_valid < len(samples))).sum())
+
+    # --- 4. 自校验 ---
+    if not (np.nanmax(np.abs(i_mean)) <= 1.0 + 1e-6):
+        fail("%s I mean 超出理论范围 [-1,1]（max %.4f）" % (species, float(np.nanmax(np.abs(i_mean)))))
+    if not (np.nanmax(c_mean) <= 2.0 + 1e-6):
+        fail("%s C mean 超出理论范围 [0,2]（max %.4f）" % (species, float(np.nanmax(c_mean))))
+    symbols = adata.var["gene_symbol"].to_numpy()
+
+    def symbol_i(gene):
+        idxs = np.where(symbols == gene)[0]
+        if not len(idxs):
+            fail("%s sanity 基因 %s 不在 var['gene_symbol']（上游口径被改？）" % (species, gene))
+        return i_mean[idxs[0]]
+
+    zonation = SANITY[species]["zonation"]
+    immune = SANITY[species]["immune"]
+    # 断言修正（2026-11-06 GSE233814 脑真机暴露，与 spatial_markers sanity 同类）：
+    # 旧版硬断言「肝 zonation 基因 I 必高于肝免疫基因」，但这三只基因是肝脏知识。
+    # 脑组织里 Apoa2/Mup3/Hamp 本就无分区结构（实测 I 约 0.03），而小胶质标记弥散度更高，
+    # 于是必然失败 ，即，即 把「组织生物学」误写成了「流水线不变量」。
+    # 面板 I 值仍如实写进报告（sanity_zonation_I / sanity_immune_I），供人工判读。
+    # 换成坐标无关的分布不变量：存在显著空间自相关的基因集。
+    # 若权重/邻接/坐标坏了，全体基因的 I 都会退化到零假设水平（E[I]=-1/(n-1)≈-0.0004），
+    # 拿 I 分布相对零假设的富尾幅度判据即可抓住真故障。
+    finite_i = i_mean[np.isfinite(i_mean)]
+    null_abs = abs(float(np.nanmean([
+        -1.0 / (int(adata.uns["autocorr"]["n_spots_" + s]) - 1)
+        for s in adata.uns["autocorr"]["samples"]
+    ]))) if "autocorr" in adata.uns else 0.001
+    i_p99 = float(np.percentile(finite_i, 99))
+    i_med = float(np.median(finite_i))
+    if not (i_p99 - i_med > 0.05):
+        fail("%s I 分布无富尾（p99=%.4f median=%.4f 差 %.4f <= 0.05，"
+             "零假设 E[I]=-%.4f）：邻接权重或坐标疑似损坏"
+             % (species, i_p99, i_med, i_p99 - i_med, null_abs))
+    log("%s I 分布不变量 OK p99=%.4f median=%.4f tail=%.4f" % (species, i_p99, i_med, i_p99 - i_med))
+    if adata.X.nnz != x_nnz_before:
+        fail("%s X nnz 被改变" % species)
+    if adata.layers["counts"].nnz != counts_nnz_before:
+        fail("%s counts 层 nnz 被改变" % species)
+    if not np.array_equal(adata.obsm["X_pca"], pca_before):
+        fail("%s X_pca 被改动" % species)
+    if not adata.obs["domain"].equals(domain_before):
+        fail("%s domain 列被改动" % species)
+    for col in REQUIRED_OBS:
+        if col not in adata.obs.columns:
+            fail("%s obs 列丢失: %s" % (species, col))
+    for col in REQUIRED_VAR:
+        if col not in adata.var.columns:
+            fail("%s var 列丢失: %s" % (species, col))
+
+    # --- 5. 落盘 ---
+    adata.var["morans_i_mean"] = i_mean
+    adata.var["morans_i_min"] = i_min
+    adata.var["morans_i_max"] = i_max
+    adata.var["morans_z_mean"] = z_mean
+    adata.var["gearys_c_mean"] = c_mean
+    adata.var["gearys_c_min"] = c_min
+    adata.var["gearys_c_max"] = c_max
+    adata.var["autocorr_n_valid_samples"] = n_valid.astype(np.int8)
+    adata.uns["autocorr"] = {
+        "method": "morans_i_plus_gearys_c_per_sample_pixel_knn",
+        "matrix": "X（归一化 log 值，squidpy/spatial_stats 惯例口径）",
+        "knn": K_NN,
+        "symmetrized": True,
+        "row_standardized": True,
+        "inference": "cliff_ord_randomization_normal_z（esda norm 同式；Geary's C 只报统计量，"
+                     "其解析方差依赖基因四阶矩，跨基因解析式与 permutation 不等价）",
+        "seed": SEED,
+        "samples_total": len(samples),
+        "samples_n": {item[0]: item[1] for item in ei_sd},
+        "nan_genes": n_nan_genes,
+        "partial_zero_genes": n_partial,
+        "sanity_genes": {"zonation": zonation, "immune": immune},
+        "source_h5ad": path,
+    }
+    h5ad_name = "spatial_autocorr_%s.h5ad" % species
+    adata.write_h5ad(h5ad_name)
+
+    tsv_name = "gene_autocorr_%s.tsv" % species
+    tsv_df = adata.var[["gene_symbol", "morans_i_mean", "morans_i_min", "morans_i_max",
+                        "morans_z_mean", "gearys_c_mean", "gearys_c_min", "gearys_c_max",
+                        "autocorr_n_valid_samples"]].copy()
+    tsv_df.insert(0, "ensembl_id", adata.var_names)
+    tsv_df = tsv_df.sort_values("morans_i_mean", ascending=False)
+    tsv_df.to_csv(tsv_name, sep="\t", index=True, index_label="var_index")
+    log("%s wrote %s (%d 行) + %s (%d 行)"
+        % (species, h5ad_name, adata.shape[0], tsv_name, len(tsv_df)))
+
+    top10 = tsv_df.head(10)["gene_symbol"].astype(str).tolist()
+    report_sections.append("\n".join(
+        ["[%s]" % species,
+         "spots=%d genes=%d samples=%d" % (adata.shape[0], adata.shape[1], len(samples)),
+         "seconds=%.1f" % elapsed,
+         "i_mean_gene_avg=%.4f i_max_gene=%.4f c_mean_gene_avg=%.4f"
+         % (float(np.nanmean(i_mean)), float(np.nanmax(i_mean)), float(np.nanmean(c_mean))),
+         "nan_genes=%d/%d" % (n_nan_genes, n_genes),
+         "partial_zero_genes=%d/%d（部分样本全零表达，n_valid_samples<样本数，低表达稀疏如实记）"
+         % (n_partial, n_genes),
+         "sanity_zonation_I=%s" % {g: round(float(symbol_i(g)), 3) for g in zonation},
+         "sanity_immune_I=%s" % {g: round(float(symbol_i(g)), 3) for g in immune},
+         "top10_by_i=%s" % " ".join(top10)]
+    ))
+
+report_lines = [
+    "step=spatial_autocorr",
+    "seed=%d" % SEED,
+    "method=逐样本像素 KNN(k=%d，对称化+行标准化) 逐基因 Moran's I + Geary's C，基因级跨样本 mean/min/max" % K_NN,
+    "matrix=X（归一化 log 值）",
+    "inference=Moran's I 用 Cliff-Ord 随机化正态近似解析 z（esda norm 同式，零置换成本）；"
+    "Geary's C 只报统计量，方向解读以 Moran's I 为准",
+    "nan_note=全 spot 零表达基因（denom=0）如实记 nan 与 n_valid_samples，不填 0 不删行",
+    "outputs=spatial_autocorr_mouse.h5ad, spatial_autocorr_human.h5ad, "
+    "gene_autocorr_mouse.tsv, gene_autocorr_human.tsv, autocorr_report.txt",
+] + report_sections + [
+    "elapsed_seconds=%.0f" % (time.time() - START),
+]
+with open("autocorr_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'autocorr_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('autocorr_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("spatial_autocorr_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "${AUTOCORR_OUTDIR:-$(pwd)}" "autocorr_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

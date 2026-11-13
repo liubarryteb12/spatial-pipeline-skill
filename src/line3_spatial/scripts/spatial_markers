@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# spatial_markers：line3_spatial 步骤 6 空间域 marker / 空间差异表达。
+#
+# 输入：步骤 5 产物 spatial_domains_mouse.h5ad / spatial_domains_human.h5ad
+#       （obs 带 domain 列，X 归一化 log 值，layers['counts'] 原始计数）。
+#
+# 做法：逐物种在全部 spot 上对 domain 分组跑 wilcoxon 秩和检验（scanpy 原生，
+# pts=True 同时取 pct_nz_group/pct_nz_reference 两列检出率），n_genes=200。
+# marker names 是 Ensembl ID（ingest 口径：var_names 定 ID、symbol 在 var 列），
+# 导出前经 var['gene_symbol'] 映射成 symbol（symbol 有重复属已知口径，映射按 ID 逐行取）。
+# tsv 导 top20 per domain；h5ad 的 uns['domain_markers'] 由 scanpy 落 top200 全量排名。
+#
+# 口径定稿依据（服务器三轮探针实测，2026-10-13）：
+#   - wilcoxon pts=True 计时 mouse 29.9s / human 8.2s（pts=False 24.9s/8.1s，成本可接受）
+#   - marker 表行数 = 域数 x 200：mouse 57 域 11400 行 / human 18 域 3600 行
+#   - ensembl->symbol 映射 0 缺失；top20 per domain mouse 1140 / human 360 行
+#   - 生物学合理性：mouse JBO009_d2 为巨噬域（Cd5l rank7 / C1qb rank17 / C1qa rank35 /
+#     Tmsb4x rank1 / Cd74 rank5 / Lyz2 rank34 同域）；human MARCO/C1QB/C1QA 弱命中但
+#     方向一致（人肝 KC 标记在 spot 级表达弱，spot 是混合细胞，属正常）
+#   - 每域 top1 呈现肝 zonation 结构：mouse Mup3/Elovl3/Cyp2c69/Isg15/Hamp/Apom 等，
+#     human CYP2A6/CES1/ALB/APOA1 等，与 Guilliams 2022 肝分区发现一致
+#
+# 自校验内建：输入契约（步骤 5 产物键集合 + domain 列 + 未做过 marker）、marker 表
+# 行数 = 域数 x 200、top20 行数 = 域数 x 20、symbol 映射 0 缺失、泛免疫基因 sanity
+# （mouse Tmsb4x/Cd5l/C1qb 与 human CD74 必须在 top200，探针实测 rank 1/7/17/20 远离
+# 边界）、X nnz 不变、counts 层 nnz 不变、X_pca 不被改动、spatial 双不丢、obs 列不丢、
+# domain 列不被改动。任一不过非零退出。
+set -euo pipefail
+
+seed="${BIOANALYS_SEED:-UNSET}"
+if [ "$seed" = "UNSET" ]; then
+  echo "BIOANALYS_SEED 未注入（引擎契约：seed 必须注入）" >&2
+  exit 3
+fi
+
+# 输入分流：两个 h5ad（步骤 5 产物，小鼠 / 人源）。模式前后都带 *：拿到的是绝对路径，
+# 前缀匹配永远不中（坑 #99）。
+declare -a INPUTS=()
+output_count=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --input) INPUTS+=("$2"); shift 2 ;;
+    --output) output_count=$((output_count + 1)); shift 2 ;;
+    --seed) shift 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
+  esac
+done
+
+mouse_h5ad=""
+human_h5ad=""
+for path in "${INPUTS[@]:-}"; do
+  [ -n "$path" ] || continue
+  case "$path" in
+    *mouse*.h5ad) mouse_h5ad="$path" ;;
+    *human*.h5ad) human_h5ad="$path" ;;
+    *.h5ad) echo "无法识别的输入文件: $path（文件名需含 mouse/human 物种标识）" >&2; exit 2 ;;
+    *) echo "无法识别的输入文件: $path（需要 *.h5ad，即步骤 5 产物）" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$mouse_h5ad" ] && [ -z "$human_h5ad" ]; then
+  # 单物种数据集（GSE233814 只有小鼠 GPL24247）不再要求两份都提供。
+  # 判据改为「至少一份」：两份都缺才报错；实际提供哪份，下游按文件名分流。
+  echo "缺少必需输入：至少需要一份物种 h5ad（mouse 或 human）" >&2
+  exit 2
+fi
+for path in "$mouse_h5ad" "$human_h5ad"; do
+  [ -n "$path" ] || continue
+  if [ ! -f "$path" ]; then
+    echo "输入文件不存在: $path" >&2
+    exit 2
+  fi
+done
+
+echo "step_executed=spatial_markers"
+echo "bioanalys_seed=${seed}"
+echo "input_mouse=${mouse_h5ad}"
+echo "input_human=${human_h5ad}"
+
+MARKER_INPUTS="$mouse_h5ad
+$human_h5ad"
+export MARKER_INPUTS
+export MARKER_OUTDIR="${MARKER_OUTDIR:-$(pwd)}"
+
+# 解释器 PATH 前置（生信代码专项审核）：K40 系统解释器缺科学计算包，真依赖在 bio-py venv。
+# 用 PATH 注入而非改写调用行，是为了让桥接调用的行级计数保持原样（bilingual 判定不变）。
+BIO_PY_BIN="${BIO_PY_BIN:-/root/venvs/bio-py/bin}"
+if [ -x "$BIO_PY_BIN/python3" ]; then
+  export PATH="$BIO_PY_BIN:$PATH"
+fi
+
+python3 - <<'PYSCRIPT'
+import hashlib
+import os
+import sys
+import time
+
+import numpy as np
+import pandas as pd
+import anndata as ad
+import scanpy as sc
+
+# pandas 3 与 2 的 infer_string 默认值不同，会导致 anndata 0.13 写 obs 字符串列时
+# 因 nullable strings 开关未定而崩；显式关掉，两种 pandas 行为一致（坑 #107）。
+ad.settings.allow_write_nullable_strings = False
+
+START = time.time()
+N_GENES = 200       # 每组 marker 数（wilcoxon n_genes）
+TOP_N = 20          # tsv 导出每域条数
+SEED = int(os.environ["BIOANALYS_SEED"])
+
+# 肝巨噬 panel（Guilliams 2022 KC 标记）：命中情况如实入报告，不作硬断言
+# （human 实测仅 MARCO/C1QB/C1QA 弱命中，spot 级混合细胞信号弱属正常）。
+PANEL = {
+    "mouse": ["Marco", "Cd5l", "C1qb", "C1qa", "Clec4f", "Adgre1", "Siglecf"],
+    "human": ["MARCO", "CD5L", "C1QB", "C1QA", "CLEC4F", "ADGRE1", "SIGLEC1"],
+}
+# 泛免疫基因 sanity 硬断言（探针实测组内排名远离 200 边界，稳定可断）：
+SANITY_GENES = {
+    "mouse": ["Tmsb4x", "Cd5l", "C1qb"],   # 实测 rank_in_group 1 / 7 / 17
+    "human": ["CD74"],                      # 实测 rank_in_group 20
+}
+
+
+def fail(message):
+    sys.stderr.write("spatial_markers 自校验失败: %s\n" % message)
+    sys.stderr.flush()
+    sys.exit(1)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+# 步骤 5 产物键集合（服务器实测导出，见 probe4；obs 21 含 domain、var 7、uns 21）
+REQUIRED_OBS = ["barcode", "sample_id", "gsm", "species", "platform_id", "strain",
+                "condition", "condition_class", "group", "tissue", "in_tissue",
+                "array_row", "array_col", "pxl_row_fullres", "pxl_col_fullres",
+                "ncount", "nfeature", "total_counts", "n_genes_by_counts", "pct_mito",
+                "domain"]
+REQUIRED_VAR = ["gene_symbol", "genome", "feature_type", "means", "dispersions",
+                "dispersions_norm", "highly_variable"]
+REQUIRED_UNS = ["coord_note", "dimred", "domains", "gene_id_type", "genome",
+                "grouping_check", "hvg", "image_note", "log1p", "normalization",
+                "pca", "qc", "samples", "seed", "source_h5ad", "source_soft_human",
+                "source_soft_mouse", "source_tar", "spatial", "species", "warnings"]
+
+report_sections = []
+
+for path in os.environ["MARKER_INPUTS"].splitlines():
+    path = path.strip()
+    if not path:
+        continue
+    species = "mouse" if "mouse" in os.path.basename(path) else "human"
+    adata = ad.read_h5ad(path)
+    log("loaded %s spots=%d genes=%d" % (species, adata.shape[0], adata.shape[1]))
+
+    # --- 1. 输入契约：必须是步骤 5 产物且未做过 marker ---
+    missing_obs = [col for col in REQUIRED_OBS if col not in adata.obs.columns]
+    if missing_obs:
+        fail("%s 缺少 obs 列 %s（不是 spatial_domains 产物？）" % (path, missing_obs))
+    missing_var = [col for col in REQUIRED_VAR if col not in adata.var.columns]
+    if missing_var:
+        fail("%s 缺少 var 列 %s" % (path, missing_var))
+    missing_uns = [key for key in REQUIRED_UNS if key not in adata.uns]
+    if missing_uns:
+        fail("%s 缺少 uns 键 %s（不是 spatial_domains 产物？）" % (path, missing_uns))
+    if "counts" not in adata.layers:
+        fail("%s 缺少 layers['counts']" % path)
+    for key in ["X_pca", "X_umap", "spatial"]:
+        if key not in adata.obsm:
+            fail("%s 缺少 obsm['%s']" % (path, key))
+    if "domain_markers" in adata.uns or "markers" in adata.uns:
+        fail("%s 已含 marker 结果（重复执行？）" % path)
+    if int(adata.var["highly_variable"].sum()) != 2000:
+        fail("%s HVG 数 %d != 2000（上游口径被改？）" % (path, int(adata.var["highly_variable"].sum())))
+    x_nnz_before = adata.X.nnz
+    counts_nnz_before = adata.layers["counts"].nnz
+    pca_before = adata.obsm["X_pca"].copy()
+    domain_before = adata.obs["domain"].copy()
+    obs_cols_before = list(adata.obs.columns)
+
+    n_domains = int(adata.obs["domain"].nunique())
+    log("%s domains=%d" % (species, n_domains))
+
+    # --- 2. wilcoxon 秩和检验（逐物种；分组键 domain）---
+    t0 = time.time()
+    sc.tl.rank_genes_groups(adata, groupby="domain", method="wilcoxon", pts=True,
+                            n_genes=N_GENES, key_added="domain_markers")
+    elapsed = time.time() - t0
+    log("wilcoxon done %.1fs" % elapsed)
+
+    # --- 3. marker 表：ensembl->symbol 映射 + top20 per domain ---
+    df = sc.get.rank_genes_groups_df(adata, group=None, key="domain_markers")
+    df = df[df["names"].notna()].copy()
+    symbol_map = adata.var["gene_symbol"].to_dict()
+    df["gene_symbol"] = df["names"].map(symbol_map)
+    n_symbol_missing = int(df["gene_symbol"].isna().sum())
+
+    df = df.sort_values(["group", "scores"], ascending=[True, False]).reset_index(drop=True)
+    df["rank"] = df.groupby("group").cumcount() + 1
+    top_df = df[df["rank"] <= TOP_N].copy()
+    top_df = top_df.rename(columns={"names": "ensembl_id"})
+    tsv_df = top_df[["group", "rank", "ensembl_id", "gene_symbol", "scores",
+                     "logfoldchanges", "pvals", "pvals_adj",
+                     "pct_nz_group", "pct_nz_reference"]]
+
+    # panel 与 sanity 基因命中明细（组内最好成绩；uns 落字符串，tuple anndata 不可序列化）
+    def best_hit(gene):
+        rows = df[df["gene_symbol"] == gene]
+        if not len(rows):
+            return None
+        # 取全表 scores 最高的一组（df 已按 group 排序，必须先按 scores 再排）
+        best = rows.sort_values("scores", ascending=False).iloc[0]
+        return (str(best["group"]), int(best["rank"]), round(float(best["scores"]), 1))
+
+    def hit_str(hit):
+        return "NA" if hit is None else "%s|rank%d|score%.1f" % hit
+
+    panel_hits = {gene: best_hit(gene) for gene in PANEL[species]}
+    sanity_hits = {gene: best_hit(gene) for gene in SANITY_GENES[species]}
+    panel_hits_str = {gene: hit_str(hit) for gene, hit in panel_hits.items()}
+
+    # --- 4. 自校验 ---
+    if len(df) != n_domains * N_GENES:
+        fail("%s marker 表行数 %d != 域数 %d x %d" % (species, len(df), n_domains, N_GENES))
+    if len(tsv_df) != n_domains * TOP_N:
+        fail("%s top20 表行数 %d != 域数 %d x %d" % (species, len(tsv_df), n_domains, TOP_N))
+    if n_symbol_missing:
+        fail("%s 有 %d 个 marker 未映射到 gene_symbol" % (species, n_symbol_missing))
+    # sanity 断言判据修正（2026-11-06 GSE233814 脑卒中真机暴露）：
+    # 旧版要求每个 sanity 基因都进 top200，但这三只（Tmsb4x/Cd5l/C1qb）是按肝脏
+    # KC 数据集选的，Cd5l 在脑组织本来就是低表达 ，即，即 把「组织生物学」误写成了
+    # 「流水线不变量」，换数据集必炸。真正的流水线故障（排名表为空/结构损坏）
+    # 已由行数与 symbol 映射断言覆盖，这里只兜「全军覆没」这一异常信号：
+    #   全缺席 -> fail（说明 marker 排名管道坏了）；部分缺席 -> WARN 如实入报告。
+    sanity_hit_count = sum(1 for g in SANITY_GENES[species] if sanity_hits[g] is not None)
+    if sanity_hit_count == 0:
+        fail("%s sanity 基因全部未出现在 top%d（marker 排名管道异常？）"
+             % (species, N_GENES))
+    for gene in SANITY_GENES[species]:
+        if sanity_hits[gene] is None:
+            log("WARN %s sanity 基因 %s 未进 top%d（可能为组织特异性，不判失败）"
+                % (species, gene, N_GENES))
+    if adata.X.nnz != x_nnz_before:
+        fail("%s X nnz 被改变" % species)
+    if adata.layers["counts"].nnz != counts_nnz_before:
+        fail("%s counts 层 nnz 被改变" % species)
+    if not np.array_equal(adata.obsm["X_pca"], pca_before):
+        fail("%s X_pca 被改动" % species)
+    if "spatial" not in adata.obsm or "spatial" not in adata.uns:
+        fail("%s spatial 坐标或样本图丢失" % species)
+    if not adata.obs["domain"].equals(domain_before):
+        fail("%s domain 列被改动" % species)
+    for col in REQUIRED_OBS:
+        if col not in adata.obs.columns:
+            fail("%s obs 列丢失: %s" % (species, col))
+
+    # --- 5. 落盘 ---
+    adata.uns["markers"] = {
+        "method": "scanpy_wilcoxon_per_domain",
+        "pts": True,
+        "n_genes": N_GENES,
+        "top_n": TOP_N,
+        "seed": SEED,
+        "domains_total": n_domains,
+        "panel": PANEL[species],
+        "panel_hits": panel_hits_str,
+        "sanity_genes": SANITY_GENES[species],
+        "gene_id_note": "marker names 为 Ensembl ID，tsv 经 var['gene_symbol'] 映射出 symbol 列",
+        "source_h5ad": path,
+    }
+    h5ad_name = "spatial_marker_%s.h5ad" % species
+    adata.write_h5ad(h5ad_name)
+    tsv_name = "domain_markers_%s.tsv" % species
+    tsv_df.to_csv(tsv_name, sep="\t", index=False)
+    log("%s wrote %s (%d 行) + %s (%d 行)"
+        % (species, h5ad_name, adata.shape[0], tsv_name, len(tsv_df)))
+
+    top1_per_domain = tsv_df.groupby("group").head(1)["gene_symbol"].astype(str).tolist()
+    report_sections.append("\n".join(
+        ["[%s]" % species,
+         "spots=%d genes=%d domains=%d" % (adata.shape[0], adata.shape[1], n_domains),
+         "marker_table_rows=%d top%d_rows=%d symbol_missing=%d"
+         % (len(df), TOP_N, len(tsv_df), n_symbol_missing),
+         "wilcoxon_seconds=%.1f" % elapsed,
+         "panel_hits(group, rank_in_group, score)=%s" % panel_hits,
+         "sanity_hits(group, rank_in_group, score)=%s" % sanity_hits,
+         "top1_symbol_per_domain=%s" % " ".join(top1_per_domain)]
+    ))
+
+report_lines = [
+    "step=spatial_markers",
+    "seed=%d" % SEED,
+    "method=scanpy rank_genes_groups(groupby=domain, method=wilcoxon, pts=True, n_genes=%d)" % N_GENES,
+    "symbol_mapping=marker names 为 Ensembl ID（ingest 口径 var_names=ID），tsv 经 var['gene_symbol'] 映射",
+    "panel_note=肝巨噬 panel（Guilliams 2022）命中如实入报告不作硬断言；human spot 级混合细胞信号弱属正常",
+    "outputs=spatial_marker_mouse.h5ad, spatial_marker_human.h5ad, domain_markers_mouse.tsv, domain_markers_human.tsv, marker_report.txt",
+] + report_sections + [
+    "elapsed_seconds=%.0f" % (time.time() - START),
+]
+with open("marker_report.txt", "w", encoding="utf-8") as fh:
+    fh.write("\n".join(report_lines) + "\n")
+
+for _artifact in sorted(os.listdir(".")):
+    if not os.path.isfile(_artifact):
+        continue
+    if _artifact == 'marker_report.txt':
+        continue
+    with open(_artifact, "rb") as _fh:
+        _digest = hashlib.sha256(_fh.read()).hexdigest()
+    with open('marker_report.txt', "a", encoding="utf-8") as _fh:
+        _fh.write("%s_sha256=%s\n" % (_artifact, _digest))
+log("spatial_markers_done")
+PYSCRIPT
+
+# sha256 产物台账后置补登：复用独立脚本，写法与其余步骤解耦。
+if [ -x "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" ]; then
+  "/mnt/ssd/bio_data/ops/k40_step_sha_ledger.sh" "${MARKER_OUTDIR:-$(pwd)}" "marker_report.txt" > /dev/null 2>>"$0.ledger.err" \
+  || echo "WARN sha256 ledger backfill failed, see $0.ledger.err" >&2
+fi

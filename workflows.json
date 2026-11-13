@@ -1,0 +1,478 @@
+{
+  "schema_version": "1.0",
+  "manifest_version": 2,
+  "manifest_kind": "workspace_module_registry",
+  "updated": "2026-10-28",
+  "notes": [
+    "mod 注册表：客户端、服务台、runner 三方共读的唯一事实源（SSOT）。",
+    "依赖用产物名表达，不用绝对路径，路径由运行方按项目拼接。",
+    "series 之间默认硬隔离（aims 铁律二）：不同系列不可穿插、不可跨系列取产物；唯一例外是 constraints.allowed_cross_series_bridges 声明的冻结签名桥。",
+    "stage 内 optional=true 的 mod 可自由勾选；跨 stage 只允许按 order 递增的标准序。",
+    "est_minutes / peak_mem_mb 为参考算力节点实测值，用于组合前的成本预估与拦截。",
+    "运行时内存上限由 BIO_MEM_LIMIT_GB 控制：生产默认 7.5GB，单任务最高 8.0GB；constraints.mem_quota_mb=7680 是规划默认值。"
+  ],
+  "constraints": {
+    "max_concurrent_series": 1,
+    "mem_quota_mb": 7680,
+    "disk_fail_free_pct": 20,
+    "ko_gene_required_mods": [
+      "l2_ko_virtual",
+      "l3_ko_spatial"
+    ],
+    "forbidden_cross_series": true,
+    "allowed_cross_series_bridges": [
+      {
+        "id": "l2_to_l3_celltype_signature",
+        "from": "line2_scrna",
+        "to": "line3_spatial",
+        "scope": "same_project",
+        "producers": [
+          "l2_export_celltype_signature"
+        ],
+        "consumers": [
+          "l3_branches_celltype"
+        ],
+        "path": "public_references/celltype_signatures/<project_id>/signatures.tsv",
+        "manifest": "public_references/celltype_signatures/<project_id>/bridge_manifest.json",
+        "requires": [
+          "sha256",
+          "species_mapping",
+          "seed",
+          "project_id",
+          "value_domain",
+          "gene_symbol_namespace"
+        ]
+      }
+    ]
+  },
+  "series": [
+    {
+      "id": "line3_spatial",
+      "name": "单细胞空间转录组 + 虚拟敲除",
+      "data_form": "空间转录组（Visium：mtx + positions + scalefactors + ADT）+ 双 soft + 分组表",
+      "language_profile": "全程 Python 0 次切换（Scanpy + Squidpy + liana + NNLS）",
+      "seed": 20261013,
+      "species_paired": true,
+      "stages": [
+        {
+          "id": "ingest",
+          "name": "数据接入",
+          "order": 1,
+          "required": true,
+          "mods": [
+            {
+              "id": "l3_ingest_spatial",
+              "name": "空间数据装配",
+              "desc": "读取空间表达矩阵、组织坐标与样本信息，装配成空间分析对象",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "raw_tar",
+                "gpl_soft_mouse",
+                "gpl_soft_human",
+                "grouping.txt"
+              ],
+              "produces": [
+                "spatial_counts_mouse.h5ad",
+                "spatial_counts_human.h5ad",
+                "samples_meta.tsv",
+                "ingest_report.txt"
+              ],
+              "est_minutes": 12,
+              "peak_mem_mb": 3000,
+              "notes": "15 样本 = 10 小鼠 mm10 + 5 人 hg19；CSC→CSR、Ensembl var_names、样本前缀 obs_names。",
+              "script": "ingest_spatial"
+            }
+          ]
+        },
+        {
+          "id": "qc",
+          "name": "质控与归一化",
+          "order": 2,
+          "required": true,
+          "mods": [
+            {
+              "id": "l3_qc_spots",
+              "name": "Spot QC",
+              "desc": "按检出基因数和线粒体比例过滤低质量 spot，并保留质控指标",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "spatial_counts_mouse.h5ad",
+                "spatial_counts_human.h5ad"
+              ],
+              "produces": [
+                "spatial_qc_mouse.h5ad",
+                "spatial_qc_human.h5ad",
+                "spot_qc_metrics.tsv",
+                "qc_report.txt"
+              ],
+              "est_minutes": 7,
+              "peak_mem_mb": 2600,
+              "notes": "mito 阈值定 50 的关键证据见 README；34% 零表达基因是参考基因组死基因。",
+              "script": "qc_spots"
+            },
+            {
+              "id": "l3_qc_normalize",
+              "name": "归一化与高变基因",
+              "desc": "完成文库大小归一化和对数转换，并筛选下游聚类所需的高变基因",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "spatial_qc_mouse.h5ad",
+                "spatial_qc_human.h5ad"
+              ],
+              "produces": [
+                "spatial_norm_mouse.h5ad",
+                "spatial_norm_human.h5ad",
+                "hvg_genes_mouse.tsv",
+                "hvg_genes_human.tsv",
+                "norm_report.txt"
+              ],
+              "est_minutes": 6,
+              "peak_mem_mb": 2600,
+              "notes": "mito 为内源基因不剔除（不同于 line2 剔 ERCC）；HVG 按物种分别选。",
+              "script": "normalize_hvg"
+            }
+          ]
+        },
+        {
+          "id": "dimred",
+          "name": "降维与空间域",
+          "order": 3,
+          "required": true,
+          "mods": [
+            {
+              "id": "l3_dimred_reduce",
+              "name": "降维",
+              "desc": "对空间表达谱进行降维，为空间域识别和二维可视化准备特征",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "spatial_norm_mouse.h5ad",
+                "spatial_norm_human.h5ad"
+              ],
+              "produces": [
+                "spatial_dimred_mouse.h5ad",
+                "spatial_dimred_human.h5ad",
+                "dimred_report.txt"
+              ],
+              "est_minutes": 9,
+              "peak_mem_mb": 2800,
+              "notes": "不做跨样本批次校正；像素坐标跨样本不可比（坑 #114）。",
+              "script": "dim_reduce"
+            },
+            {
+              "id": "l3_dimred_domains",
+              "name": "空间域识别",
+              "desc": "结合表达谱与空间坐标识别组织结构域，并标记不同空间区域",
+              "tool": "Scanpy (Leiden)",
+              "language": "Python",
+              "requires": [
+                "spatial_dimred_mouse.h5ad",
+                "spatial_dimred_human.h5ad"
+              ],
+              "produces": [
+                "spatial_domains_mouse.h5ad",
+                "spatial_domains_human.h5ad",
+                "domains_report.txt"
+              ],
+              "est_minutes": 12,
+              "peak_mem_mb": 3000,
+              "script": "spatial_domains"
+            },
+            {
+              "id": "l3_dimred_markers",
+              "name": "域 Marker",
+              "desc": "在各空间域内做差异检验，提取用于域身份判读的标记基因",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "spatial_domains_mouse.h5ad",
+                "spatial_domains_human.h5ad"
+              ],
+              "produces": [
+                "spatial_marker_mouse.h5ad",
+                "spatial_marker_human.h5ad",
+                "domain_markers_mouse.tsv",
+                "domain_markers_human.tsv"
+              ],
+              "est_minutes": 10,
+              "peak_mem_mb": 2800,
+              "notes": "marker 表行数 = 域数 × 200；被 enrichment / celltype_annotation / dr_post 共同消费。",
+              "script": "spatial_markers"
+            }
+          ]
+        },
+        {
+          "id": "spatial_stats",
+          "name": "空间统计",
+          "order": 4,
+          "required": false,
+          "mods": [
+            {
+              "id": "l3_stats_autocorr",
+              "name": "空间自相关",
+              "desc": "计算基因表达的空间自相关，识别具有聚集分布特征的基因",
+              "tool": "Squidpy",
+              "language": "Python",
+              "requires": [
+                "spatial_marker_mouse.h5ad",
+                "spatial_marker_human.h5ad"
+              ],
+              "produces": [
+                "spatial_autocorr_mouse.h5ad",
+                "spatial_autocorr_human.h5ad",
+                "gene_autocorr_mouse.tsv",
+                "gene_autocorr_human.tsv"
+              ],
+              "est_minutes": 8,
+              "peak_mem_mb": 2600,
+              "script": "spatial_autocorr"
+            },
+            {
+              "id": "l3_stats_cooccur",
+              "name": "域共现",
+              "desc": "统计空间域之间的邻接偏好，判断哪些区域倾向相邻或相互排斥",
+              "tool": "Squidpy",
+              "language": "Python",
+              "requires": [
+                "spatial_autocorr_mouse.h5ad",
+                "spatial_autocorr_human.h5ad"
+              ],
+              "produces": [
+                "spatial_cooccurrence_mouse.h5ad",
+                "spatial_cooccurrence_human.h5ad",
+                "domain_cooccurrence_mouse.tsv",
+                "domain_cooccurrence_human.tsv"
+              ],
+              "est_minutes": 6,
+              "peak_mem_mb": 2400,
+              "script": "spatial_cooccurrence"
+            },
+            {
+              "id": "l3_stats_composition",
+              "name": "样本组成谱",
+              "desc": "比较不同切片和区域的域组成，量化空间结构比例的变化",
+              "tool": "Scanpy, scipy",
+              "language": "Python",
+              "requires": [
+                "spatial_cooccurrence_mouse.h5ad",
+                "spatial_cooccurrence_human.h5ad"
+              ],
+              "produces": [
+                "spatial_composition_mouse.h5ad",
+                "spatial_composition_human.h5ad",
+                "sample_composition_mouse.tsv",
+                "sample_composition_human.tsv"
+              ],
+              "est_minutes": 5,
+              "peak_mem_mb": 2200,
+              "script": "spatial_composition"
+            },
+            {
+              "id": "l3_stats_communication",
+              "name": "空间通讯",
+              "desc": "在空间邻域内评估配受体互作，比较不同区域间的通讯强度",
+              "tool": "liana",
+              "language": "Python",
+              "requires": [
+                "spatial_composition_mouse.h5ad",
+                "spatial_composition_human.h5ad"
+              ],
+              "produces": [
+                "spatial_communication_mouse.h5ad",
+                "spatial_communication_human.h5ad",
+                "sample_communication_mouse.tsv",
+                "sample_communication_human.tsv"
+              ],
+              "est_minutes": 25,
+              "peak_mem_mb": 3200,
+              "script": "spatial_communication"
+            }
+          ]
+        },
+        {
+          "id": "branches",
+          "name": "可选支线（可多选）",
+          "order": 5,
+          "required": false,
+          "notes": "本阶段内各 mod 互不依赖，可任意组合。",
+          "mods": [
+            {
+              "id": "l3_branches_celltype",
+              "name": "细胞类型注释",
+              "desc": "用空间域标记基因构建签名并逐 spot 解卷积，估计细胞类型组成",
+              "tool": "scipy.nnls, Scanpy",
+              "language": "Python",
+              "requires": [
+                "spatial_marker_mouse.h5ad",
+                "spatial_marker_human.h5ad",
+                "domain_markers_mouse.tsv",
+                "domain_markers_human.tsv"
+              ],
+              "produces": [
+                "celltype_scores_mouse.tsv",
+                "celltype_scores_human.tsv",
+                "celltype_annotation_mouse.tsv",
+                "celltype_annotation_human.tsv"
+              ],
+              "est_minutes": 6,
+              "peak_mem_mb": 2200,
+              "notes": "h5ad 取全量 marker、tsv 取 top20，两套都要给。",
+              "script": "celltype_annotation"
+            },
+            {
+              "id": "l3_branches_localization",
+              "name": "目标基因空间定位",
+              "desc": "把目标基因表达映射回组织切片，展示其在空间域中的分布",
+              "tool": "Scanpy",
+              "language": "Python",
+              "requires": [
+                "spatial_communication_mouse.h5ad",
+                "spatial_communication_human.h5ad"
+              ],
+              "produces": [
+                "spatial_localization_mouse.h5ad",
+                "spatial_localization_human.h5ad",
+                "gene_localization_mouse.tsv",
+                "gene_localization_human.tsv"
+              ],
+              "est_minutes": 8,
+              "peak_mem_mb": 2600,
+              "script": "spatial_localization"
+            },
+            {
+              "id": "l3_branches_enrich",
+              "name": "功能富集",
+              "desc": "对差异基因或域标记基因执行 GO、KEGG 和 Reactome 富集分析",
+              "tool": "gseapy",
+              "language": "Python",
+              "requires": [
+                "spatial_marker_mouse.h5ad",
+                "spatial_marker_human.h5ad"
+              ],
+              "produces": [
+                "enrichment_ora_mouse.tsv",
+                "enrichment_ora_human.tsv",
+                "enrichment_gsea_mouse.tsv",
+                "enrichment_gsea_human.tsv"
+              ],
+              "est_minutes": 20,
+              "peak_mem_mb": 3000,
+              "script": "enrichment"
+            },
+            {
+              "id": "l3_branches_enrich_fig",
+              "name": "富集图件",
+              "desc": "把富集分析结果整理为条形图等图件，突出主要功能条目与显著性",
+              "tool": "matplotlib",
+              "language": "Python",
+              "requires": [
+                "enrichment_ora_mouse.tsv",
+                "enrichment_ora_human.tsv",
+                "enrichment_gsea_mouse.tsv",
+                "enrichment_gsea_human.tsv"
+              ],
+              "produces": [
+                "l3_mouse_12_ora_top.png",
+                "l3_human_12_ora_top.png",
+                "figures_manifest.txt"
+              ],
+              "est_minutes": 3,
+              "peak_mem_mb": 1500,
+              "outputs_dir": "figures",
+              "script": "enrichment_figures"
+            }
+          ]
+        },
+        {
+          "id": "ko",
+          "name": "虚拟敲除（本线末端模块）",
+          "order": 6,
+          "required": false,
+          "notes": "aims 铁律二：虚拟敲除不是第四条线，是本线末端模块。",
+          "mods": [
+            {
+              "id": "l3_ko_spatial",
+              "name": "空间虚拟敲除",
+              "desc": "在空间调控网络中模拟敲除目标基因，输出空间 DR 基因结果",
+              "tool": "scTenifoldKnk",
+              "language": "Python",
+              "requires": [
+                "spatial_localization_mouse.h5ad",
+                "spatial_localization_human.h5ad"
+              ],
+              "produces": [
+                "spatial_knockout_mouse.h5ad",
+                "spatial_knockout_human.h5ad",
+                "ko_dr_genes_mouse.tsv",
+                "ko_dr_genes_human.tsv"
+              ],
+              "est_minutes": 45,
+              "peak_mem_mb": 3800,
+              "ko_gene": true,
+              "script": "spatial_knockout"
+            },
+            {
+              "id": "l3_ko_drpost",
+              "name": "DR 后分析",
+              "desc": "对 DR 基因做富集、调控网络和交集分析，连接表达差异与调控扰动",
+              "tool": "gseapy, networkx",
+              "language": "Python",
+              "requires": [
+                "spatial_knockout_mouse.h5ad",
+                "spatial_knockout_human.h5ad",
+                "ko_dr_genes_mouse.tsv",
+                "ko_dr_genes_human.tsv",
+                "domain_markers_mouse.tsv",
+                "domain_markers_human.tsv"
+              ],
+              "produces": [
+                "dr_enrichment_mouse.tsv",
+                "dr_enrichment_human.tsv",
+                "dr_overlap_mouse.tsv",
+                "dr_overlap_human.tsv"
+              ],
+              "est_minutes": 18,
+              "peak_mem_mb": 3000,
+              "after": [
+                "l3_ko_spatial"
+              ],
+              "script": "dr_post_analysis"
+            }
+          ]
+        },
+        {
+          "id": "figures",
+          "name": "图件汇总",
+          "order": 7,
+          "required": false,
+          "mods": [
+            {
+              "id": "l3_figures_spatial",
+              "name": "线 3 图件包",
+              "desc": "汇总空间域、目标基因和敲除结果，按样本生成统一展示图件",
+              "tool": "matplotlib",
+              "language": "Python",
+              "requires": [
+                "spatial_knockout_mouse.h5ad",
+                "spatial_knockout_human.h5ad"
+              ],
+              "produces": [
+                "l3_mouse_01_domains.png",
+                "l3_mouse_03_ko_dr.png",
+                "l3_human_01_domains.png",
+                "figures_manifest.txt"
+              ],
+              "est_minutes": 6,
+              "peak_mem_mb": 2000,
+              "outputs_dir": "figures",
+              "script": "spatial_figures"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

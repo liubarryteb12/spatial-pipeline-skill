@@ -1,32 +1,35 @@
-# 数据与产物：**不入库**
-# 单细胞数据动辄几百 MB 到几十 GB，入库会让 clone 变得不可用。
-# CI 每次都重新下载（内置数据集只有 7 MB）。
-# **前导 **/ 递归匹配** —— 只写 data/ 不覆盖 scripts/lib/data/（scrna 侧实测漏了 24 MB 缓存）
+# 数据与产物
 **/data/
 **/results/
+**/figures/
+**/outputs/
+**/processed/
+**/raw_data/
+**/*.h5ad
+**/*.rds
+**/*.tar
+**/*.tar.gz
+**/*.zip
 
-# 缓存
+# Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ipynb_checkpoints/
-
-# 环境
 .venv/
 venv/
 env/
 *.egg-info/
 
-# 编辑器
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# 编辑器与系统
 .vscode/
 .idea/
 *.swp
 .DS_Store
-
-# 临时
-*.part
-*.tmp
-
-# 提交信息临时文件（用 git commit -F 时产生，不该入库）
-_commitmsg.txt
-_*msg.txt
+Thumbs.db
