@@ -122,7 +122,10 @@ def run_01_qc(cfg: dict) -> dict:
     # ---- 1. 指标 ------------------------------------------------------------
     # **小鼠的线粒体前缀是 mt-，人是 MT-。** 用错前缀会让 pct_counts_mt 全 0，
     # 过滤形同虚设，而日志里看不出任何异常。
-    is_mouse = organism.lower().startswith("mus")
+    # ★ 2026-10-06：organism 写法兼容 'Mus musculus' / 'mouse' / 'mmu'（GSE192741
+    #   桥接实测 'mouse' 落在这里被判成人类 → MT- 一个不中 → qc 判红）。
+    _org = organism.lower()
+    is_mouse = _org.startswith("mus") or _org.startswith("mouse") or _org.startswith("mmu")
     mt_pref = ("mt-",) if is_mouse else ("MT-",)
     adata.var["mt"] = adata.var_names.str.startswith(mt_pref)
     adata.var["ribo"] = adata.var_names.str.startswith(("Rps", "Rpl") if is_mouse
