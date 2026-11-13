@@ -163,7 +163,7 @@ jobs:
         continue-on-error: true
         timeout-minutes: 12
         run: |
-          python -m pip install "cell2location>=0.1.5,<0.2" || \
+          python -m pip install "pyro-ppl==1.9.1" "cell2location>=0.1.5,<0.2" || \
             echo "cell2location 安装失败 —— 记为装不上，不影响流水线"
           python -c "
           import importlib.util as u
